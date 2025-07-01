@@ -54,6 +54,7 @@ from fcclip import (
     COCOInstanceNewBaselineDatasetMapper,
     COCOPanopticNewBaselineDatasetMapper,
     InstanceSegEvaluator,
+    COCOZSPanopticEvaluator,
     MaskFormerInstanceDatasetMapper,
     MaskFormerPanopticDatasetMapper,
     MaskFormerSemanticDatasetMapper,
@@ -102,6 +103,14 @@ class Trainer(DefaultTrainer):
         ]:
             if cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_ON:
                 evaluator_list.append(COCOPanopticEvaluator(dataset_name, output_folder))
+        if evaluator_type in [
+            "zs_coco_panoptic_seg",
+            "zs_ade20k_panoptic_seg",
+            "zs_cityscapes_panoptic_seg",
+            "zs_mapillary_vistas_panoptic_seg",
+        ]:
+            if cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_ON:
+                evaluator_list.append(COCOZSPanopticEvaluator(dataset_name, output_folder))
         # COCO
         if evaluator_type == "coco_panoptic_seg" and cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON:
             evaluator_list.append(COCOEvaluator(dataset_name, output_dir=output_folder))

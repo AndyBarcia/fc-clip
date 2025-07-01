@@ -112,7 +112,7 @@ def register_ade20k_panoptic(
         image_root=image_root,
         panoptic_json=panoptic_json,
         json_file=instances_json,
-        evaluator_type="ade20k_panoptic_seg",
+        evaluator_type="zs_ade20k_panoptic_seg",
         ignore_label=255,
         label_divisor=1000,
         **metadata,
@@ -137,6 +137,104 @@ _PREDEFINED_SPLITS_ADE20K_PANOPTIC = {
 }
 
 
+UNSEEN_ADE20K_CATEGORY_IDS =  [
+    # 93 Categories in ADE20K not present in COCO.
+    13, # ground
+    17, # plant
+    22, # picture
+    23, # sofa
+    29, # field
+    30, # armchair
+    31, # seat
+    33, # desk
+    35, # press
+    36, # lamp
+    37, # tub
+    38, # rail
+    39, # cushion
+    40, # stand
+    41, # box
+    42, # pillar
+    43, # sign
+    44, # dresser
+    48, # skyscraper
+    49, # fireplace
+    51, # covered stand
+    52, # path
+    54, # runway
+    55, # vitrine
+    56, # snooker table
+    58, # screen
+    59, # staircase
+    62, # bookcase
+    64, # coffee table
+    68, # hill
+    70, # countertop
+    71, # stove
+    72, # palm tree
+    73, # kitchen island
+    74, # computer
+    75, # swivel chair
+    77, # bar
+    78, # arcade machine
+    79, # shanty
+    84, # tower
+    85, # chandelier
+    86, # sunblind
+    87, # street lamp
+    88, # booth
+    90, # plane
+    91, # dirt track
+    92, # clothes
+    93, # pole
+    94, # soil
+    95, # handrail
+    96, # moving stairway
+    97, # hassock
+    100, # card
+    101, # stage
+    102, # van
+    103, # ship
+    104, # fountain
+    105, # transporter
+    106, # canopy
+    107, # washing machine
+    108, # toy
+    109, # pool
+    110, # stool
+    111, # cask
+    112, # handbasket
+    113, # falls
+    115, # bag
+    116, # motorbike
+    117, # cradle
+    119, # ball
+    121, # stair
+    122, # storage tank
+    123, # trade name
+    125, # pot
+    126, # animal
+    128, # lake
+    129, # dishwasher
+    130, # screen
+    132, # sculpture
+    133, # exhaust hood
+    134, # sconce
+    137, # tray
+    138, # trash can
+    139, # fan
+    140, # pier
+    141, # crt screen
+    142, # plate
+    143, # monitor
+    144, # bulletin board
+    145, # shower
+    146, # radiator
+    147, # drinking glass
+    149, # flag
+]
+
+
 def get_metadata():
     meta = {}
     # The following metadata maps contiguous id from [0, #thing categories +
@@ -150,10 +248,20 @@ def get_metadata():
     stuff_classes = [k["name"] for k in ADE20K_150_CATEGORIES]
     stuff_colors = [k["color"] for k in ADE20K_150_CATEGORIES]
 
+    seen_classes = [k["name"] for k in ADE20K_150_CATEGORIES if k["id"] not in UNSEEN_ADE20K_CATEGORY_IDS]
+    seen_colors = [k["color"] for k in ADE20K_150_CATEGORIES if k["id"] not in UNSEEN_ADE20K_CATEGORY_IDS]
+    unseen_classes = [k["name"] for k in ADE20K_150_CATEGORIES if k["id"] in UNSEEN_ADE20K_CATEGORY_IDS]
+    unseen_colors = [k["color"] for k in ADE20K_150_CATEGORIES if k["id"] in UNSEEN_ADE20K_CATEGORY_IDS]
+
     meta["thing_classes"] = thing_classes
     meta["thing_colors"] = thing_colors
     meta["stuff_classes"] = stuff_classes
     meta["stuff_colors"] = stuff_colors
+
+    meta["seen_classes"] = seen_classes
+    meta["seen_colors"] = seen_colors
+    meta["unseen_classes"] = unseen_classes
+    meta["unseen_colors"] = unseen_colors
 
     # Convert category id for training:
     #   category id: like semantic segmentation, it is the class id for each
@@ -165,18 +273,55 @@ def get_metadata():
     #           softmax classifier.
     thing_dataset_id_to_contiguous_id = {}
     stuff_dataset_id_to_contiguous_id = {}
+    seen_dataset_id_to_contiguous_id = {}
+    seen_dataset_id_to_seen_contiguous_id = {}
+    unseen_dataset_id_to_contiguous_id = {}
+
+    seen_dataset_id_to_thing_contigous_id = {}
+    unseen_dataset_id_to_thing_contigous_id = {}
+    last_thing_id = 0
+
+    contiguous_id_to_seen_contiguous_id = []
+    last_seen_id = 0
+
+    max_dataset_id = max([ cat["id"] for cat in ADE20K_150_CATEGORIES ])
+    dataset_id_to_seen_contigous_id = [ -1 for _ in range(max_dataset_id+1) ]
 
     for i, cat in enumerate(ADE20K_150_CATEGORIES):
         if cat["isthing"]:
             thing_dataset_id_to_contiguous_id[cat["id"]] = i
+            if cat["id"] in UNSEEN_ADE20K_CATEGORY_IDS:
+                unseen_dataset_id_to_thing_contigous_id[cat["id"]] = last_thing_id
+            else:
+                seen_dataset_id_to_thing_contigous_id[cat["id"]] = last_thing_id
+            last_thing_id += 1
         # else:
         #     stuff_dataset_id_to_contiguous_id[cat["id"]] = i
-
+        
         # in order to use sem_seg evaluator
         stuff_dataset_id_to_contiguous_id[cat["id"]] = i
 
+        if cat["id"] in UNSEEN_ADE20K_CATEGORY_IDS:
+            # If this category is unseen, map it to -1 category.
+            # This allows then easy filtering on unseen categories.
+            contiguous_id_to_seen_contiguous_id.append(-1)
+            unseen_dataset_id_to_contiguous_id[cat["id"]] = i
+        else:
+            contiguous_id_to_seen_contiguous_id.append(last_seen_id)
+            seen_dataset_id_to_seen_contiguous_id[cat["id"]] = last_seen_id
+            dataset_id_to_seen_contigous_id[cat["id"]] = last_seen_id
+            last_seen_id += 1
+            seen_dataset_id_to_contiguous_id[cat["id"]] = i
+
     meta["thing_dataset_id_to_contiguous_id"] = thing_dataset_id_to_contiguous_id
     meta["stuff_dataset_id_to_contiguous_id"] = stuff_dataset_id_to_contiguous_id
+    meta["seen_dataset_id_to_contiguous_id"] = seen_dataset_id_to_contiguous_id
+    meta["dataset_id_to_seen_contigous_id"] = dataset_id_to_seen_contigous_id
+    meta["seen_dataset_id_to_seen_contiguous_id"] = seen_dataset_id_to_seen_contiguous_id
+    meta["unseen_dataset_id_to_contiguous_id"] = unseen_dataset_id_to_contiguous_id
+    meta["seen_dataset_id_to_thing_contigous_id"] = seen_dataset_id_to_thing_contigous_id
+    meta["unseen_dataset_id_to_thing_contigous_id"] = unseen_dataset_id_to_thing_contigous_id
+    meta["contiguous_id_to_seen_contiguous_id"] = contiguous_id_to_seen_contiguous_id
 
     return meta
 
