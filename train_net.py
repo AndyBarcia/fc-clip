@@ -60,7 +60,8 @@ from fcclip import (
     MaskFormerSemanticDatasetMapper,
     SemanticSegmentorWithTTA,
     add_maskformer2_config,
-    add_fcclip_config
+    add_fcclip_config,
+    add_zegfc_config
 )
 
 
@@ -300,6 +301,7 @@ def setup(args):
     add_deeplab_config(cfg)
     add_maskformer2_config(cfg)
     add_fcclip_config(cfg)
+    add_zegfc_config(cfg)
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
     cfg.freeze()

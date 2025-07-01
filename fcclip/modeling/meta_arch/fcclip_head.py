@@ -5,7 +5,9 @@ All Bytedance's Modifications are Copyright (year) Bytedance Ltd. and/or its aff
 Reference: https://github.com/facebookresearch/Mask2Former/blob/main/mask2former/modeling/meta_arch/mask_former_head.py
 """
 
+import torch
 import logging
+from einops import rearrange, einsum
 from copy import deepcopy
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
@@ -29,6 +31,8 @@ class FCCLIPHead(nn.Module):
         self,
         input_shape: Dict[str, ShapeSpec],
         *,
+        clip_embedding_dim: int,
+        use_rd: bool,
         num_classes: int,
         pixel_decoder: nn.Module,
         loss_weight: float = 1.0,
@@ -64,6 +68,11 @@ class FCCLIPHead(nn.Module):
 
         self.num_classes = num_classes
 
+        self.use_rd = use_rd
+        self.clip_embedding_dim = clip_embedding_dim
+        if use_rd:
+            self.class_embed = nn.Linear(self.clip_embedding_dim*2, self.clip_embedding_dim)
+
     @classmethod
     def from_config(cls, cfg, input_shape: Dict[str, ShapeSpec]):
         # figure out in_channels to transformer predictor
@@ -76,6 +85,8 @@ class FCCLIPHead(nn.Module):
             "input_shape": {
                 k: v for k, v in input_shape.items() if k in cfg.MODEL.SEM_SEG_HEAD.IN_FEATURES
             },
+            "clip_embedding_dim": cfg.MODEL.FC_CLIP.EMBED_DIM,
+            "use_rd": cfg.MODEL.ZEG_FC.USE_RELATIONSHIP_DESCRIPTOR,
             "ignore_value": cfg.MODEL.SEM_SEG_HEAD.IGNORE_VALUE,
             "num_classes": cfg.MODEL.SEM_SEG_HEAD.NUM_CLASSES,
             "pixel_decoder": build_pixel_decoder(cfg, input_shape),
@@ -88,14 +99,45 @@ class FCCLIPHead(nn.Module):
             ),
         }
 
+    def get_relationship_descriptor(
+        self,
+        text: torch.Tensor, # (T,C) or (B,T,C) 
+        img: torch.Tensor, # (B,C)
+    ) -> torch.Tensor:
+        if len(text.shape) == 2:
+            rd = einsum(text, img, "t c, b c -> b t c") # (B,T,C)
+            rd = torch.concat((rd,text.expand(img.shape[0],-1,-1)), dim=-1) # (B,T,2*C)
+        else:
+            rd = einsum(text, img, "b t c, b c -> b t c") # (B,T,C)
+            rd = torch.concat((rd,text), dim=-1) # (B,T,2*C)
+        rd = self.class_embed(rd).float()
+        return rd # (B,T,C')
+
     def forward(self, features, mask=None):
         return self.layers(features, mask)
 
     def layers(self, features, mask=None):
+        # Deformable-attention encoder.
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(features)
+
+        # Semantically enrich text embeddings with relationship descriptor
+        if self.use_rd:
+            text_classifier = self.get_relationship_descriptor(
+                features["text_classifier"],
+                features["clip_embedding"]
+            )
+        else:
+            text_classifier = features["text_classifier"]
+
+        # FC-CLIP decoder.
         if self.transformer_in_feature == "multi_scale_pixel_decoder":
-            predictions = self.predictor(multi_scale_features, mask_features, mask,
-                                        text_classifier=features["text_classifier"], num_templates=features["num_templates"])
+            predictions = self.predictor(
+                multi_scale_features, 
+                mask_features, 
+                mask,
+                text_classifier=text_classifier, 
+                num_templates=features["num_templates"]
+            )
         else:
             raise NotImplementedError
         return predictions

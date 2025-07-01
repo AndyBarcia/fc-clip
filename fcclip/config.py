@@ -120,7 +120,7 @@ def add_maskformer2_config(cfg):
 
 
 def add_fcclip_config(cfg):
-    # FC-CLIP model config
+    # FC-CLIP model config.
     cfg.MODEL.FC_CLIP = CN()
     cfg.MODEL.FC_CLIP.CLIP_MODEL_NAME = "convnext_large_d_320"
     cfg.MODEL.FC_CLIP.CLIP_PRETRAINED_WEIGHTS = "laion2b_s29b_b131k_ft_soup"
@@ -128,3 +128,9 @@ def add_fcclip_config(cfg):
     cfg.MODEL.FC_CLIP.GEOMETRIC_ENSEMBLE_ALPHA = 0.4
     cfg.MODEL.FC_CLIP.GEOMETRIC_ENSEMBLE_BETA = 0.8
     cfg.MODEL.FC_CLIP.ENSEMBLE_ON_VALID_MASK = False
+
+
+def add_zegfc_config(cfg):
+    # ZEG-FC model config.
+    cfg.MODEL.ZEG_FC = CN()
+    cfg.MODEL.ZEG_FC.USE_RELATIONSHIP_DESCRIPTOR = False

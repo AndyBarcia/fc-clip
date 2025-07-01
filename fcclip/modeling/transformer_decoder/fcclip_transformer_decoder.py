@@ -440,8 +440,13 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         predictions_mask = []
 
         # prediction heads on learnable query features
-        outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(output, mask_features, attn_mask_target_size=size_list[0],
-                                                                               text_classifier=text_classifier, num_templates=num_templates)
+        outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(
+            output, 
+            mask_features, 
+            attn_mask_target_size=size_list[0],
+            text_classifier=text_classifier, 
+            num_templates=num_templates
+        )
         predictions_class.append(outputs_class)
         predictions_mask.append(outputs_mask)
 
@@ -461,14 +466,21 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
                 tgt_key_padding_mask=None,
                 query_pos=query_embed
             )
+
+            # TODO add here query to text attention layer.
             
             # FFN
             output = self.transformer_ffn_layers[i](
                 output
             )
 
-            outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(output, mask_features, attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels],
-                                                                                   text_classifier=text_classifier, num_templates=num_templates)
+            outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(
+                output, 
+                mask_features, 
+                attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels],
+                text_classifier=text_classifier, 
+                num_templates=num_templates
+            )
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
 
@@ -493,6 +505,9 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         maskpool_embeddings = self.mask_pooling(x=mask_features, mask=outputs_mask) # [B, Q, C]
         maskpool_embeddings = self._mask_pooling_proj(maskpool_embeddings)
         class_embed = self.class_embed(maskpool_embeddings + decoder_output)
+
+        # TODO here convert text_classifier to RD descriptors.
+
         outputs_class = get_classification_logits(class_embed, text_classifier, self.logit_scale, num_templates)
 
         # NOTE: prediction is of higher-resolution
