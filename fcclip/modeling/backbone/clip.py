@@ -125,11 +125,14 @@ class CLIP(Backbone):
             out[f'res{i+2}'] = x.contiguous() # res 2 (os4), 3 (os8), 4 (os16), 5 (os32)
         
         x = self.clip_model.visual.trunk.norm_pre(x)
+        # TODO for the clip_vis_dense, apply the head??
         out['clip_vis_dense'] = x.contiguous()
 
-        x = self.clip_model.head.global_pool(x)
-        x = self.clip_model.head.norm(x)
-        x = self.clip_model.head.flatten(x)
+        x = self.clip_model.visual.trunk.head.global_pool(x)
+        x = self.clip_model.visual.trunk.head.norm(x)
+        x = self.clip_model.visual.trunk.head.flatten(x)
+        x = self.clip_model.visual.head(x)
+
         out['clip_embedding'] = x.contiguous()
 
         return out
@@ -150,7 +153,7 @@ class CLIP(Backbone):
         x = self.clip_model.visual.layer4(x)
         out['res5'] = x.contiguous() # os32
         out['clip_vis_dense'] = x
-        out['clip_embedding'] = self.clip_model.global_pool(x)
+        out['clip_embedding'] = self.clip_model.visual.global_pool(x)
         return out
 
     def visual_prediction_forward_convnext(self, x, masks):

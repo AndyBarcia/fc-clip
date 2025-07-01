@@ -14,3 +14,4 @@ See the License for the specific language governing permissions and
 limitations under the License. 
 """
 from .fcclip_transformer_decoder import MultiScaleMaskedTransformerDecoder
+from .zegfc_transformer_decoder import MultiScaleExtendedMaskedTransformerDecoder

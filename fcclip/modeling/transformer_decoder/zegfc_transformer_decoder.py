@@ -17,155 +17,29 @@ from detectron2.config import configurable
 from detectron2.layers import Conv2d
 from detectron2.utils.registry import Registry
 
-
 from .position_encoding import PositionEmbeddingSine
+from .fcclip_transformer_decoder import (
+    TRANSFORMER_DECODER_REGISTRY,
+    get_classification_logits,
+    MaskPooling,
+    SelfAttentionLayer,
+    CrossAttentionLayer,
+    FFNLayer,
+    MLP,
+    _get_activation_fn
+)
 
 
-TRANSFORMER_DECODER_REGISTRY = Registry("TRANSFORMER_MODULE")
-TRANSFORMER_DECODER_REGISTRY.__doc__ = """
-Registry for transformer module in MaskFormer.
-"""
+class TextCrossAttentionLayer(nn.Module):
 
-
-def build_transformer_decoder(cfg, in_channels, mask_classification=True):
-    """
-    Build a instance embedding branch from `cfg.MODEL.INS_EMBED_HEAD.NAME`.
-    """
-    name = cfg.MODEL.MASK_FORMER.TRANSFORMER_DECODER_NAME
-    return TRANSFORMER_DECODER_REGISTRY.get(name)(cfg, in_channels, mask_classification)
-
-
-def get_classification_logits(x, text_classifier, logit_scale, num_templates=None):
-    # x in shape of [B, *, C]
-    # text_classifier: either [num_classes, C] or [B, num_classes, C]
-    # logit_scale: scalar
-    # num_templates: list of template counts per non-void class
-    # Returns: [B, *, num_classes_final] where num_classes_final = len(num_templates) + 1
-    
-    # Normalize input features
-    x = F.normalize(x, dim=-1)
-    logit_scale = torch.clamp(logit_scale.exp(), max=100)
-    
-    # Handle different text_classifier dimensions
-    if text_classifier.dim() == 2:
-        # Original case: [num_classes, C]
-        text_classifier = F.normalize(text_classifier, dim=-1)
-        pred_logits = logit_scale * (x @ text_classifier.T)
-    elif text_classifier.dim() == 3:
-        # New case: [B, num_classes, C]
-        text_classifier = F.normalize(text_classifier, dim=-1)
-        # Batched matrix multiplication: [B, *, C] @ [B, C, num_classes] -> [B, *, num_classes]
-        pred_logits = logit_scale * torch.matmul(x, text_classifier.transpose(-1, -2))
-    else:
-        raise ValueError(f"text_classifier must be 2D or 3D, got {text_classifier.dim()}D")
-    
-    # Max ensembling over templates
-    final_pred_logits = []
-    cur_idx = 0
-    # Process each group of templates for non-void classes
-    for num_t in num_templates:
-        # Slice current template group and take max
-        group_logits = pred_logits[..., cur_idx:cur_idx + num_t]
-        final_pred_logits.append(group_logits.max(-1).values)
-        cur_idx += num_t
-    # Append void class (last element)
-    final_pred_logits.append(pred_logits[..., -1])
-    # Stack along new class dimension
-    final_pred_logits = torch.stack(final_pred_logits, dim=-1)
-    
-    return final_pred_logits
-
-
-# Ref: https://github.com/NVlabs/ODISE/blob/e97b06c424c575fec9fc5368dd4b3e050d91abc4/odise/modeling/meta_arch/odise.py#L923
-class MaskPooling(nn.Module):
     def __init__(
-        self,
+        self, 
+        d_model, 
+        nhead, 
+        dropout=0.0,
+        activation="relu", 
+        normalize_before=False
     ):
-        super().__init__()
-
-    def forward(self, x, mask):
-        """
-        Args:
-            x: [B, C, H, W]
-            mask: [B, Q, H, W]
-        """
-        if not x.shape[-2:] == mask.shape[-2:]:
-            # reshape mask to x
-            mask = F.interpolate(mask, size=x.shape[-2:], mode='bilinear', align_corners=False)
-        with torch.no_grad():
-            mask = mask.detach()
-            mask = (mask > 0).to(mask.dtype)
-            denorm = mask.sum(dim=(-1, -2), keepdim=True) + 1e-8
-
-        mask_pooled_x = torch.einsum(
-            "bchw,bqhw->bqc",
-            x,
-            mask / denorm,
-        )
-        return mask_pooled_x
-
-class SelfAttentionLayer(nn.Module):
-
-    def __init__(self, d_model, nhead, dropout=0.0,
-                 activation="relu", normalize_before=False):
-        super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
-
-        self.norm = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
-
-        self.activation = _get_activation_fn(activation)
-        self.normalize_before = normalize_before
-
-        self._reset_parameters()
-    
-    def _reset_parameters(self):
-        for p in self.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
-
-    def with_pos_embed(self, tensor, pos: Optional[Tensor]):
-        return tensor if pos is None else tensor + pos
-
-    def forward_post(self, tgt,
-                     tgt_mask: Optional[Tensor] = None,
-                     tgt_key_padding_mask: Optional[Tensor] = None,
-                     query_pos: Optional[Tensor] = None):
-        q = k = self.with_pos_embed(tgt, query_pos)
-        tgt2 = self.self_attn(q, k, value=tgt, attn_mask=tgt_mask,
-                              key_padding_mask=tgt_key_padding_mask)[0]
-        tgt = tgt + self.dropout(tgt2)
-        tgt = self.norm(tgt)
-
-        return tgt
-
-    def forward_pre(self, tgt,
-                    tgt_mask: Optional[Tensor] = None,
-                    tgt_key_padding_mask: Optional[Tensor] = None,
-                    query_pos: Optional[Tensor] = None):
-        tgt2 = self.norm(tgt)
-        q = k = self.with_pos_embed(tgt2, query_pos)
-        tgt2 = self.self_attn(q, k, value=tgt2, attn_mask=tgt_mask,
-                              key_padding_mask=tgt_key_padding_mask)[0]
-        tgt = tgt + self.dropout(tgt2)
-        
-        return tgt
-
-    def forward(self, tgt,
-                tgt_mask: Optional[Tensor] = None,
-                tgt_key_padding_mask: Optional[Tensor] = None,
-                query_pos: Optional[Tensor] = None):
-        if self.normalize_before:
-            return self.forward_pre(tgt, tgt_mask,
-                                    tgt_key_padding_mask, query_pos)
-        return self.forward_post(tgt, tgt_mask,
-                                 tgt_key_padding_mask, query_pos)
-
-
-class CrossAttentionLayer(nn.Module):
-
-    def __init__(self, d_model, nhead, dropout=0.0,
-                 activation="relu", normalize_before=False):
         super().__init__()
         self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
 
@@ -185,117 +59,55 @@ class CrossAttentionLayer(nn.Module):
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
 
-    def forward_post(self, tgt, memory,
-                     memory_mask: Optional[Tensor] = None,
-                     memory_key_padding_mask: Optional[Tensor] = None,
-                     pos: Optional[Tensor] = None,
-                     query_pos: Optional[Tensor] = None):
-        tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt, query_pos),
-                                   key=self.with_pos_embed(memory, pos),
-                                   value=memory, attn_mask=memory_mask,
-                                   key_padding_mask=memory_key_padding_mask)[0]
+    def forward_post(
+        self, 
+        tgt, 
+        text_classification,
+        query_pos: Optional[Tensor] = None
+    ):
+        tgt2 = self.multihead_attn(
+            query=self.with_pos_embed(tgt, query_pos),
+            key=text_classification,
+            value=text_classification, 
+            attn_mask=None,
+            key_padding_mask=None
+        )[0]
         tgt = tgt + self.dropout(tgt2)
         tgt = self.norm(tgt)
         
         return tgt
 
-    def forward_pre(self, tgt, memory,
-                    memory_mask: Optional[Tensor] = None,
-                    memory_key_padding_mask: Optional[Tensor] = None,
-                    pos: Optional[Tensor] = None,
-                    query_pos: Optional[Tensor] = None):
+    def forward_pre(
+        self, 
+        tgt, 
+        text_classification,
+        query_pos: Optional[Tensor] = None
+    ):
         tgt2 = self.norm(tgt)
-        tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt2, query_pos),
-                                   key=self.with_pos_embed(memory, pos),
-                                   value=memory, attn_mask=memory_mask,
-                                   key_padding_mask=memory_key_padding_mask)[0]
+        tgt2 = self.multihead_attn(
+            query=self.with_pos_embed(tgt2, query_pos),
+            key=text_classification,
+            value=text_classification, 
+            attn_mask=None,
+            key_padding_mask=None
+        )[0]
         tgt = tgt + self.dropout(tgt2)
 
         return tgt
 
-    def forward(self, tgt, memory,
-                memory_mask: Optional[Tensor] = None,
-                memory_key_padding_mask: Optional[Tensor] = None,
-                pos: Optional[Tensor] = None,
-                query_pos: Optional[Tensor] = None):
+    def forward(
+        self, 
+        tgt, 
+        text_classification,
+        query_pos: Optional[Tensor] = None
+    ):
         if self.normalize_before:
-            return self.forward_pre(tgt, memory, memory_mask,
-                                    memory_key_padding_mask, pos, query_pos)
-        return self.forward_post(tgt, memory, memory_mask,
-                                 memory_key_padding_mask, pos, query_pos)
-
-
-class FFNLayer(nn.Module):
-
-    def __init__(self, d_model, dim_feedforward=2048, dropout=0.0,
-                 activation="relu", normalize_before=False):
-        super().__init__()
-        # Implementation of Feedforward model
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-
-        self.norm = nn.LayerNorm(d_model)
-
-        self.activation = _get_activation_fn(activation)
-        self.normalize_before = normalize_before
-
-        self._reset_parameters()
-    
-    def _reset_parameters(self):
-        for p in self.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
-
-    def with_pos_embed(self, tensor, pos: Optional[Tensor]):
-        return tensor if pos is None else tensor + pos
-
-    def forward_post(self, tgt):
-        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
-        tgt = tgt + self.dropout(tgt2)
-        tgt = self.norm(tgt)
-        return tgt
-
-    def forward_pre(self, tgt):
-        tgt2 = self.norm(tgt)
-        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
-        tgt = tgt + self.dropout(tgt2)
-        return tgt
-
-    def forward(self, tgt):
-        if self.normalize_before:
-            return self.forward_pre(tgt)
-        return self.forward_post(tgt)
-
-
-def _get_activation_fn(activation):
-    """Return an activation function given a string"""
-    if activation == "relu":
-        return F.relu
-    if activation == "gelu":
-        return F.gelu
-    if activation == "glu":
-        return F.glu
-    raise RuntimeError(F"activation should be relu/gelu, not {activation}.")
-
-
-class MLP(nn.Module):
-    """ Very simple multi-layer perceptron (also called FFN)"""
-
-    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
-        super().__init__()
-        self.num_layers = num_layers
-        h = [hidden_dim] * (num_layers - 1)
-        self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
-
-    def forward(self, x):
-        for i, layer in enumerate(self.layers):
-            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
-        return x
+            return self.forward_pre(tgt, text_classification, query_pos)
+        return self.forward_post(tgt, text_classification, query_pos)
 
 
 @TRANSFORMER_DECODER_REGISTRY.register()
-class MultiScaleMaskedTransformerDecoder(nn.Module):
+class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
 
     @configurable
     def __init__(
@@ -345,6 +157,7 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         self.num_layers = dec_layers
         self.transformer_self_attention_layers = nn.ModuleList()
         self.transformer_cross_attention_layers = nn.ModuleList()
+        self.transformer_text_cross_attention_layers = nn.ModuleList()
         self.transformer_ffn_layers = nn.ModuleList()
 
         for _ in range(self.num_layers):
@@ -359,6 +172,15 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
 
             self.transformer_cross_attention_layers.append(
                 CrossAttentionLayer(
+                    d_model=hidden_dim,
+                    nhead=nheads,
+                    dropout=0.0,
+                    normalize_before=pre_norm,
+                )
+            )
+
+            self.transformer_text_cross_attention_layers.append(
+                TextCrossAttentionLayer(
                     d_model=hidden_dim,
                     nhead=nheads,
                     dropout=0.0,
@@ -483,7 +305,12 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
                 memory_key_padding_mask=None,  # here we do not apply masking on padded region
                 pos=pos[level_index], query_pos=query_embed
             )
-
+            # then, text cross-attention
+            output = self.transformer_text_cross_attention_layers[i](
+                output, text_classifier,
+                query_pos=query_embed
+            )
+            # then, self-attention
             output = self.transformer_self_attention_layers[i](
                 output, tgt_mask=None,
                 tgt_key_padding_mask=None,
@@ -526,8 +353,6 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         maskpool_embeddings = self.mask_pooling(x=mask_features, mask=outputs_mask) # [B, Q, C]
         maskpool_embeddings = self._mask_pooling_proj(maskpool_embeddings)
         class_embed = self.class_embed(maskpool_embeddings + decoder_output)
-
-        # TODO here convert text_classifier to RD descriptors.
 
         outputs_class = get_classification_logits(class_embed, text_classifier, self.logit_scale, num_templates)
 
