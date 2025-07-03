@@ -183,6 +183,7 @@ class FCCLIP(nn.Module):
         self.test_text_classifier = None
         return
 
+    @torch.compiler.disable(recursive=True)
     def get_text_classifier(self):
         if self.training:
             if self.train_text_classifier is None:

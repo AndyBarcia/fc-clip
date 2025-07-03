@@ -109,47 +109,53 @@ class HungarianMatcher(nn.Module):
             out_prob = outputs["pred_logits"][b].softmax(-1)  # [num_queries, num_classes]
             tgt_ids = targets[b]["labels"]
 
-            # Compute the classification cost. Contrary to the loss, we don't use the NLL,
-            # but approximate it in 1 - proba[target class].
-            # The 1 is a constant that doesn't change the matching, it can be ommitted.
-            cost_class = -out_prob[:, tgt_ids]
+            if tgt_ids.numel() > 0:                
+                # Compute the classification cost.
+                cost_class = -out_prob[:, tgt_ids]
 
-            out_mask = outputs["pred_masks"][b]  # [num_queries, H_pred, W_pred]
-            # gt masks are already padded when preparing target
-            tgt_mask = targets[b]["masks"].to(out_mask)
+                out_mask = outputs["pred_masks"][b]  # [num_queries, H_pred, W_pred]
+                tgt_mask = targets[b]["masks"].to(out_mask)
 
-            out_mask = out_mask[:, None]
-            tgt_mask = tgt_mask[:, None]
-            # all masks share the same set of points for efficient matching!
-            point_coords = torch.rand(1, self.num_points, 2, device=out_mask.device)
-            # get gt labels
-            tgt_mask = point_sample(
-                tgt_mask,
-                point_coords.repeat(tgt_mask.shape[0], 1, 1),
-                align_corners=False,
-            ).squeeze(1)
+                out_mask = out_mask[:, None]
+                tgt_mask = tgt_mask[:, None]
+                
+                # all masks share the same set of points for efficient matching!
+                point_coords = torch.rand(1, self.num_points, 2, device=out_mask.device)
+                
+                # Sample points from ground-truth masks
+                tgt_mask = point_sample(
+                    tgt_mask,
+                    point_coords.repeat(tgt_mask.shape[0], 1, 1),
+                    align_corners=False,
+                ).squeeze(1)
 
-            out_mask = point_sample(
-                out_mask,
-                point_coords.repeat(out_mask.shape[0], 1, 1),
-                align_corners=False,
-            ).squeeze(1)
+                # Sample points from predicted masks
+                out_mask = point_sample(
+                    out_mask,
+                    point_coords.repeat(out_mask.shape[0], 1, 1),
+                    align_corners=False,
+                ).squeeze(1)
 
-            with autocast(enabled=False):
-                out_mask = out_mask.float()
-                tgt_mask = tgt_mask.float()
-                # Compute the focal loss between masks
-                cost_mask = batch_sigmoid_ce_loss_jit(out_mask, tgt_mask)
-
-                # Compute the dice loss betwen masks
-                cost_dice = batch_dice_loss_jit(out_mask, tgt_mask)
-            
-            # Final cost matrix
-            C = (
-                self.cost_mask * cost_mask
-                + self.cost_class * cost_class
-                + self.cost_dice * cost_dice
-            )
+                with autocast(enabled=False):
+                    out_mask = out_mask.float()
+                    tgt_mask = tgt_mask.float()
+                    # Compute the focal loss between masks
+                    cost_mask = batch_sigmoid_ce_loss_jit(out_mask, tgt_mask)
+                    # Compute the dice loss between masks
+                    cost_dice = batch_dice_loss_jit(out_mask, tgt_mask)
+                
+                # Final cost matrix
+                C = (
+                    self.cost_mask * cost_mask
+                    + self.cost_class * cost_class
+                    + self.cost_dice * cost_dice
+                )
+            else:
+                # This block runs if there are NO ground-truth objects.
+                # We create an empty cost matrix. The shape [num_queries, 0] is
+                # important. linear_sum_assignment will correctly handle this
+                # by returning empty indices, which is the desired behavior.
+                C = torch.empty(num_queries, 0, device=out_prob.device)
             C = C.reshape(num_queries, -1).cpu()
 
             indices.append(linear_sum_assignment(C))

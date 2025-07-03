@@ -118,6 +118,14 @@ def add_maskformer2_config(cfg):
     # the original paper.
     cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO = 0.75
 
+    # Compilation options
+    cfg.MODEL.COMPILE = CN()
+    cfg.MODEL.COMPILE.ENABLED = False
+    cfg.MODEL.COMPILE.TRACE = False
+    cfg.MODEL.COMPILE.MODE = "default"
+
+    # Training precission options
+    cfg.SOLVER.AMP.PRECISION = "float16"
 
 def add_fcclip_config(cfg):
     # FC-CLIP model config.
