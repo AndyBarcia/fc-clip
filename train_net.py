@@ -35,6 +35,9 @@ from detectron2.engine import (
     default_argument_parser,
     default_setup,
     launch,
+    create_ddp_model,
+    AMPTrainer,
+    SimpleTrainer
 )
 from detectron2.evaluation import (
     CityscapesInstanceEvaluator,
@@ -49,6 +52,7 @@ from detectron2.evaluation import (
 from detectron2.projects.deeplab import add_deeplab_config, build_lr_scheduler
 from detectron2.solver.build import maybe_add_gradient_clipping
 from detectron2.utils.logger import setup_logger
+import weakref
 
 from fcclip import (
     COCOInstanceNewBaselineDatasetMapper,
@@ -61,14 +65,140 @@ from fcclip import (
     SemanticSegmentorWithTTA,
     add_maskformer2_config,
     add_fcclip_config,
-    add_zegfc_config
+    add_zegfc_config,
+    build_compiled_model
 )
+
+
+class MemEfficientDetectionCheckpointer(DetectionCheckpointer):
+    def save(self, name: str, **kwargs: Any) -> None:
+        """
+        Dump model and checkpointables to a file.
+        Only saves parameters that have gradients (non-frozen parameters).
+        Args:
+            name (str): name of the file.
+            kwargs (dict): extra arbitrary data to save.
+        """
+        if not self.save_dir or not self.save_to_disk:
+            return
+        
+        data = {}
+        
+        # Only save model parameters that require gradients
+        model_state_dict = {}
+        for param_name, param in self.model.named_parameters():
+            if param.requires_grad:
+                model_state_dict[param_name] = param.data
+        
+        # Also include buffers (batch norm stats, etc.) as they're usually needed
+        for buffer_name, buffer in self.model.named_buffers():
+            model_state_dict[buffer_name] = buffer.data
+            
+        data["model"] = model_state_dict
+        
+        # For checkpointables, filter based on requires_grad if they have parameters
+        for key, obj in self.checkpointables.items():
+            if hasattr(obj, 'state_dict'):
+                obj_state_dict = {}
+                
+                # If the object has named_parameters method (like optimizers, schedulers)
+                if hasattr(obj, 'named_parameters'):
+                    for param_name, param in obj.named_parameters():
+                        if param.requires_grad:
+                            obj_state_dict[param_name] = param.data
+                else:
+                    # For other checkpointables (optimizers, schedulers), save full state
+                    # as they typically only store states for parameters that require gradients
+                    obj_state_dict = obj.state_dict()
+                    
+                data[key] = obj_state_dict
+            else:
+                # If no state_dict method, save the object as-is
+                data[key] = obj
+        
+        data.update(kwargs)
+        basename = "{}.pth".format(name)
+        save_file = os.path.join(self.save_dir, basename)
+        assert os.path.basename(save_file) == basename, basename
+        self.logger.info("Saving checkpoint to {}".format(save_file))
+        
+        # Log how many parameters are being saved vs total
+        total_params = sum(p.numel() for p in self.model.parameters())
+        saved_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        self.logger.info(f"Saving {saved_params}/{total_params} parameters ({saved_params/total_params*100:.1f}%)")
+        
+        with self.path_manager.open(save_file, "wb") as f:
+            torch.save(data, f)
+        self.tag_last_checkpoint(basename)
 
 
 class Trainer(DefaultTrainer):
     """
     Extension of the Trainer class adapted to FCCLIP.
     """
+
+    def __init__(self, cfg):
+        """
+        Args:
+            cfg (CfgNode):
+        """
+        super(DefaultTrainer, self).__init__()
+        logger = logging.getLogger("detectron2")
+        if not logger.isEnabledFor(logging.INFO):  # setup_logger is not called for d2
+            setup_logger()
+        cfg = DefaultTrainer.auto_scale_workers(cfg, comm.get_world_size())
+
+        # Assume these objects must be constructed in this order.
+        model, compiled_model = self.build_model(cfg)
+        optimizer = self.build_optimizer(cfg, model)
+        data_loader = self.build_train_loader(cfg)
+
+        compiled_model = create_ddp_model(compiled_model, broadcast_buffers=False)
+
+        if cfg.SOLVER.AMP.ENABLED:
+            # Convert precision string to torch dtype
+            precision_map = {
+                "float16": torch.float16,
+                "float8_e4m3fn": torch.float8_e4m3fn,
+                "float8_e5m2": torch.float8_e5m2
+            }
+            precision = precision_map.get(cfg.SOLVER.AMP.PRECISION, torch.float16)
+
+            self._trainer = AMPTrainer(
+                compiled_model, data_loader, optimizer,
+                precision=precision
+            )
+        else:
+            self._trainer = SimpleTrainer(
+                compiled_model, data_loader, optimizer
+            )
+
+        self.scheduler = self.build_lr_scheduler(cfg, optimizer)
+        self.checkpointer = MemEfficientDetectionCheckpointer(
+            # Assume you want to save checkpoints together with logs/statistics
+            model,
+            cfg.OUTPUT_DIR,
+            trainer=weakref.proxy(self),
+        )
+        self.start_iter = 0
+        self.max_iter = cfg.SOLVER.MAX_ITER
+        self.cfg = cfg
+
+        self.register_hooks(self.build_hooks())
+
+    @classmethod
+    def build_model(cls, cfg):
+        """
+        Returns:
+            torch.nn.Module:
+
+        It now calls :func:`detectron2.modeling.build_model`.
+        Overwrite it if you'd like a different model.
+        """
+        model, compiled_model = build_compiled_model(cfg)
+        logger = logging.getLogger(__name__)
+        logger.info("Model:\n{}".format(model))
+        return model, compiled_model
 
     @classmethod
     def build_evaluator(cls, cfg, dataset_name, output_folder=None):
@@ -315,7 +445,7 @@ def main(args):
     cfg = setup(args)
 
     if args.eval_only:
-        model = Trainer.build_model(cfg)
+        model, compiled_model = Trainer.build_model(cfg)
 
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -330,12 +460,12 @@ def main(args):
             frozen_params_exclude_text += p.numel()    
         print(f"total_params: {total_params}, trainable_params: {trainable_params}, frozen_params: {frozen_params}, frozen_params_exclude_text: {frozen_params_exclude_text}")
 
-        DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
+        MemEfficientDetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
             cfg.MODEL.WEIGHTS, resume=args.resume
         )
-        res = Trainer.test(cfg, model)
+        res = Trainer.test(cfg, compiled_model)
         if cfg.TEST.AUG.ENABLED:
-            res.update(Trainer.test_with_TTA(cfg, model))
+            res.update(Trainer.test_with_TTA(cfg, compiled_model))
         if comm.is_main_process():
             verify_results(cfg, res)
         return res
