@@ -5,6 +5,7 @@ All Bytedance's Modifications are Copyright (year) Bytedance Ltd. and/or its aff
 Reference: https://github.com/facebookresearch/Mask2Former/blob/main/mask2former/modeling/transformer_decoder/mask2former_transformer_decoder.py
 """
 
+import math
 import logging
 import fvcore.nn.weight_init as weight_init
 from typing import Optional
@@ -35,20 +36,18 @@ class TextCrossAttentionLayer(nn.Module):
     def __init__(
         self, 
         d_model, 
+        d_clip: int,
         nhead, 
         dropout=0.0,
         activation="relu", 
         normalize_before=False
     ):
         super().__init__()
-        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
-
+        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, kdim=d_clip, vdim=d_clip, dropout=dropout)
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
-
         self.activation = _get_activation_fn(activation)
         self.normalize_before = normalize_before
-
         self._reset_parameters()
     
     def _reset_parameters(self):
@@ -59,51 +58,126 @@ class TextCrossAttentionLayer(nn.Module):
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
 
+    def _compute_attn_logits(self, q, k):
+        # Project queries and keys
+        if self.multihead_attn._qkv_same_embed_dim:
+            # Combined projection weights
+            w_q, w_k, _ = self.multihead_attn.in_proj_weight.chunk(3, dim=0)
+            b_q, b_k, _ = self.multihead_attn.in_proj_bias.chunk(3)
+        else:
+            # Separate projection weights
+            w_q = self.multihead_attn.q_proj_weight
+            w_k = self.multihead_attn.k_proj_weight
+            b_q = self.multihead_attn.in_proj_bias[:self.multihead_attn.embed_dim]
+            b_k = self.multihead_attn.in_proj_bias[self.multihead_attn.embed_dim:2*self.multihead_attn.embed_dim]
+
+        q = F.linear(q, w_q, b_q)
+        k = F.linear(k, w_k, b_k)
+        
+        # Prepare dimensions
+        tgt_len, bsz, embed_dim = q.size()
+        src_len = k.size(0)
+        head_dim = embed_dim // self.multihead_attn.num_heads
+        
+        # Reshape queries and keys for efficient computation
+        q = q.contiguous().view(tgt_len, bsz, self.multihead_attn.num_heads, head_dim)
+        k = k.contiguous().view(src_len, bsz, self.multihead_attn.num_heads, head_dim)
+        
+        # Compute scaled dot-product attention logits
+        # Using einsum for efficient computation of averaged attention
+        attn_logits = torch.einsum('ibhd,jbhd->bij', q, k) / math.sqrt(head_dim)
+        
+        # Result is already averaged over heads due to einsum operation
+        return attn_logits  # Shape: [bsz, tgt_len, src_len]
+
     def forward_post(
         self, 
         tgt, 
         text_classification,
-        query_pos: Optional[Tensor] = None
+        query_pos: Optional[Tensor] = None,
+        return_attn_logits: bool = False,
     ):
-        tgt2 = self.multihead_attn(
-            query=self.with_pos_embed(tgt, query_pos),
-            key=text_classification,
-            value=text_classification, 
-            attn_mask=None,
-            key_padding_mask=None
-        )[0]
+        q = self.with_pos_embed(tgt, query_pos)
+        k = v = text_classification
+        
+        if return_attn_logits:
+            # Compute attention logits (already averaged over heads)
+            attn_logits = self._compute_attn_logits(q, k)
+            
+            # Use multihead_attn for output computation
+            tgt2 = self.multihead_attn(
+                query=q,
+                key=k,
+                value=v,
+                attn_mask=None,
+                key_padding_mask=None
+            )[0]
+        else:
+            tgt2 = self.multihead_attn(
+                query=q,
+                key=k,
+                value=v,
+                attn_mask=None,
+                key_padding_mask=None
+            )[0]
+        
         tgt = tgt + self.dropout(tgt2)
         tgt = self.norm(tgt)
         
-        return tgt
+        return (tgt, attn_logits) if return_attn_logits else (tgt, None)
 
     def forward_pre(
         self, 
         tgt, 
         text_classification,
-        query_pos: Optional[Tensor] = None
+        query_pos: Optional[Tensor] = None,
+        return_attn_logits: bool = False
     ):
         tgt2 = self.norm(tgt)
-        tgt2 = self.multihead_attn(
-            query=self.with_pos_embed(tgt2, query_pos),
-            key=text_classification,
-            value=text_classification, 
-            attn_mask=None,
-            key_padding_mask=None
-        )[0]
+        q = self.with_pos_embed(tgt2, query_pos)
+        k = v = text_classification
+        
+        if return_attn_logits:
+            # Compute attention logits (already averaged over heads)
+            attn_logits = self._compute_attn_logits(q, k)
+            
+            # Use multihead_attn for output computation
+            tgt2 = self.multihead_attn(
+                query=q,
+                key=k,
+                value=v,
+                attn_mask=None,
+                key_padding_mask=None
+            )[0]
+        else:
+            tgt2 = self.multihead_attn(
+                query=q,
+                key=k,
+                value=v,
+                attn_mask=None,
+                key_padding_mask=None
+            )[0]
+        
         tgt = tgt + self.dropout(tgt2)
-
-        return tgt
+        return (tgt, attn_logits) if return_attn_logits else (tgt, None)
 
     def forward(
         self, 
         tgt, 
         text_classification,
-        query_pos: Optional[Tensor] = None
+        query_pos: Optional[Tensor] = None,
+        return_attn_logits: bool = False
     ):
         if self.normalize_before:
-            return self.forward_pre(tgt, text_classification, query_pos)
-        return self.forward_post(tgt, text_classification, query_pos)
+            return self.forward_pre(
+                tgt, text_classification.transpose(0,1), query_pos, 
+                return_attn_logits=return_attn_logits
+            )
+        else:
+            return self.forward_post(
+                tgt, text_classification.transpose(0,1), query_pos,
+                return_attn_logits=return_attn_logits
+            )
 
 
 @TRANSFORMER_DECODER_REGISTRY.register()
@@ -115,7 +189,6 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         in_channels,
         mask_classification=True,
         *,
-        num_classes: int,
         hidden_dim: int,
         num_queries: int,
         nheads: int,
@@ -124,6 +197,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         pre_norm: bool,
         mask_dim: int,
         enforce_input_project: bool,
+        text_atnn_cls: bool,
         clip_embedding_dim: int
     ):
         """
@@ -131,7 +205,6 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         Args:
             in_channels: channels of the input features
             mask_classification: whether to add mask classifier or not
-            num_classes: number of classes
             hidden_dim: Transformer feature dimension
             num_queries: number of queries
             nheads: number of heads
@@ -182,6 +255,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             self.transformer_text_cross_attention_layers.append(
                 TextCrossAttentionLayer(
                     d_model=hidden_dim,
+                    d_clip=clip_embedding_dim,
                     nhead=nheads,
                     dropout=0.0,
                     normalize_before=pre_norm,
@@ -229,13 +303,23 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         self.class_embed = MLP(hidden_dim, hidden_dim, clip_embedding_dim, 3)
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
+        # ZEG-FC
+        self.text_atnn_cls = text_atnn_cls
+        if self.text_atnn_cls:
+            self.intermediate_text_cross_attention_layer = TextCrossAttentionLayer(
+                d_model=hidden_dim,
+                d_clip=clip_embedding_dim,
+                nhead=nheads,
+                dropout=0.0,
+                normalize_before=pre_norm,
+            )
+
     @classmethod
     def from_config(cls, cfg, in_channels, mask_classification):
         ret = {}
         ret["in_channels"] = in_channels
         ret["mask_classification"] = mask_classification
         
-        ret["num_classes"] = cfg.MODEL.SEM_SEG_HEAD.NUM_CLASSES
         ret["hidden_dim"] = cfg.MODEL.MASK_FORMER.HIDDEN_DIM
         ret["num_queries"] = cfg.MODEL.MASK_FORMER.NUM_OBJECT_QUERIES
         # Transformer parameters:
@@ -252,6 +336,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         ret["pre_norm"] = cfg.MODEL.MASK_FORMER.PRE_NORM
         ret["enforce_input_project"] = cfg.MODEL.MASK_FORMER.ENFORCE_INPUT_PROJ
 
+        ret["text_atnn_cls"] = cfg.MODEL.ZEG_FC.TEXT_ATTN_CLS
         ret["mask_dim"] = cfg.MODEL.SEM_SEG_HEAD.MASK_DIM
         ret["clip_embedding_dim"] = cfg.MODEL.FC_CLIP.EMBED_DIM
         return ret
@@ -284,10 +369,21 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         predictions_class = []
         predictions_mask = []
 
+        # Optional starting cross-attention for text. 
+        if self.text_atnn_cls:
+            output, text_attn_logits = self.intermediate_text_cross_attention_layer(
+                output, text_classifier,
+                query_pos=query_embed,
+                return_attn_logits=self.text_atnn_cls
+            )
+        else:
+            text_attn_logits = None
+
         # prediction heads on learnable query features
         outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(
             output, 
             mask_features, 
+            text_attn_logits,
             attn_mask_target_size=size_list[0],
             text_classifier=text_classifier, 
             num_templates=num_templates
@@ -306,9 +402,10 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                 pos=pos[level_index], query_pos=query_embed
             )
             # then, text cross-attention
-            output = self.transformer_text_cross_attention_layers[i](
+            output, text_attn_logits = self.transformer_text_cross_attention_layers[i](
                 output, text_classifier,
-                query_pos=query_embed
+                query_pos=query_embed,
+                return_attn_logits=self.text_atnn_cls
             )
             # then, self-attention
             output = self.transformer_self_attention_layers[i](
@@ -325,6 +422,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(
                 output, 
                 mask_features, 
+                text_attn_logits,
                 attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels],
                 text_classifier=text_classifier, 
                 num_templates=num_templates
@@ -343,7 +441,15 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         }
         return out
 
-    def forward_prediction_heads(self, output, mask_features, attn_mask_target_size, text_classifier, num_templates):
+    def forward_prediction_heads(
+        self, 
+        output, 
+        mask_features, 
+        text_attn_logits, 
+        attn_mask_target_size, 
+        text_classifier, 
+        num_templates
+    ):
         decoder_output = self.decoder_norm(output)
         decoder_output = decoder_output.transpose(0, 1)
         mask_embed = self.mask_embed(decoder_output)
@@ -353,8 +459,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         maskpool_embeddings = self.mask_pooling(x=mask_features, mask=outputs_mask) # [B, Q, C]
         maskpool_embeddings = self._mask_pooling_proj(maskpool_embeddings)
         class_embed = self.class_embed(maskpool_embeddings + decoder_output)
-
-        outputs_class = get_classification_logits(class_embed, text_classifier, self.logit_scale, num_templates)
+        outputs_class = get_classification_logits(class_embed, text_classifier, self.logit_scale, text_attn_logits, num_templates)
 
         # NOTE: prediction is of higher-resolution
         # [B, Q, H, W] -> [B, Q, H*W] -> [B, h, Q, H*W] -> [B*h, Q, HW]

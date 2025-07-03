@@ -142,3 +142,4 @@ def add_zegfc_config(cfg):
     # ZEG-FC model config.
     cfg.MODEL.ZEG_FC = CN()
     cfg.MODEL.ZEG_FC.USE_RELATIONSHIP_DESCRIPTOR = False
+    cfg.MODEL.ZEG_FC.TEXT_ATTN_CLS = False
