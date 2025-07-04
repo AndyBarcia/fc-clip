@@ -35,7 +35,7 @@ def build_transformer_decoder(cfg, in_channels, mask_classification=True):
     return TRANSFORMER_DECODER_REGISTRY.get(name)(cfg, in_channels, mask_classification)
 
 
-def get_classification_logits(x, text_classifier, logit_scale, text_attn_logits=None, num_templates=None):
+def get_classification_logits(x, text_classifier, logit_scale, num_templates=None, text_attn_logits=None):
     # x in shape of [B, *, C]
     # text_classifier: either [num_classes, C] or [B, num_classes, C]
     # text_attn_logits: optional [B, Q, num_classes]
