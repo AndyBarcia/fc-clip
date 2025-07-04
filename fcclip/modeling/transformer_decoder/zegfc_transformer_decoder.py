@@ -441,6 +441,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         }
         return out
 
+    @torch.compiler.disable(recursive=False)
     def forward_prediction_heads(
         self, 
         output, 
