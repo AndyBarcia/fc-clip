@@ -125,7 +125,6 @@ class CLIP(Backbone):
             out[f'res{i+2}'] = x.contiguous() # res 2 (os4), 3 (os8), 4 (os16), 5 (os32)
         
         x = self.clip_model.visual.trunk.norm_pre(x)
-        # TODO for the clip_vis_dense, apply the head??
         out['clip_vis_dense'] = x.contiguous()
 
         x = self.clip_model.visual.trunk.head.global_pool(x)

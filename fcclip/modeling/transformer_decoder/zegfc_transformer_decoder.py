@@ -164,18 +164,23 @@ class TextCrossAttentionLayer(nn.Module):
     def forward(
         self, 
         tgt, 
-        text_classification,
+        text_classification, # (B,T,C) or (T,C)
         query_pos: Optional[Tensor] = None,
         return_attn_logits: bool = False
     ):
+        if len(text_classification.shape) == 2:
+            text_classification = text_classification[:,None].expand(-1,tgt.shape[1],-1) # (T,B,C)
+        else:
+            text_classification = text_classification.transpose(0,1) # (T,B,C)
+
         if self.normalize_before:
             return self.forward_pre(
-                tgt, text_classification.transpose(0,1), query_pos, 
+                tgt, text_classification, query_pos, 
                 return_attn_logits=return_attn_logits
             )
         else:
             return self.forward_post(
-                tgt, text_classification.transpose(0,1), query_pos,
+                tgt, text_classification, query_pos,
                 return_attn_logits=return_attn_logits
             )
 
@@ -196,8 +201,13 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         dec_layers: int,
         pre_norm: bool,
         mask_dim: int,
+        mask_embed_type: str = "mlp",
+        class_embed_type: str = "mlp",
         enforce_input_project: bool,
+        attn_conv_kernel_size: Optional[int] = 3,
+        text_attn: bool,
         text_atnn_cls: bool,
+        mem_attn_mask: bool,
         clip_embedding_dim: int
     ):
         """
@@ -252,15 +262,16 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                 )
             )
 
-            self.transformer_text_cross_attention_layers.append(
-                TextCrossAttentionLayer(
-                    d_model=hidden_dim,
-                    d_clip=clip_embedding_dim,
-                    nhead=nheads,
-                    dropout=0.0,
-                    normalize_before=pre_norm,
+            if text_attn:
+                self.transformer_text_cross_attention_layers.append(
+                    TextCrossAttentionLayer(
+                        d_model=hidden_dim,
+                        d_clip=clip_embedding_dim,
+                        nhead=nheads,
+                        dropout=0.0,
+                        normalize_before=pre_norm,
+                    )
                 )
-            )
 
             self.transformer_ffn_layers.append(
                 FFNLayer(
@@ -290,21 +301,35 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             else:
                 self.input_proj.append(nn.Sequential())
 
-        # output FFNs
-        # if self.mask_classification:
-        #     self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
-        self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
+        self.mask_embed_type = mask_embed_type
+        if self.mask_embed_type == "mlp":
+            self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
+        elif self.mask_embed_type == "linear":
+            self.mask_embed = nn.Linear(hidden_dim, mask_dim)
+            weight_init.c2_xavier_fill(self.mask_embed)
+        else:
+            raise ValueError(f"Unknown mask_embed_type: {self.mask_embed_type}")
 
         # FC-CLIP
         self.mask_pooling = MaskPooling()
         self._mask_pooling_proj = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim))
-        self.class_embed = MLP(hidden_dim, hidden_dim, clip_embedding_dim, 3)
+        
+        self.class_embed_type = class_embed_type
+        if self.class_embed_type == "mlp":
+            self.class_embed = MLP(hidden_dim, hidden_dim, clip_embedding_dim, 3)
+        elif self.class_embed_type == "linear":
+            self.class_embed = nn.Linear(hidden_dim, clip_embedding_dim)
+            weight_init.c2_xavier_fill(self.class_embed)
+        else:
+            raise ValueError(f"Unknown class_embed_type: {self.class_embed_type}")
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
         # ZEG-FC
+        self.text_attn = text_attn
         self.text_atnn_cls = text_atnn_cls
+        assert not (self.text_atnn_cls and not self.text_attn), "text_atnn_cls requires text_attn to be True"
         if self.text_atnn_cls:
             self.intermediate_text_cross_attention_layer = TextCrossAttentionLayer(
                 d_model=hidden_dim,
@@ -312,6 +337,24 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                 nhead=nheads,
                 dropout=0.0,
                 normalize_before=pre_norm,
+            )
+        self.mem_attn_mask = mem_attn_mask
+        if self.mem_attn_mask:
+            self.intermediate_mem_cross_attention_layer = CrossAttentionLayer(
+                d_model=hidden_dim,
+                nhead=nheads,
+                dropout=0.0,
+                normalize_before=pre_norm,
+            )
+        
+        self.attn_conv_kernel_size = attn_conv_kernel_size
+        if self.attn_conv_kernel_size:
+            self.attn_conv_layer = nn.Sequential(
+                nn.ReLU(),
+                nn.Conv2d(
+                    in_channels=1, out_channels=1,
+                    kernel_size=self.attn_conv_kernel_size, groups=1, padding="same", bias=False
+                )
             )
 
     @classmethod
@@ -335,10 +378,15 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         ret["dec_layers"] = cfg.MODEL.MASK_FORMER.DEC_LAYERS - 1
         ret["pre_norm"] = cfg.MODEL.MASK_FORMER.PRE_NORM
         ret["enforce_input_project"] = cfg.MODEL.MASK_FORMER.ENFORCE_INPUT_PROJ
-
+        
+        ret["text_attn"] = cfg.MODEL.ZEG_FC.TEXT_ATTN
         ret["text_atnn_cls"] = cfg.MODEL.ZEG_FC.TEXT_ATTN_CLS
+        ret["mem_attn_mask"] = cfg.MODEL.ZEG_FC.MEM_ATTN_MASK
         ret["mask_dim"] = cfg.MODEL.SEM_SEG_HEAD.MASK_DIM
         ret["clip_embedding_dim"] = cfg.MODEL.FC_CLIP.EMBED_DIM
+        ret["mask_embed_type"] = cfg.MODEL.ZEG_FC.MASK_EMBED_TYPE
+        ret["class_embed_type"] = cfg.MODEL.ZEG_FC.CLASS_EMBED_TYPE
+        ret["attn_conv_kernel_size"] = cfg.MODEL.ZEG_FC.ATTN_CONV_KERNEL_SIZE
         return ret
 
     def forward(self, x, mask_features, mask = None, text_classifier=None, num_templates=None):
@@ -378,12 +426,26 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             )
         else:
             text_attn_logits = None
+        
+        # Optional starting cross-attention for memory attention mask.
+        if self.mem_attn_mask:
+            output, mem_attn_logits = self.intermediate_mem_cross_attention_layer(
+                output, src[0],
+                memory_mask=None,
+                memory_key_padding_mask=None,  # here we do not apply masking on padded region
+                pos=pos[0], query_pos=query_embed,
+                return_attn_logits=self.mem_attn_mask
+            )
+        else:
+            mem_attn_logits = None
 
         # prediction heads on learnable query features
         outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(
             output, 
-            mask_features, 
+            mask_features,
+            mem_attn_logits,
             text_attn_logits,
+            attn_mask_size=size_list[0],
             attn_mask_target_size=size_list[0],
             text_classifier=text_classifier, 
             num_templates=num_templates
@@ -395,18 +457,22 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             level_index = i % self.num_feature_levels
             attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
             # attention: cross-attention first
-            output = self.transformer_cross_attention_layers[i](
+            output, mem_attn_logits = self.transformer_cross_attention_layers[i](
                 output, src[level_index],
                 memory_mask=attn_mask,
                 memory_key_padding_mask=None,  # here we do not apply masking on padded region
-                pos=pos[level_index], query_pos=query_embed
+                pos=pos[level_index], query_pos=query_embed,
+                return_attn_logits=self.mem_attn_mask
             )
             # then, text cross-attention
-            output, text_attn_logits = self.transformer_text_cross_attention_layers[i](
-                output, text_classifier,
-                query_pos=query_embed,
-                return_attn_logits=self.text_atnn_cls
-            )
+            if self.text_attn:
+                output, text_attn_logits = self.transformer_text_cross_attention_layers[i](
+                    output, text_classifier,
+                    query_pos=query_embed,
+                    return_attn_logits=self.text_atnn_cls
+                )
+            else:
+                text_attn_logits = None
             # then, self-attention
             output = self.transformer_self_attention_layers[i](
                 output, tgt_mask=None,
@@ -422,7 +488,9 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(
                 output, 
                 mask_features, 
+                mem_attn_logits,
                 text_attn_logits,
+                attn_mask_size=size_list[i % self.num_feature_levels],
                 attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels],
                 text_classifier=text_classifier, 
                 num_templates=num_templates
@@ -446,7 +514,9 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         self, 
         output, 
         mask_features, 
+        mem_attn_logits,
         text_attn_logits, 
+        attn_mask_size,
         attn_mask_target_size, 
         text_classifier, 
         num_templates
@@ -454,7 +524,26 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         decoder_output = self.decoder_norm(output)
         decoder_output = decoder_output.transpose(0, 1)
         mask_embed = self.mask_embed(decoder_output)
-        outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
+
+        if self.mem_attn_mask:
+            # Get attention logits from memory attention to the propper size.
+            mem_attn_logits = mem_attn_logits.unflatten(-1, attn_mask_size) # [B, Q, H, W]
+            mem_attn_logits = F.interpolate(
+                mem_attn_logits, 
+                size=mask_features.shape[-2:], 
+                mode="bilinear", 
+                align_corners=False
+            )
+            outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features) + mem_attn_logits
+        else:
+            outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
+
+        # Apply convolution MLP to the mask features.
+        if self.attn_conv_kernel_size:
+            outputs_mask = outputs_mask.flatten(0,1).unsqueeze(1)  # [B*Q, 1, H, W]
+            outputs_mask = outputs_mask + self.attn_conv_layer(outputs_mask)  # [B*Q, 1, H, W]
+            bs = decoder_output.shape[0]
+            outputs_mask = outputs_mask.squeeze(1).unflatten(0, (bs, -1))  # [B, Q, H, W]
 
         # fcclip head
         maskpool_embeddings = self.mask_pooling(x=mask_features, mask=outputs_mask) # [B, Q, C]
