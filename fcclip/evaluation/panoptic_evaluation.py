@@ -1,274 +1,486 @@
-"""
-This file may have been modified by Bytedance Ltd. and/or its affiliates (“Bytedance's Modifications”).
-All Bytedance's Modifications are Copyright (year) Bytedance Ltd. and/or its affiliates. 
-
-Reference: https://github.com/cocodataset/panopticapi/blob/master/panopticapi/evaluation.py
-Reference: https://github.com/open-mmlab/mmdetection/pull/7538
-"""
-
 #!/usr/bin/env python
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-from __future__ import unicode_literals
-import os, sys
+from __future__ import absolute_import, division, print_function, unicode_literals
+
+import os
 import numpy as np
 import json
 import time
-from datetime import timedelta
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 import argparse
 import multiprocessing
+import contextlib
+import io
+import itertools
+import logging
+import tempfile
+from typing import Optional
+from tabulate import tabulate
 
 import PIL.Image as Image
-
 from panopticapi.utils import get_traceback, rgb2id
+
+from detectron2.data import MetadataCatalog
+from detectron2.utils import comm
+from detectron2.utils.file_io import PathManager
+from detectron2.evaluation.evaluator import DatasetEvaluator
+
+logger = logging.getLogger(__name__)
+
 
 OFFSET = 256 * 256 * 256
 VOID = 0
 
-class PQStatCat():
-        def __init__(self):
-            self.iou = 0.0
-            self.tp = 0
-            self.fp = 0
-            self.fn = 0
 
-        def __iadd__(self, pq_stat_cat):
-            self.iou += pq_stat_cat.iou
-            self.tp += pq_stat_cat.tp
-            self.fp += pq_stat_cat.fp
-            self.fn += pq_stat_cat.fn
-            return self
+class PQStatCat:
+    """
+    Per-category statistics including standard and class-agnostic metrics.
+    """
+    def __init__(self):
+        self.iou = 0.0      # Sum of IoUs for true positives (same class)
+        self.tp = 0         # True positives (same class)
+        self.fp = 0         # False positives (same class)
+        self.fn = 0         # False negatives (same class)
+        self.iou_ca = 0.0   # Sum of IoUs for all IoU > 0.5 matches (class-agnostic)
+        self.tp_ca = 0      # Total count of IoU > 0.5 matches (class-agnostic)
+
+    def __iadd__(self, other):
+        for attr in ['iou', 'tp', 'fp', 'fn', 'iou_ca', 'tp_ca']:
+            setattr(self, attr, getattr(self, attr) + getattr(other, attr))
+        return self
 
 
-class PQStat():
+class PQStat:
     def __init__(self):
         self.pq_per_cat = defaultdict(PQStatCat)
 
-    def __getitem__(self, i):
-        return self.pq_per_cat[i]
+    def __getitem__(self, idx):
+        return self.pq_per_cat[idx]
 
-    def __iadd__(self, pq_stat):
-        for label, pq_stat_cat in pq_stat.pq_per_cat.items():
-            self.pq_per_cat[label] += pq_stat_cat
+    def __iadd__(self, other):
+        for label, cat_stat in other.pq_per_cat.items():
+            self.pq_per_cat[label] += cat_stat
         return self
 
-    def pq_average(self, categories, isthing):
-        pq, sq, rq, n = 0, 0, 0, 0
-        per_class_results = {}
-        for label, label_info in categories.items():
-            if isthing is not None:
-                cat_isthing = label_info['isthing'] == 1
-                if isthing != cat_isthing:
-                    continue
-            iou = self.pq_per_cat[label].iou
-            tp = self.pq_per_cat[label].tp
-            fp = self.pq_per_cat[label].fp
-            fn = self.pq_per_cat[label].fn
-            if tp + fp + fn == 0:
-                per_class_results[label] = {'pq': 0.0, 'sq': 0.0, 'rq': 0.0}
-                continue
-            n += 1
-            pq_class = iou / (tp + 0.5 * fp + 0.5 * fn)
-            sq_class = iou / tp if tp != 0 else 0
-            rq_class = tp / (tp + 0.5 * fp + 0.5 * fn)
-            per_class_results[label] = {'pq': pq_class, 'sq': sq_class, 'rq': rq_class}
-            pq += pq_class
-            sq += sq_class
-            rq += rq_class
+    def pq_average(self, categories, isthing=None):
+        pq_sum = sq_sum = rq_sum = sqca_sum = 0.0
+        tp_sum = fp_sum = fn_sum = tpca_sum = 0
+        n = 0
+        per_class = {}
 
-        return {'pq': pq / n, 'sq': sq / n, 'rq': rq / n, 'n': n}, per_class_results
+        for label, info in categories.items():
+            cat_isthing = (info.get('isthing', 0) == 1)
+            if isthing is not None and cat_isthing != isthing:
+                continue
+
+            stat = self.pq_per_cat[label]
+
+            tp_sum += stat.tp
+            fp_sum += stat.fp
+            fn_sum += stat.fn
+            tpca_sum += stat.tp_ca
+
+            denom = stat.tp + 0.5 * stat.fp + 0.5 * stat.fn
+            if denom == 0:
+                per_class[label] = {
+                    'pq': 0.0, 'sq': 0.0, 'rq': 0.0, 'sqca': 0.0,
+                    'tp': stat.tp, 'fp': stat.fp, 'fn': stat.fn, 'tpca': stat.tp_ca
+                }
+                continue
+
+            n += 1
+            pq_c = stat.iou / denom
+            sq_c = stat.iou / stat.tp if stat.tp > 0 else 0.0
+            rq_c = stat.tp / denom
+            sqca_c = stat.iou_ca / stat.tp_ca if stat.tp_ca > 0 else 0.0
+
+            per_class[label] = {
+                'pq': pq_c, 'sq': sq_c, 'rq': rq_c, 'sqca': sqca_c,
+                'tp': stat.tp, 'fp': stat.fp, 'fn': stat.fn, 'tpca': stat.tp_ca
+            }
+
+            pq_sum += pq_c
+            sq_sum += sq_c
+            rq_sum += rq_c
+            sqca_sum += sqca_c
+
+        if n > 0:
+            pred_sum = tp_sum + fp_sum
+            actual_sum = tp_sum + fn_sum
+            overall = {
+                'pq': pq_sum / n,
+                'sq': sq_sum / n,
+                'rq': rq_sum / n,
+                'sqca': sqca_sum / n,
+                'pr': (tp_sum / pred_sum) if pred_sum != 0 else 0, 
+                'prca': (tpca_sum / pred_sum) if pred_sum != 0 else 0,
+                're': (tp_sum / actual_sum) if actual_sum != 0 else 0,
+                'reca': (tpca_sum / actual_sum) if actual_sum != 0 else 0,
+                'n': n
+            }
+        else:
+            overall = {
+                'pq': 0.0, 'sq': 0.0, 'rq': 0.0, 'sqca': 0.0,
+                'pr': 0.0, 'prca': 0.0, 're': 0.0, 'reca': 0.0,
+                'n': 0
+            }
+
+        return overall, per_class
 
 
 @get_traceback
 def pq_compute_single_core(proc_id, annotation_set, gt_folder, pred_folder, categories):
     pq_stat = PQStat()
 
-    idx = 0
-    for gt_ann, pred_ann in annotation_set:
+    for idx, (gt_ann, pred_ann) in enumerate(annotation_set):
         if idx % 100 == 0:
-            print('Core: {}, {} from {} images processed'.format(proc_id, idx, len(annotation_set)))
-        idx += 1
+            print(f"Core: {proc_id}, {idx} of {len(annotation_set)} processed")
 
-        pan_gt = np.array(Image.open(os.path.join(gt_folder, gt_ann['file_name'])), dtype=np.uint32)
-        pan_gt = rgb2id(pan_gt)
-        pan_pred = np.array(Image.open(os.path.join(pred_folder, pred_ann['file_name'])), dtype=np.uint32)
-        pan_pred = rgb2id(pan_pred)
+        pan_gt = rgb2id(np.array(Image.open(os.path.join(gt_folder, gt_ann['file_name'])), dtype=np.uint32))
+        pan_pred = rgb2id(np.array(Image.open(os.path.join(pred_folder, pred_ann['file_name'])), dtype=np.uint32))
 
-        gt_segms = {el['id']: el for el in gt_ann['segments_info']}
-        pred_segms = {el['id']: el for el in pred_ann['segments_info']}
+        gt_segms = {s['id']: s for s in gt_ann['segments_info']}
+        pred_segms = {s['id']: s for s in pred_ann['segments_info']}
 
-        # predicted segments area calculation + prediction sanity checks
-        pred_labels_set = set(el['id'] for el in pred_ann['segments_info'])
-        labels, labels_cnt = np.unique(pan_pred, return_counts=True)
-        for label, label_cnt in zip(labels, labels_cnt):
-            if label not in pred_segms:
-                if label == VOID:
-                    continue
-                raise KeyError('In the image with ID {} segment with ID {} is presented in PNG and not presented in JSON.'.format(gt_ann['image_id'], label))
-            pred_segms[label]['area'] = label_cnt
-            pred_labels_set.remove(label)
-            if pred_segms[label]['category_id'] not in categories:
-                raise KeyError('In the image with ID {} segment with ID {} has unknown category_id {}.'.format(gt_ann['image_id'], label, pred_segms[label]['category_id']))
-        if len(pred_labels_set) != 0:
-            raise KeyError('In the image with ID {} the following segment IDs {} are presented in JSON and not presented in PNG.'.format(gt_ann['image_id'], list(pred_labels_set)))
-
-        # confusion matrix calculation
-        pan_gt_pred = pan_gt.astype(np.uint64) * OFFSET + pan_pred.astype(np.uint64)
-        gt_pred_map = {}
-        labels, labels_cnt = np.unique(pan_gt_pred, return_counts=True)
-        for label, intersection in zip(labels, labels_cnt):
-            gt_id = label // OFFSET
-            pred_id = label % OFFSET
-            gt_pred_map[(gt_id, pred_id)] = intersection
-
-        # count all matched pairs
-        gt_matched = set()
-        pred_matched = set()
-        for label_tuple, intersection in gt_pred_map.items():
-            gt_label, pred_label = label_tuple
-            if gt_label not in gt_segms:
+        labels, counts = np.unique(pan_pred, return_counts=True)
+        for lbl, cnt in zip(labels, counts):
+            if lbl == VOID:
                 continue
-            if pred_label not in pred_segms:
-                continue
-            if gt_segms[gt_label]['iscrowd'] == 1:
-                continue
-            if gt_segms[gt_label]['category_id'] != pred_segms[pred_label]['category_id']:
+            if lbl not in pred_segms:
+                raise KeyError(f"Segment {lbl} in PNG not in JSON for image {gt_ann['image_id']}")
+            pred_segms[lbl]['area'] = cnt
+
+        combined = pan_gt.astype(np.uint64) * OFFSET + pan_pred.astype(np.uint64)
+        pairs, intsct = np.unique(combined, return_counts=True)
+        gt_pred_map = {(p // OFFSET, p % OFFSET): c for p, c in zip(pairs, intsct)}
+
+        matched_gt, matched_pred = set(), set()
+
+        # Match same-category segments
+        for (gt_id, pred_id), inter in gt_pred_map.items():
+            if gt_id not in gt_segms or pred_id not in pred_segms:
                 continue
 
-            union = pred_segms[pred_label]['area'] + gt_segms[gt_label]['area'] - intersection - gt_pred_map.get((VOID, pred_label), 0)
-            iou = intersection / union
+            g, p = gt_segms[gt_id], pred_segms[pred_id]
+            if g['iscrowd'] == 1 or g['category_id'] != p['category_id']:
+                continue
+
+            union = p['area'] + g['area'] - inter - gt_pred_map.get((VOID, pred_id), 0)
+            iou = inter / union if union > 0 else 0.0
+
             if iou > 0.5:
-                pq_stat[gt_segms[gt_label]['category_id']].tp += 1
-                pq_stat[gt_segms[gt_label]['category_id']].iou += iou
-                gt_matched.add(gt_label)
-                pred_matched.add(pred_label)
+                cat = g['category_id']
+                stat = pq_stat[cat]
+                stat.tp += 1
+                stat.iou += iou
+                stat.tp_ca += 1
+                stat.iou_ca += iou
+                matched_gt.add(gt_id)
+                matched_pred.add(pred_id)
 
-        # count false positives
-        crowd_labels_dict = {}
-        for gt_label, gt_info in gt_segms.items():
-            if gt_label in gt_matched:
+        # Class-agnostic matching for remaining unmatched pairs
+        for (gt_id, pred_id), inter in gt_pred_map.items():
+            if gt_id in matched_gt or pred_id in matched_pred:
                 continue
-            # crowd segments are ignored
-            if gt_info['iscrowd'] == 1:
-                crowd_labels_dict[gt_info['category_id']] = gt_label
+            if gt_id not in gt_segms or pred_id not in pred_segms:
                 continue
-            pq_stat[gt_info['category_id']].fn += 1
 
-        # count false positives
-        for pred_label, pred_info in pred_segms.items():
-            if pred_label in pred_matched:
+            g, p = gt_segms[gt_id], pred_segms[pred_id]
+            if g['iscrowd'] == 1:
                 continue
-            # intersection of the segment with VOID
-            intersection = gt_pred_map.get((VOID, pred_label), 0)
-            # plus intersection with corresponding CROWD region if it exists
-            if pred_info['category_id'] in crowd_labels_dict:
-                intersection += gt_pred_map.get((crowd_labels_dict[pred_info['category_id']], pred_label), 0)
-            # predicted segment is ignored if more than half of the segment correspond to VOID and CROWD regions
-            if intersection / pred_info['area'] > 0.5:
+
+            union = p['area'] + g['area'] - inter - gt_pred_map.get((VOID, pred_id), 0)
+            iou = inter / union if union > 0 else 0.0
+
+            if iou > 0.5:
+                cat = g['category_id']
+                stat = pq_stat[cat]
+                stat.tp_ca += 1
+                stat.iou_ca += iou
+                matched_gt.add(gt_id)
+                matched_pred.add(pred_id)
+
+        # Count false negatives
+        crowd_by_cat = {}
+        for gt_id, g in gt_segms.items():
+            if gt_id in matched_gt:
                 continue
-            pq_stat[pred_info['category_id']].fp += 1
-    print('Core: {}, all {} images processed'.format(proc_id, len(annotation_set)))
+            if g['iscrowd'] == 1:
+                crowd_by_cat[g['category_id']] = gt_id
+                continue
+            pq_stat[g['category_id']].fn += 1
+
+        # Count false positives
+        for pred_id, p in pred_segms.items():
+            if pred_id in matched_pred:
+                continue
+            inter = gt_pred_map.get((VOID, pred_id), 0)
+            if p['category_id'] in crowd_by_cat:
+                inter += gt_pred_map.get((crowd_by_cat[p['category_id']], pred_id), 0)
+            if inter / p['area'] > 0.5:
+                continue
+            pq_stat[p['category_id']].fp += 1
+
+    print(f"Core: {proc_id}, all {len(annotation_set)} processed")
     return pq_stat
 
 
-def pq_compute_multi_core(matched_annotations_list, gt_folder, pred_folder, categories):
-    cpu_num = multiprocessing.cpu_count()
-    annotations_split = np.array_split(matched_annotations_list, cpu_num)
-    print("Number of cores: {}, images per core: {}".format(cpu_num, len(annotations_split[0])))
-    workers = multiprocessing.Pool(processes=cpu_num)
-    processes = []
-    for proc_id, annotation_set in enumerate(annotations_split):
-        p = workers.apply_async(pq_compute_single_core,
-                                (proc_id, annotation_set, gt_folder, pred_folder, categories))
-        processes.append(p)
+def pq_compute_multi_core(matched_list, gt_folder, pred_folder, categories):
+    cpu = multiprocessing.cpu_count()
+    splits = np.array_split(matched_list, cpu)
+    pool = multiprocessing.Pool(cpu)
 
-    # https://github.com/open-mmlab/mmdetection/pull/7538
-    # Close the process pool, otherwise it will lead to memory
-    # leaking problems.
-    workers.close()
-    workers.join()
+    procs = [
+        pool.apply_async(pq_compute_single_core, (i, split, gt_folder, pred_folder, categories))
+        for i, split in enumerate(splits)
+    ]
 
+    pool.close()
+    pool.join()
 
-    pq_stat = PQStat()
-    for p in processes:
-        pq_stat += p.get()
-    return pq_stat
+    total = PQStat()
+    for p in procs:
+        total += p.get()
+
+    return total
 
 
-def pq_compute(gt_json_file, pred_json_file, gt_folder=None, pred_folder=None):
+def pq_compute(gt_json, pred_json, gt_folder=None, pred_folder=None):
+    start = time.time()
 
-    start_time = time.time()
-    with open(gt_json_file, 'r') as f:
-        gt_json = json.load(f)
-    with open(pred_json_file, 'r') as f:
-        pred_json = json.load(f)
+    with open(gt_json) as f:
+        gt = json.load(f)
 
-    if gt_folder is None:
-        gt_folder = gt_json_file.replace('.json', '')
-    if pred_folder is None:
-        pred_folder = pred_json_file.replace('.json', '')
-    categories = {el['id']: el for el in gt_json['categories']}
+    with open(pred_json) as f:
+        pred = json.load(f)
 
-    print("Evaluation panoptic segmentation metrics:")
-    print("Ground truth:")
-    print("\tSegmentation folder: {}".format(gt_folder))
-    print("\tJSON file: {}".format(gt_json_file))
-    print("Prediction:")
-    print("\tSegmentation folder: {}".format(pred_folder))
-    print("\tJSON file: {}".format(pred_json_file))
+    gt_folder = gt_folder or gt_json.replace('.json', '')
+    pred_folder = pred_folder or pred_json.replace('.json', '')
 
-    if not os.path.isdir(gt_folder):
-        raise Exception("Folder {} with ground truth segmentations doesn't exist".format(gt_folder))
-    if not os.path.isdir(pred_folder):
-        raise Exception("Folder {} with predicted segmentations doesn't exist".format(pred_folder))
+    categories = {c['id']: c for c in gt['categories']}
+    pred_map = {a['image_id']: a for a in pred['annotations']}
 
-    pred_annotations = {el['image_id']: el for el in pred_json['annotations']}
-    matched_annotations_list = []
-    for gt_ann in gt_json['annotations']:
-        image_id = gt_ann['image_id']
-        if image_id not in pred_annotations:
-            raise Exception('no prediction for the image with id: {}'.format(image_id))
-        matched_annotations_list.append((gt_ann, pred_annotations[image_id]))
+    matched = []
+    for a in gt['annotations']:
+        if a['image_id'] not in pred_map:
+            raise Exception(f"No prediction for image {a['image_id']}")
+        matched.append((a, pred_map[a['image_id']]))
 
-    pq_stat = pq_compute_multi_core(matched_annotations_list, gt_folder, pred_folder, categories)
+    stats = pq_compute_multi_core(matched, gt_folder, pred_folder, categories)
 
-    metrics = [("All", None), ("Things", True), ("Stuff", False)]
+    metrics = [('All', None), ('Things', True), ('Stuff', False)]
     results = {}
     for name, isthing in metrics:
-        results[name], per_class_results = pq_stat.pq_average(categories, isthing=isthing)
+        stats_res, per_cls = stats.pq_average(categories, isthing)
+        results[name] = stats_res
         if name == 'All':
-            results['per_class'] = per_class_results
-    print("{:10s}| {:>5s}  {:>5s}  {:>5s} {:>5s}".format("", "PQ", "SQ", "RQ", "N"))
-    print("-" * (10 + 7 * 4))
-
-    for name, _isthing in metrics:
-        print("{:10s}| {:5.1f}  {:5.1f}  {:5.1f} {:5d}".format(
-            name,
-            100 * results[name]['pq'],
-            100 * results[name]['sq'],
-            100 * results[name]['rq'],
-            results[name]['n'])
-        )
-
-    t_delta = time.time() - start_time
-    print("Time elapsed: {:0.2f} seconds".format(t_delta))
+            results['per_class'] = per_cls
 
     return results
 
 
+class COCOPanopticEvaluator(DatasetEvaluator):
+    """
+    Evaluate Panoptic Quality metrics on COCO using PanopticAPI.
+    It saves panoptic segmentation prediction in `output_dir`
+
+    It contains a synchronize call and has to be called from all workers.
+    """
+
+    def __init__(self, dataset_name: str, output_dir: Optional[str] = None):
+        """
+        Args:
+            dataset_name: name of the dataset
+            output_dir: output directory to save results for evaluation.
+        """
+        self._metadata = MetadataCatalog.get(dataset_name)
+        self._thing_contiguous_id_to_dataset_id = {
+            v: k for k, v in self._metadata.thing_dataset_id_to_contiguous_id.items()
+        }
+        self._stuff_contiguous_id_to_dataset_id = {
+            v: k for k, v in self._metadata.stuff_dataset_id_to_contiguous_id.items()
+        }
+
+        self._output_dir = output_dir
+        if self._output_dir is not None:
+            PathManager.mkdirs(self._output_dir)
+
+    def reset(self):
+        self._predictions = []
+
+    def _convert_category_id(self, segment_info):
+        isthing = segment_info.pop("isthing", None)
+        if isthing is None:
+            # the model produces panoptic category id directly. No more conversion needed
+            return segment_info
+        if isthing is True:
+            segment_info["category_id"] = self._thing_contiguous_id_to_dataset_id[
+                segment_info["category_id"]
+            ]
+        else:
+            segment_info["category_id"] = self._stuff_contiguous_id_to_dataset_id[
+                segment_info["category_id"]
+            ]
+        return segment_info
+
+    def process(self, inputs, outputs):
+        from panopticapi.utils import id2rgb
+
+        for input, output in zip(inputs, outputs):
+            panoptic_img, segments_info = output["panoptic_seg"]
+            panoptic_img = panoptic_img.cpu().numpy()
+            if segments_info is None:
+                # If "segments_info" is None, we assume "panoptic_img" is a
+                # H*W int32 image storing the panoptic_id in the format of
+                # category_id * label_divisor + instance_id. We reserve -1 for
+                # VOID label, and add 1 to panoptic_img since the official
+                # evaluation script uses 0 for VOID label.
+                label_divisor = self._metadata.label_divisor
+                segments_info = []
+                for panoptic_label in np.unique(panoptic_img):
+                    if panoptic_label == -1:
+                        # VOID region.
+                        continue
+                    pred_class = panoptic_label // label_divisor
+                    isthing = (
+                        pred_class in self._metadata.thing_dataset_id_to_contiguous_id.values()
+                    )
+                    segments_info.append(
+                        {
+                            "id": int(panoptic_label) + 1,
+                            "category_id": int(pred_class),
+                            "isthing": bool(isthing),
+                        }
+                    )
+                # Official evaluation script uses 0 for VOID label.
+                panoptic_img += 1
+
+            file_name = os.path.basename(input["file_name"])
+            file_name_png = os.path.splitext(file_name)[0] + ".png"
+            with io.BytesIO() as out:
+                Image.fromarray(id2rgb(panoptic_img)).save(out, format="PNG")
+                segments_info = [self._convert_category_id(x) for x in segments_info]
+                self._predictions.append(
+                    {
+                        "image_id": input["image_id"],
+                        "file_name": file_name_png,
+                        "png_string": out.getvalue(),
+                        "segments_info": segments_info,
+                    }
+                )
+
+    def pq_compute_to_res_dic(self, pq_res):
+        # 'pr': 0.0, 'prca': 0.0, 're': 0.0, 'reca': 0.0,
+        res = {}
+        res["PQ"] = 100 * pq_res["All"]["pq"]
+        res["SQ"] = 100 * pq_res["All"]["sq"]
+        res["SQca"] = 100 * pq_res["All"]["sqca"]
+        res["RQ"] = 100 * pq_res["All"]["rq"]
+        res["PR"] = 100 * pq_res["All"]["pr"]
+        res["PRca"] = 100 * pq_res["All"]["prca"]
+        res["RE"] = 100 * pq_res["All"]["re"]
+        res["REca"] = 100 * pq_res["All"]["reca"]
+
+        res["PQ_th"] = 100 * pq_res["Things"]["pq"]
+        res["SQ_th"] = 100 * pq_res["Things"]["sq"]
+        res["SQca_th"] = 100 * pq_res["Things"]["sqca"]
+        res["RQ_th"] = 100 * pq_res["Things"]["rq"]
+        res["PR_th"] = 100 * pq_res["Things"]["pr"]
+        res["PRca_th"] = 100 * pq_res["Things"]["prca"]
+        res["RE_th"] = 100 * pq_res["Things"]["re"]
+        res["REca_th"] = 100 * pq_res["Things"]["reca"]
+
+        res["PQ_st"] = 100 * pq_res["Stuff"]["pq"]
+        res["SQ_st"] = 100 * pq_res["Stuff"]["sq"]
+        res["SQca_st"] = 100 * pq_res["Stuff"]["sqca"]
+        res["RQ_st"] = 100 * pq_res["Stuff"]["rq"]
+        res["PR_st"] = 100 * pq_res["Stuff"]["pr"]
+        res["PRca_st"] = 100 * pq_res["Stuff"]["prca"]
+        res["RE_st"] = 100 * pq_res["Stuff"]["re"]
+        res["REca_st"] = 100 * pq_res["Stuff"]["reca"]
+        return res
+
+    def _print_panoptic_results(self, pq_res):
+        headers = ["", "PQ", "SQ", "SQca", "RQ", "PR", "PRca", "RE", "REca", "#categories"]
+        data = []
+        for name in ["All", "Things", "Stuff"]:
+            row = [name] + [
+                pq_res[name][k] * 100 
+                for k in ["pq", "sq", "sqca", "rq", "pr", "prca", "re", "reca"]
+            ] + [pq_res[name]["n"]]
+            data.append(row)
+        table = tabulate(
+            data, headers=headers, tablefmt="pipe", floatfmt=".3f", stralign="center", numalign="center"
+        )
+        logger.info("Panoptic Evaluation Results:\n" + table)
+
+    def evaluate(self):
+        comm.synchronize()
+
+        self._predictions = comm.gather(self._predictions)
+        self._predictions = list(itertools.chain(*self._predictions))
+        if not comm.is_main_process():
+            return
+
+        # PanopticApi requires local files
+        gt_json = PathManager.get_local_path(self._metadata.panoptic_json)
+        gt_folder = PathManager.get_local_path(self._metadata.panoptic_root)
+
+        with tempfile.TemporaryDirectory(prefix="panoptic_eval") as pred_dir:
+            logger.info("Writing all panoptic predictions to {} ...".format(pred_dir))
+            for p in self._predictions:
+                with open(os.path.join(pred_dir, p["file_name"]), "wb") as f:
+                    f.write(p.pop("png_string"))
+
+            with open(gt_json, "r") as f:
+                json_data = json.load(f)
+            json_data["annotations"] = self._predictions
+
+            output_dir = self._output_dir or pred_dir
+            predictions_json = os.path.join(output_dir, "predictions.json")
+            with PathManager.open(predictions_json, "w") as f:
+                f.write(json.dumps(json_data))
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                pq_res = pq_compute(
+                    gt_json,
+                    PathManager.get_local_path(predictions_json),
+                    gt_folder=gt_folder,
+                    pred_folder=pred_dir,
+                )
+
+        res = self.pq_compute_to_res_dic(pq_res)
+        results = OrderedDict({"panoptic_seg": res})
+        self._print_panoptic_results(pq_res)
+
+        return results
+
+
 if __name__ == "__main__":
+    from detectron2.utils.logger import setup_logger
+
+    logger = setup_logger()
+    import argparse
+
     parser = argparse.ArgumentParser()
-    parser.add_argument('--gt_json_file', type=str,
-                        help="JSON file with ground truth data")
-    parser.add_argument('--pred_json_file', type=str,
-                        help="JSON file with predictions data")
-    parser.add_argument('--gt_folder', type=str, default=None,
-                        help="Folder with ground turth COCO format segmentations. \
-                              Default: X if the corresponding json file is X.json")
-    parser.add_argument('--pred_folder', type=str, default=None,
-                        help="Folder with prediction COCO format segmentations. \
-                              Default: X if the corresponding json file is X.json")
+    parser.add_argument("--gt-json")
+    parser.add_argument("--gt-dir")
+    parser.add_argument("--pred-json")
+    parser.add_argument("--pred-dir")
     args = parser.parse_args()
-    pq_compute(args.gt_json_file, args.pred_json_file, args.gt_folder, args.pred_folder)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        pq_res = pq_compute(
+            args.gt_json, args.pred_json, gt_folder=args.gt_dir, pred_folder=args.pred_dir
+        )
+        headers = ["", "PQ", "SQ", "SQca", "RQ", "PR", "PRca", "RE", "REca", "#categories"]
+        data = []
+        for name in ["All", "Things", "Stuff"]:
+            row = [name] + [
+                pq_res[name][k] * 100 
+                for k in ["pq", "sq", "sqca", "rq", "pr", "prca", "re", "reca"]
+            ] + [pq_res[name]["n"]]
+            data.append(row)
+        table = tabulate(
+            data, headers=headers, tablefmt="pipe", floatfmt=".3f", stralign="center", numalign="center"
+        )
+        logger.info("Panoptic Evaluation Results:\n" + table)
