@@ -42,9 +42,11 @@ class PQStatCat:
         self.fn = 0         # False negatives (same class)
         self.iou_ca = 0.0   # Sum of IoUs for all IoU > 0.5 matches (class-agnostic)
         self.tp_ca = 0      # Total count of IoU > 0.5 matches (class-agnostic)
+        self.fp_ca = 0      # False positives (class-agnostic)
+        self.fn_ca = 0      # False negatives (class-agnostic)
 
     def __iadd__(self, other):
-        for attr in ['iou', 'tp', 'fp', 'fn', 'iou_ca', 'tp_ca']:
+        for attr in ['iou', 'tp', 'fp', 'fn', 'iou_ca', 'tp_ca', 'fp_ca', 'fn_ca']:
             setattr(self, attr, getattr(self, attr) + getattr(other, attr))
         return self
 
@@ -62,9 +64,14 @@ class PQStat:
         return self
 
     def pq_average(self, categories, isthing=None):
-        pq_sum = sq_sum = rq_sum = sqca_sum = 0.0
-        tp_sum = fp_sum = fn_sum = tpca_sum = 0
+        pq_sum = sq_sum = rq_sum = 0.0
+        tp_sum = fp_sum = fn_sum = 0
+
+        pqca_sum = sqca_sum = rqca_sum = 0.0
+        tpca_sum = fpca_sum = fnca_sum = 0
+
         n = 0
+        n_ca = 0
         per_class = {}
 
         for label, info in categories.items():
@@ -77,52 +84,66 @@ class PQStat:
             tp_sum += stat.tp
             fp_sum += stat.fp
             fn_sum += stat.fn
+
             tpca_sum += stat.tp_ca
+            fpca_sum += stat.fp_ca
+            fnca_sum += stat.fn_ca
 
             denom = stat.tp + 0.5 * stat.fp + 0.5 * stat.fn
-            if denom == 0:
-                per_class[label] = {
-                    'pq': 0.0, 'sq': 0.0, 'rq': 0.0, 'sqca': 0.0,
-                    'tp': stat.tp, 'fp': stat.fp, 'fn': stat.fn, 'tpca': stat.tp_ca
-                }
-                continue
+            if denom != 0:
+                n += 1
+                pq_c = stat.iou / denom
+                sq_c = stat.iou / stat.tp if stat.tp > 0 else 0
+                rq_c = stat.tp / denom
 
-            n += 1
-            pq_c = stat.iou / denom
-            sq_c = stat.iou / stat.tp if stat.tp > 0 else 0.0
-            rq_c = stat.tp / denom
-            sqca_c = stat.iou_ca / stat.tp_ca if stat.tp_ca > 0 else 0.0
+                pq_sum += pq_c
+                sq_sum += sq_c
+                rq_sum += rq_c
+            else:
+                pq_c = sq_c = rq_c = 0.0
+
+            denom_ca = stat.tp_ca + 0.5 * stat.fp_ca + 0.5 * stat.fn_ca
+            if denom_ca != 0:
+                n_ca += 1
+                pqca_c = stat.iou_ca / denom_ca
+                sqca_c = stat.iou_ca / stat.tp_ca if stat.tp_ca > 0 else 0
+                rqca_c = stat.tp_ca / denom_ca
+
+                pqca_sum += pqca_c
+                sqca_sum += sqca_c
+                rqca_sum += rqca_c
+            else:
+                pqca_c = sqca_c = rqca_c = 0.0
 
             per_class[label] = {
-                'pq': pq_c, 'sq': sq_c, 'rq': rq_c, 'sqca': sqca_c,
-                'tp': stat.tp, 'fp': stat.fp, 'fn': stat.fn, 'tpca': stat.tp_ca
+                'pq': pq_c, 'sq': sq_c, 'rq': rq_c,
+                'pqca': pqca_c, 'sqca': sqca_c, 'rqca': rqca_c,
+                'tp': stat.tp, 'fp': stat.fp, 'fn': stat.fn,
+                'tpca': stat.tp_ca, 'fpca': stat.fp_ca, 'fnca': stat.fn_ca
             }
 
-            pq_sum += pq_c
-            sq_sum += sq_c
-            rq_sum += rq_c
-            sqca_sum += sqca_c
+        # Overall metrics
+        pq = pq_sum / n if n > 0 else 0.0
+        sq = sq_sum / n if n > 0 else 0.0
+        rq = rq_sum / n if n > 0 else 0.0
 
-        if n > 0:
-            pred_sum = tp_sum + fp_sum
-            actual_sum = tp_sum + fn_sum
-            overall = {
-                'pq': pq_sum / n,
-                'sq': sq_sum / n,
-                'rq': rq_sum / n,
-                'sqca': sqca_sum / n,
-                'pr': (tp_sum / pred_sum) if pred_sum != 0 else 0, 
-                'prca': (tpca_sum / pred_sum) if pred_sum != 0 else 0,
-                're': (tp_sum / actual_sum) if actual_sum != 0 else 0,
-                'reca': (tpca_sum / actual_sum) if actual_sum != 0 else 0,
-                'n': n
-            }
-        else:
-            overall = {
-                'pq': 0.0, 'sq': 0.0, 'rq': 0.0, 'sqca': 0.0,
-                'pr': 0.0, 'prca': 0.0, 're': 0.0, 'reca': 0.0,
-                'n': 0
-            }
+        pr = (tp_sum / (tp_sum + fp_sum)) if (tp_sum + fp_sum) > 0 else 0.0
+        re = (tp_sum / (tp_sum + fn_sum)) if (tp_sum + fn_sum) > 0 else 0.0
+
+        # Overall class-agnostic metrics
+        pqca = pqca_sum / n_ca if n_ca > 0 else 0.0
+        sqca = sqca_sum / n_ca if n_ca > 0 else 0.0
+        rqca = rqca_sum / n_ca if n_ca > 0 else 0.0
+
+        preca = (tpca_sum / (tpca_sum + fpca_sum)) if (tpca_sum + fpca_sum) > 0 else 0.0
+        reca = (tpca_sum / (tpca_sum + fnca_sum)) if (tpca_sum + fnca_sum) > 0 else 0.0
+
+        overall = {
+            'pq': pq, 'sq': sq, 'rq': rq,
+            'pqca': pqca, 'sqca': sqca, 'rqca': rqca,
+            'pr': pr, 'prca': preca, 're': re, 'reca': reca,
+            'n': n
+        }
 
         return overall, per_class
 
@@ -153,72 +174,79 @@ def pq_compute_single_core(proc_id, annotation_set, gt_folder, pred_folder, cate
         pairs, intsct = np.unique(combined, return_counts=True)
         gt_pred_map = {(p // OFFSET, p % OFFSET): c for p, c in zip(pairs, intsct)}
 
+        # Matched IDs when taking into account only same-category segments
         matched_gt, matched_pred = set(), set()
+        # Matched IDs when taking into account class-agnostic segments
+        matched_gt_ca, matched_pred_ca = set(), set()
 
-        # Match same-category segments
+        # Match segments
         for (gt_id, pred_id), inter in gt_pred_map.items():
             if gt_id not in gt_segms or pred_id not in pred_segms:
                 continue
-
-            g, p = gt_segms[gt_id], pred_segms[pred_id]
-            if g['iscrowd'] == 1 or g['category_id'] != p['category_id']:
-                continue
-
-            union = p['area'] + g['area'] - inter - gt_pred_map.get((VOID, pred_id), 0)
-            iou = inter / union if union > 0 else 0.0
-
-            if iou > 0.5:
-                cat = g['category_id']
-                stat = pq_stat[cat]
-                stat.tp += 1
-                stat.iou += iou
-                stat.tp_ca += 1
-                stat.iou_ca += iou
-                matched_gt.add(gt_id)
-                matched_pred.add(pred_id)
-
-        # Class-agnostic matching for remaining unmatched pairs
-        for (gt_id, pred_id), inter in gt_pred_map.items():
-            if gt_id in matched_gt or pred_id in matched_pred:
-                continue
-            if gt_id not in gt_segms or pred_id not in pred_segms:
-                continue
-
+            
+            # Ignore if crowd
             g, p = gt_segms[gt_id], pred_segms[pred_id]
             if g['iscrowd'] == 1:
                 continue
 
+            # Compute IoU of detection and ground truth
             union = p['area'] + g['area'] - inter - gt_pred_map.get((VOID, pred_id), 0)
             iou = inter / union if union > 0 else 0.0
 
+            # If it is a match, count them.
             if iou > 0.5:
                 cat = g['category_id']
                 stat = pq_stat[cat]
+                # Class-agnostic metrics.
                 stat.tp_ca += 1
                 stat.iou_ca += iou
-                matched_gt.add(gt_id)
-                matched_pred.add(pred_id)
+                matched_gt_ca.add(gt_id)
+                matched_pred_ca.add(pred_id)
+                # Class-aware metrics if category matches
+                if g['category_id'] == p['category_id']:
+                    stat.tp += 1
+                    stat.iou += iou
+                    matched_gt.add(gt_id)
+                    matched_pred.add(pred_id)
 
         # Count false negatives
         crowd_by_cat = {}
+        crowd_by_cat_ca = {}
         for gt_id, g in gt_segms.items():
-            if gt_id in matched_gt:
-                continue
-            if g['iscrowd'] == 1:
-                crowd_by_cat[g['category_id']] = gt_id
-                continue
-            pq_stat[g['category_id']].fn += 1
+            # If the ground truth wasn't matched, count it as a false negative.
+            if gt_id not in matched_gt:
+                if g['iscrowd'] == 1:
+                    crowd_by_cat[g['category_id']] = gt_id
+                else:
+                    pq_stat[g['category_id']].fn += 1
+            # If the ground truth wasn't matched in class-agnostic mode, count it 
+            # as a class-agnostic false negative, which is worse than a normal
+            # false negative.
+            if gt_id not in matched_gt_ca:
+                if g['iscrowd'] == 1:
+                    crowd_by_cat_ca[g['category_id']] = gt_id
+                else:
+                    pq_stat[g['category_id']].fn_ca += 1
 
         # Count false positives
         for pred_id, p in pred_segms.items():
-            if pred_id in matched_pred:
-                continue
-            inter = gt_pred_map.get((VOID, pred_id), 0)
-            if p['category_id'] in crowd_by_cat:
-                inter += gt_pred_map.get((crowd_by_cat[p['category_id']], pred_id), 0)
-            if inter / p['area'] > 0.5:
-                continue
-            pq_stat[p['category_id']].fp += 1
+            # If the prediction wasn't matched, count it as a false positive.
+            if pred_id not in matched_pred:
+                inter = gt_pred_map.get((VOID, pred_id), 0)
+                if p['category_id'] in crowd_by_cat:
+                    inter += gt_pred_map.get((crowd_by_cat[p['category_id']], pred_id), 0)
+                if inter / p['area'] <= 0.5:
+                    pq_stat[p['category_id']].fp += 1
+            # If the prediction wasn't matched in class-agnostic mode, count it
+            # as a class-agnostic false positive, which is worse than a normal
+            # false positive.
+            if pred_id not in matched_pred_ca:
+                inter = gt_pred_map.get((VOID, pred_id), 0)
+                if p['category_id'] in crowd_by_cat_ca:
+                    inter += gt_pred_map.get((crowd_by_cat_ca[p['category_id']], pred_id), 0)
+                if inter / p['area'] <= 0.5:
+                    pq_stat[p['category_id']].fp_ca += 1
+            
 
     print(f"Core: {proc_id}, all {len(annotation_set)} processed")
     return pq_stat
@@ -369,49 +397,66 @@ class COCOPanopticEvaluator(DatasetEvaluator):
                 )
 
     def pq_compute_to_res_dic(self, pq_res):
-        # 'pr': 0.0, 'prca': 0.0, 're': 0.0, 'reca': 0.0,
         res = {}
         res["PQ"] = 100 * pq_res["All"]["pq"]
         res["SQ"] = 100 * pq_res["All"]["sq"]
-        res["SQca"] = 100 * pq_res["All"]["sqca"]
         res["RQ"] = 100 * pq_res["All"]["rq"]
         res["PR"] = 100 * pq_res["All"]["pr"]
-        res["PRca"] = 100 * pq_res["All"]["prca"]
         res["RE"] = 100 * pq_res["All"]["re"]
+        res["PQca"] = 100 * pq_res["All"]["pqca"]
+        res["SQca"] = 100 * pq_res["All"]["sqca"]
+        res["RQca"] = 100 * pq_res["All"]["rqca"]
+        res["PRca"] = 100 * pq_res["All"]["prca"]
         res["REca"] = 100 * pq_res["All"]["reca"]
 
         res["PQ_th"] = 100 * pq_res["Things"]["pq"]
         res["SQ_th"] = 100 * pq_res["Things"]["sq"]
-        res["SQca_th"] = 100 * pq_res["Things"]["sqca"]
         res["RQ_th"] = 100 * pq_res["Things"]["rq"]
         res["PR_th"] = 100 * pq_res["Things"]["pr"]
-        res["PRca_th"] = 100 * pq_res["Things"]["prca"]
         res["RE_th"] = 100 * pq_res["Things"]["re"]
+        res["PQca_th"] = 100 * pq_res["Things"]["pqca"]
+        res["SQca_th"] = 100 * pq_res["Things"]["sqca"]
+        res["RQca_th"] = 100 * pq_res["Things"]["rqca"]
+        res["PRca_th"] = 100 * pq_res["Things"]["prca"]
         res["REca_th"] = 100 * pq_res["Things"]["reca"]
 
         res["PQ_st"] = 100 * pq_res["Stuff"]["pq"]
         res["SQ_st"] = 100 * pq_res["Stuff"]["sq"]
-        res["SQca_st"] = 100 * pq_res["Stuff"]["sqca"]
         res["RQ_st"] = 100 * pq_res["Stuff"]["rq"]
         res["PR_st"] = 100 * pq_res["Stuff"]["pr"]
-        res["PRca_st"] = 100 * pq_res["Stuff"]["prca"]
         res["RE_st"] = 100 * pq_res["Stuff"]["re"]
+        res["PQca_st"] = 100 * pq_res["Stuff"]["pqca"]
+        res["SQca_st"] = 100 * pq_res["Stuff"]["sqca"]
+        res["RQca_st"] = 100 * pq_res["Stuff"]["rqca"]
+        res["PRca_st"] = 100 * pq_res["Stuff"]["prca"]
         res["REca_st"] = 100 * pq_res["Stuff"]["reca"]
         return res
 
     def _print_panoptic_results(self, pq_res):
-        headers = ["", "PQ", "SQ", "SQca", "RQ", "PR", "PRca", "RE", "REca", "#categories"]
+        headers = ["", "PQ", "SQ", "RQ", "PR", "RE", "#categories"]
         data = []
         for name in ["All", "Things", "Stuff"]:
             row = [name] + [
                 pq_res[name][k] * 100 
-                for k in ["pq", "sq", "sqca", "rq", "pr", "prca", "re", "reca"]
+                for k in ["pq", "sq", "rq", "pr", "re"]
             ] + [pq_res[name]["n"]]
             data.append(row)
         table = tabulate(
             data, headers=headers, tablefmt="pipe", floatfmt=".3f", stralign="center", numalign="center"
         )
         logger.info("Panoptic Evaluation Results:\n" + table)
+
+        data = []
+        for name in ["All", "Things", "Stuff"]:
+            row = [name] + [
+                pq_res[name][k] * 100 
+                for k in ["pqca", "sqca", "rqca", "prca", "reca"]
+            ] + [pq_res[name]["n"]]
+            data.append(row)
+        table = tabulate(
+            data, headers=headers, tablefmt="pipe", floatfmt=".3f", stralign="center", numalign="center"
+        )
+        logger.info("Panoptic Evaluation Results (Class-Agnostic):\n" + table)
 
     def evaluate(self):
         comm.synchronize()
@@ -472,15 +517,28 @@ if __name__ == "__main__":
         pq_res = pq_compute(
             args.gt_json, args.pred_json, gt_folder=args.gt_dir, pred_folder=args.pred_dir
         )
-        headers = ["", "PQ", "SQ", "SQca", "RQ", "PR", "PRca", "RE", "REca", "#categories"]
+        
+        headers = ["", "PQ", "SQ", "RQ", "PR", "RE", "#categories"]
         data = []
         for name in ["All", "Things", "Stuff"]:
             row = [name] + [
                 pq_res[name][k] * 100 
-                for k in ["pq", "sq", "sqca", "rq", "pr", "prca", "re", "reca"]
+                for k in ["pq", "sq", "rq", "pr", "re"]
             ] + [pq_res[name]["n"]]
             data.append(row)
         table = tabulate(
             data, headers=headers, tablefmt="pipe", floatfmt=".3f", stralign="center", numalign="center"
         )
         logger.info("Panoptic Evaluation Results:\n" + table)
+
+        data = []
+        for name in ["All", "Things", "Stuff"]:
+            row = [name] + [
+                pq_res[name][k] * 100 
+                for k in ["pqca", "sqca", "rqca", "prca", "reca"]
+            ] + [pq_res[name]["n"]]
+            data.append(row)
+        table = tabulate(
+            data, headers=headers, tablefmt="pipe", floatfmt=".3f", stralign="center", numalign="center"
+        )
+        logger.info("Panoptic Evaluation Results (Class-Agnostic):\n" + table)
