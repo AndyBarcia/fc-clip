@@ -44,9 +44,11 @@ class PQStatCat:
         self.tp_ca = 0      # Total count of IoU > 0.5 matches (class-agnostic)
         self.fp_ca = 0      # False positives (class-agnostic)
         self.fn_ca = 0      # False negatives (class-agnostic)
+        self.gt = 0         # Number of unique ground truths for true positives (used to measure duplication rate).
+        self.gt_ca = 0      # Number of unique ground truths for true positives (class-agnostic).
 
     def __iadd__(self, other):
-        for attr in ['iou', 'tp', 'fp', 'fn', 'iou_ca', 'tp_ca', 'fp_ca', 'fn_ca']:
+        for attr in ['iou', 'tp', 'fp', 'fn', 'iou_ca', 'tp_ca', 'fp_ca', 'fn_ca', 'gt', 'gt_ca']:
             setattr(self, attr, getattr(self, attr) + getattr(other, attr))
         return self
 
@@ -65,10 +67,10 @@ class PQStat:
 
     def pq_average(self, categories, isthing=None):
         pq_sum = sq_sum = rq_sum = 0.0
-        tp_sum = fp_sum = fn_sum = 0
+        tp_sum = fp_sum = fn_sum = gt_sum = 0
 
         pqca_sum = sqca_sum = rqca_sum = 0.0
-        tpca_sum = fpca_sum = fnca_sum = 0
+        tpca_sum = fpca_sum = fnca_sum = gtca_sum = 0
 
         n = 0
         n_ca = 0
@@ -84,10 +86,15 @@ class PQStat:
             tp_sum += stat.tp
             fp_sum += stat.fp
             fn_sum += stat.fn
+            gt_sum += stat.gt
 
             tpca_sum += stat.tp_ca
             fpca_sum += stat.fp_ca
             fnca_sum += stat.fn_ca
+            gtca_sum += stat.gt_ca
+
+            uniqueness_rate = stat.gt / stat.tp if stat.tp > 0 else 0.0
+            uniqueness_rate_ca = stat.gt_ca / stat.tp_ca if stat.tp_ca > 0 else 0.0
 
             denom = stat.tp + 0.5 * stat.fp + 0.5 * stat.fn
             if denom != 0:
@@ -119,7 +126,8 @@ class PQStat:
                 'pq': pq_c, 'sq': sq_c, 'rq': rq_c,
                 'pqca': pqca_c, 'sqca': sqca_c, 'rqca': rqca_c,
                 'tp': stat.tp, 'fp': stat.fp, 'fn': stat.fn,
-                'tpca': stat.tp_ca, 'fpca': stat.fp_ca, 'fnca': stat.fn_ca
+                'tpca': stat.tp_ca, 'fpca': stat.fp_ca, 'fnca': stat.fn_ca,
+                'uq': uniqueness_rate, 'uqca': uniqueness_rate_ca,
             }
 
         # Overall metrics
@@ -130,6 +138,8 @@ class PQStat:
         pr = (tp_sum / (tp_sum + fp_sum)) if (tp_sum + fp_sum) > 0 else 0.0
         re = (tp_sum / (tp_sum + fn_sum)) if (tp_sum + fn_sum) > 0 else 0.0
 
+        uniqueness_rate = gt_sum / tp_sum if tp_sum > 0 else 0.0
+
         # Overall class-agnostic metrics
         pqca = pqca_sum / n_ca if n_ca > 0 else 0.0
         sqca = sqca_sum / n_ca if n_ca > 0 else 0.0
@@ -138,10 +148,13 @@ class PQStat:
         preca = (tpca_sum / (tpca_sum + fpca_sum)) if (tpca_sum + fpca_sum) > 0 else 0.0
         reca = (tpca_sum / (tpca_sum + fnca_sum)) if (tpca_sum + fnca_sum) > 0 else 0.0
 
+        uniqueness_rate_ca = gtca_sum / tpca_sum if tpca_sum > 0 else 0.0
+
         overall = {
             'pq': pq, 'sq': sq, 'rq': rq,
             'pqca': pqca, 'sqca': sqca, 'rqca': rqca,
             'pr': pr, 'prca': preca, 're': re, 'reca': reca,
+            'uq': uniqueness_rate, 'uqca': uniqueness_rate_ca,
             'n': n
         }
 
@@ -178,6 +191,8 @@ def pq_compute_single_core(proc_id, annotation_set, gt_folder, pred_folder, cate
         matched_gt, matched_pred = set(), set()
         # Matched IDs when taking into account class-agnostic segments
         matched_gt_ca, matched_pred_ca = set(), set()
+        # Per-category matched IDs to count number of unique ground truths. 
+        per_cat_matched_gt, per_cat_matched_gt_ca = defaultdict(set), defaultdict(set)
 
         # Match segments
         for (gt_id, pred_id), inter in gt_pred_map.items():
@@ -202,12 +217,16 @@ def pq_compute_single_core(proc_id, annotation_set, gt_folder, pred_folder, cate
                 stat.iou_ca += iou
                 matched_gt_ca.add(gt_id)
                 matched_pred_ca.add(pred_id)
+                per_cat_matched_gt_ca[cat].add(gt_id)
+                stat.gt_ca = len(per_cat_matched_gt_ca[cat])
                 # Class-aware metrics if category matches
                 if g['category_id'] == p['category_id']:
                     stat.tp += 1
                     stat.iou += iou
                     matched_gt.add(gt_id)
                     matched_pred.add(pred_id)
+                    per_cat_matched_gt[cat].add(gt_id)
+                    stat.gt = len(per_cat_matched_gt[cat])
 
         # Count false negatives
         crowd_by_cat = {}
@@ -403,42 +422,48 @@ class COCOPanopticEvaluator(DatasetEvaluator):
         res["RQ"] = 100 * pq_res["All"]["rq"]
         res["PR"] = 100 * pq_res["All"]["pr"]
         res["RE"] = 100 * pq_res["All"]["re"]
+        res["UQ"] = 100 * pq_res["All"]["uq"]
         res["PQca"] = 100 * pq_res["All"]["pqca"]
         res["SQca"] = 100 * pq_res["All"]["sqca"]
         res["RQca"] = 100 * pq_res["All"]["rqca"]
         res["PRca"] = 100 * pq_res["All"]["prca"]
         res["REca"] = 100 * pq_res["All"]["reca"]
+        res["UQca"] = 100 * pq_res["All"]["uqca"]
 
         res["PQ_th"] = 100 * pq_res["Things"]["pq"]
         res["SQ_th"] = 100 * pq_res["Things"]["sq"]
         res["RQ_th"] = 100 * pq_res["Things"]["rq"]
         res["PR_th"] = 100 * pq_res["Things"]["pr"]
         res["RE_th"] = 100 * pq_res["Things"]["re"]
+        res["UQ_th"] = 100 * pq_res["Things"]["uq"]
         res["PQca_th"] = 100 * pq_res["Things"]["pqca"]
         res["SQca_th"] = 100 * pq_res["Things"]["sqca"]
         res["RQca_th"] = 100 * pq_res["Things"]["rqca"]
         res["PRca_th"] = 100 * pq_res["Things"]["prca"]
         res["REca_th"] = 100 * pq_res["Things"]["reca"]
+        res["UQca_th"] = 100 * pq_res["Things"]["uqca"]
 
         res["PQ_st"] = 100 * pq_res["Stuff"]["pq"]
         res["SQ_st"] = 100 * pq_res["Stuff"]["sq"]
         res["RQ_st"] = 100 * pq_res["Stuff"]["rq"]
         res["PR_st"] = 100 * pq_res["Stuff"]["pr"]
         res["RE_st"] = 100 * pq_res["Stuff"]["re"]
+        res["UQ_st"] = 100 * pq_res["Stuff"]["uq"]
         res["PQca_st"] = 100 * pq_res["Stuff"]["pqca"]
         res["SQca_st"] = 100 * pq_res["Stuff"]["sqca"]
         res["RQca_st"] = 100 * pq_res["Stuff"]["rqca"]
         res["PRca_st"] = 100 * pq_res["Stuff"]["prca"]
         res["REca_st"] = 100 * pq_res["Stuff"]["reca"]
+        res["UQca_st"] = 100 * pq_res["Stuff"]["uqca"]
         return res
 
     def _print_panoptic_results(self, pq_res):
-        headers = ["", "PQ", "SQ", "RQ", "PR", "RE", "#categories"]
+        headers = ["", "PQ", "SQ", "RQ", "PR", "RE", "UQ", "#categories"]
         data = []
         for name in ["All", "Things", "Stuff"]:
             row = [name] + [
                 pq_res[name][k] * 100 
-                for k in ["pq", "sq", "rq", "pr", "re"]
+                for k in ["pq", "sq", "rq", "pr", "re", "uq"]
             ] + [pq_res[name]["n"]]
             data.append(row)
         table = tabulate(
@@ -450,7 +475,7 @@ class COCOPanopticEvaluator(DatasetEvaluator):
         for name in ["All", "Things", "Stuff"]:
             row = [name] + [
                 pq_res[name][k] * 100 
-                for k in ["pqca", "sqca", "rqca", "prca", "reca"]
+                for k in ["pqca", "sqca", "rqca", "prca", "reca", "uqca"]
             ] + [pq_res[name]["n"]]
             data.append(row)
         table = tabulate(
@@ -518,12 +543,12 @@ if __name__ == "__main__":
             args.gt_json, args.pred_json, gt_folder=args.gt_dir, pred_folder=args.pred_dir
         )
         
-        headers = ["", "PQ", "SQ", "RQ", "PR", "RE", "#categories"]
+        headers = ["", "PQ", "SQ", "RQ", "PR", "RE", "UQ", "#categories"]
         data = []
         for name in ["All", "Things", "Stuff"]:
             row = [name] + [
                 pq_res[name][k] * 100 
-                for k in ["pq", "sq", "rq", "pr", "re"]
+                for k in ["pq", "sq", "rq", "pr", "re", "uq"]
             ] + [pq_res[name]["n"]]
             data.append(row)
         table = tabulate(
@@ -535,7 +560,7 @@ if __name__ == "__main__":
         for name in ["All", "Things", "Stuff"]:
             row = [name] + [
                 pq_res[name][k] * 100 
-                for k in ["pqca", "sqca", "rqca", "prca", "reca"]
+                for k in ["pqca", "sqca", "rqca", "prca", "reca", "uqca"]
             ] + [pq_res[name]["n"]]
             data.append(row)
         table = tabulate(
