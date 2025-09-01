@@ -40,15 +40,28 @@ class PQStatCat:
         self.tp = 0         # True positives (same class)
         self.fp = 0         # False positives (same class)
         self.fn = 0         # False negatives (same class)
+        self.gt = 0         # Number of unique ground truths for true positives (used to measure duplication rate).
         self.iou_ca = 0.0   # Sum of IoUs for all IoU > 0.5 matches (class-agnostic)
         self.tp_ca = 0      # Total count of IoU > 0.5 matches (class-agnostic)
         self.fp_ca = 0      # False positives (class-agnostic)
         self.fn_ca = 0      # False negatives (class-agnostic)
-        self.gt = 0         # Number of unique ground truths for true positives (used to measure duplication rate).
         self.gt_ca = 0      # Number of unique ground truths for true positives (class-agnostic).
+        self.iou_ua = 0.0   # Sum of IoUs for true positives (unique assignment matching).
+        self.tp_ua = 0      # True positives (unique assignment matching).
+        self.fp_ua = 0      # False positives (unique assignment matching).
+        self.fn_ua = 0      # False negatives (unique assignment matching).
+        self.iou_uaca = 0.0 # Sum of IOus for true positives (unique assignment matching, class-agnostic).
+        self.tp_uaca = 0    # True positives (unique assignment matching, class-agnostic).
+        self.fp_uaca = 0    # False positives (unique assignment matching, class-agnostic).
+        self.fn_uaca = 0    # False negatives (unique assignment matching, class-agnostic).
 
     def __iadd__(self, other):
-        for attr in ['iou', 'tp', 'fp', 'fn', 'iou_ca', 'tp_ca', 'fp_ca', 'fn_ca', 'gt', 'gt_ca']:
+        for attr in [
+            'iou', 'tp', 'fp', 'fn', 'gt',
+            'iou_ca', 'tp_ca', 'fp_ca', 'fn_ca', 'gt_ca',
+            'iou_ua', 'tp_ua', 'fp_ua', 'fn_ua',
+            'iou_uaca', 'tp_uaca', 'fp_uaca', 'fn_uaca'
+        ]:
             setattr(self, attr, getattr(self, attr) + getattr(other, attr))
         return self
 
@@ -71,9 +84,17 @@ class PQStat:
 
         pqca_sum = sqca_sum = rqca_sum = 0.0
         tpca_sum = fpca_sum = fnca_sum = gtca_sum = 0
+        
+        pqua_sum = squa_sum = rqua_sum = 0.0
+        tpua_sum = fpua_sum = fnua_sum = 0
+        
+        pquaca_sum = squaca_sum = rquaca_sum = 0.0
+        tpuaca_sum = fpuaca_sum = fnuaca_sum = 0
 
         n = 0
         n_ca = 0
+        n_ua = 0
+        n_uaca = 0
         per_class = {}
 
         for label, info in categories.items():
@@ -92,6 +113,14 @@ class PQStat:
             fpca_sum += stat.fp_ca
             fnca_sum += stat.fn_ca
             gtca_sum += stat.gt_ca
+            
+            tpua_sum += stat.tp_ua
+            fpua_sum += stat.fp_ua
+            fnua_sum += stat.fn_ua
+
+            tpuaca_sum += stat.tp_uaca
+            fpuaca_sum += stat.fp_uaca
+            fnuaca_sum += stat.fn_uaca
 
             uniqueness_rate = stat.gt / stat.tp if stat.tp > 0 else 0.0
             uniqueness_rate_ca = stat.gt_ca / stat.tp_ca if stat.tp_ca > 0 else 0.0
@@ -121,12 +150,42 @@ class PQStat:
                 rqca_sum += rqca_c
             else:
                 pqca_c = sqca_c = rqca_c = 0.0
+                
+            denom_ua = stat.tp_ua + 0.5 * stat.fp_ua + 0.5 * stat.fn_ua
+            if denom_ua != 0:
+                n_ua += 1
+                pqua_c = stat.iou_ua / denom_ua
+                squa_c = stat.iou_ua / stat.tp_ua if stat.tp_ua > 0 else 0
+                rqua_c = stat.tp_ua / denom_ua
+
+                pqua_sum += pqua_c
+                squa_sum += squa_c
+                rqua_sum += rqua_c
+            else:
+                pqua_c = squa_c = rqua_c = 0.0
+
+            denom_uaca = stat.tp_uaca + 0.5 * stat.fp_uaca + 0.5 * stat.fn_uaca
+            if denom_uaca != 0:
+                n_uaca += 1
+                pquaca_c = stat.iou_uaca / denom_uaca
+                squaca_c = stat.iou_uaca / stat.tp_uaca if stat.tp_uaca > 0 else 0
+                rquaca_c = stat.tp_uaca / denom_uaca
+
+                pquaca_sum += pquaca_c
+                squaca_sum += squaca_c
+                rquaca_sum += rquaca_c
+            else:
+                pquaca_c = squaca_c = rquaca_c = 0.0
 
             per_class[label] = {
                 'pq': pq_c, 'sq': sq_c, 'rq': rq_c,
                 'pqca': pqca_c, 'sqca': sqca_c, 'rqca': rqca_c,
+                'pqua': pqua_c, 'squa': squa_c, 'rqua': rqua_c,
+                'pquaca': pquaca_c, 'squaca': squaca_c, 'rquaca': rquaca_c,
                 'tp': stat.tp, 'fp': stat.fp, 'fn': stat.fn,
                 'tpca': stat.tp_ca, 'fpca': stat.fp_ca, 'fnca': stat.fn_ca,
+                'tpua': stat.tp_ua, 'fpua': stat.fp_ua, 'fnua': stat.fn_ua,
+                'tpuaca': stat.tp_uaca, 'fpuaca': stat.fp_uaca, 'fnuaca': stat.fn_uaca,
                 'uq': uniqueness_rate, 'uqca': uniqueness_rate_ca,
             }
 
@@ -149,13 +208,32 @@ class PQStat:
         reca = (tpca_sum / (tpca_sum + fnca_sum)) if (tpca_sum + fnca_sum) > 0 else 0.0
 
         uniqueness_rate_ca = gtca_sum / tpca_sum if tpca_sum > 0 else 0.0
+        
+        # Overall unique assignment metrics
+        pqua = pqua_sum / n_ua if n_ua > 0 else 0.0
+        squa = squa_sum / n_ua if n_ua > 0 else 0.0
+        rqua = rqua_sum / n_ua if n_ua > 0 else 0.0
+
+        prua = (tpua_sum / (tpua_sum + fpua_sum)) if (tpua_sum + fpua_sum) > 0 else 0.0
+        reua = (tpua_sum / (tpua_sum + fnua_sum)) if (tpua_sum + fnua_sum) > 0 else 0.0
+
+        # Overall unique assignment class-agnostic metrics
+        pquaca = pquaca_sum / n_uaca if n_uaca > 0 else 0.0
+        squaca = squaca_sum / n_uaca if n_uaca > 0 else 0.0
+        rquaca = rquaca_sum / n_uaca if n_uaca > 0 else 0.0
+
+        pruaca = (tpuaca_sum / (tpuaca_sum + fpuaca_sum)) if (tpuaca_sum + fpuaca_sum) > 0 else 0.0
+        reuaca = (tpuaca_sum / (tpuaca_sum + fnuaca_sum)) if (tpuaca_sum + fnuaca_sum) > 0 else 0.0
 
         overall = {
             'pq': pq, 'sq': sq, 'rq': rq,
             'pqca': pqca, 'sqca': sqca, 'rqca': rqca,
+            'pqua': pqua, 'squa': squa, 'rqua': rqua,
+            'pquaca': pquaca, 'squaca': squaca, 'rquaca': rquaca,
             'pr': pr, 'prca': preca, 're': re, 'reca': reca,
+            'prua': prua, 'reua': reua, 'pruaca': pruaca, 'reuaca': reuaca,
             'uq': uniqueness_rate, 'uqca': uniqueness_rate_ca,
-            'n': n
+            'n': n,
         }
 
         return overall, per_class
@@ -194,6 +272,10 @@ def pq_compute_single_core(proc_id, annotation_set, gt_folder, pred_folder, cate
         # Per-category matched IDs to count number of unique ground truths. 
         per_cat_matched_gt, per_cat_matched_gt_ca = defaultdict(set), defaultdict(set)
 
+        # All potential matches before unique assignment
+        potential_matches = defaultdict(list)
+        potential_matches_ca = defaultdict(list)
+
         # Match segments
         for (gt_id, pred_id), inter in gt_pred_map.items():
             if gt_id not in gt_segms or pred_id not in pred_segms:
@@ -219,6 +301,7 @@ def pq_compute_single_core(proc_id, annotation_set, gt_folder, pred_folder, cate
                 matched_pred_ca.add(pred_id)
                 per_cat_matched_gt_ca[cat].add(gt_id)
                 stat.gt_ca = len(per_cat_matched_gt_ca[cat])
+                potential_matches_ca[cat].append((iou, gt_id, pred_id))
                 # Class-aware metrics if category matches
                 if g['category_id'] == p['category_id']:
                     stat.tp += 1
@@ -227,6 +310,7 @@ def pq_compute_single_core(proc_id, annotation_set, gt_folder, pred_folder, cate
                     matched_pred.add(pred_id)
                     per_cat_matched_gt[cat].add(gt_id)
                     stat.gt = len(per_cat_matched_gt[cat])
+                    potential_matches[cat].append((iou, gt_id, pred_id))
 
         # Count false negatives
         crowd_by_cat = {}
@@ -265,7 +349,63 @@ def pq_compute_single_core(proc_id, annotation_set, gt_folder, pred_folder, cate
                     inter += gt_pred_map.get((crowd_by_cat_ca[p['category_id']], pred_id), 0)
                 if inter / p['area'] <= 0.5:
                     pq_stat[p['category_id']].fp_ca += 1
-            
+    
+    # Greedy one-to-one matching
+    matched_gt, matched_pred = set(), set()
+    matched_gt_ca, matched_pred_ca = set(), set()
+
+    # Class-aware matching
+    for cat_id, matches in potential_matches.items():
+        # Sort matches by IoU in descending order
+        matches.sort(key=lambda x: x[0], reverse=True)
+        stat = pq_stat[cat_id]
+        for iou, gt_id, pred_id in matches:
+            if gt_id not in matched_gt and pred_id not in matched_pred:
+                stat.tp_ua += 1
+                stat.iou_ua += iou
+                matched_gt.add(gt_id)
+                matched_pred.add(pred_id)
+
+    # Class-agnostic matching
+    for cat_id, matches in potential_matches_ca.items():
+        matches.sort(key=lambda x: x[0], reverse=True)
+        stat = pq_stat[cat_id]
+        for iou, gt_id, pred_id in matches:
+            if gt_id not in matched_gt_ca and pred_id not in matched_pred_ca:
+                stat.tp_uaca += 1
+                stat.iou_uaca += iou
+                matched_gt_ca.add(gt_id)
+                matched_pred_ca.add(pred_id)
+
+    # Count false negatives
+    for gt_id, g in gt_segms.items():
+        if g['iscrowd'] == 0:
+            cat_id = g['category_id']
+            if gt_id not in matched_gt:
+                pq_stat[cat_id].fn_ua += 1
+            if gt_id not in matched_gt_ca:
+                pq_stat[cat_id].fn_uaca += 1
+
+    # Count false positives
+    for pred_id, p in pred_segms.items():
+        cat_id = p['category_id']
+        is_matched = pred_id in matched_pred
+        is_matched_ca = pred_id in matched_pred_ca
+
+        # Logic to handle predictions overlapping with crowd regions
+        inter_with_crowd = 0
+        for gt_id, g in gt_segms.items():
+            if g['iscrowd'] == 1 and g['category_id'] == cat_id:
+                if (gt_id, pred_id) in gt_pred_map:
+                    inter_with_crowd += gt_pred_map[(gt_id, pred_id)]
+
+        if not is_matched:
+            if inter_with_crowd / p.get('area', 1) <= 0.5:
+                pq_stat[cat_id].fp_ua += 1
+
+        if not is_matched_ca:
+            if inter_with_crowd / p.get('area', 1) <= 0.5:
+                pq_stat[cat_id].fp_uaca += 1
 
     print(f"Core: {proc_id}, all {len(annotation_set)} processed")
     return pq_stat
@@ -429,6 +569,16 @@ class COCOPanopticEvaluator(DatasetEvaluator):
         res["PRca"] = 100 * pq_res["All"]["prca"]
         res["REca"] = 100 * pq_res["All"]["reca"]
         res["UQca"] = 100 * pq_res["All"]["uqca"]
+        res["PQua"] = 100 * pq_res["All"]["pqua"]
+        res["SQua"] = 100 * pq_res["All"]["squa"]
+        res["RQua"] = 100 * pq_res["All"]["rqua"]
+        res["PRua"] = 100 * pq_res["All"]["prua"]
+        res["REua"] = 100 * pq_res["All"]["reua"]
+        res["PQuaca"] = 100 * pq_res["All"]["pquaca"]
+        res["SQuaca"] = 100 * pq_res["All"]["squaca"]
+        res["RQuaca"] = 100 * pq_res["All"]["rquaca"]
+        res["PRuaca"] = 100 * pq_res["All"]["pruaca"]
+        res["REuaca"] = 100 * pq_res["All"]["reuaca"]
 
         res["PQ_th"] = 100 * pq_res["Things"]["pq"]
         res["SQ_th"] = 100 * pq_res["Things"]["sq"]
@@ -442,6 +592,16 @@ class COCOPanopticEvaluator(DatasetEvaluator):
         res["PRca_th"] = 100 * pq_res["Things"]["prca"]
         res["REca_th"] = 100 * pq_res["Things"]["reca"]
         res["UQca_th"] = 100 * pq_res["Things"]["uqca"]
+        res["PQua_th"] = 100 * pq_res["Things"]["pqua"]
+        res["SQua_th"] = 100 * pq_res["Things"]["squa"]
+        res["RQua_th"] = 100 * pq_res["Things"]["rqua"]
+        res["PRua_th"] = 100 * pq_res["Things"]["prua"]
+        res["REua_th"] = 100 * pq_res["Things"]["reua"]
+        res["PQuaca_th"] = 100 * pq_res["Things"]["pquaca"]
+        res["SQuaca_th"] = 100 * pq_res["Things"]["squaca"]
+        res["RQuaca_th"] = 100 * pq_res["Things"]["rquaca"]
+        res["PRuaca_th"] = 100 * pq_res["Things"]["pruaca"]
+        res["REuaca_th"] = 100 * pq_res["Things"]["reuaca"]
 
         res["PQ_st"] = 100 * pq_res["Stuff"]["pq"]
         res["SQ_st"] = 100 * pq_res["Stuff"]["sq"]
@@ -455,6 +615,16 @@ class COCOPanopticEvaluator(DatasetEvaluator):
         res["PRca_st"] = 100 * pq_res["Stuff"]["prca"]
         res["REca_st"] = 100 * pq_res["Stuff"]["reca"]
         res["UQca_st"] = 100 * pq_res["Stuff"]["uqca"]
+        res["PQua_st"] = 100 * pq_res["Stuff"]["pqua"]
+        res["SQua_st"] = 100 * pq_res["Stuff"]["squa"]
+        res["RQua_st"] = 100 * pq_res["Stuff"]["rqua"]
+        res["PRua_st"] = 100 * pq_res["Stuff"]["prua"]
+        res["REua_st"] = 100 * pq_res["Stuff"]["reua"]
+        res["PQuaca_st"] = 100 * pq_res["Stuff"]["pquaca"]
+        res["SQuaca_st"] = 100 * pq_res["Stuff"]["squaca"]
+        res["RQuaca_st"] = 100 * pq_res["Stuff"]["rquaca"]
+        res["PRuaca_st"] = 100 * pq_res["Stuff"]["pruaca"]
+        res["REuaca_st"] = 100 * pq_res["Stuff"]["reuaca"]
         return res
 
     def _print_panoptic_results(self, pq_res):
@@ -482,6 +652,29 @@ class COCOPanopticEvaluator(DatasetEvaluator):
             data, headers=headers, tablefmt="pipe", floatfmt=".3f", stralign="center", numalign="center"
         )
         logger.info("Panoptic Evaluation Results (Class-Agnostic):\n" + table)
+        
+        headers = ["", "PQ", "SQ", "RQ", "PR", "RE", "#categories"]
+        data = []
+        for name in ["All", "Things", "Stuff"]:
+            row = [name] + [
+                pq_res[name][k] * 100 for k in ["pqua", "squa", "rqua", "prua", "reua"]
+            ] + [pq_res[name]["n"]]
+            data.append(row)
+        table = tabulate(
+            data, headers=headers, tablefmt="pipe", floatfmt=".3f", stralign="center", numalign="center"
+        )
+        logger.info("Panoptic Evaluation Results (Unique Assignment):\n" + table)
+        
+        data = []
+        for name in ["All", "Things", "Stuff"]:
+            row = [name] + [
+                pq_res[name][k] * 100 for k in ["pquaca", "squaca", "rquaca", "pruaca", "reuaca"]
+            ] + [pq_res[name]["n"]]
+            data.append(row)
+        table = tabulate(
+            data, headers=headers, tablefmt="pipe", floatfmt=".3f", stralign="center", numalign="center"
+        )
+        logger.info("Panoptic Evaluation Results (Unique Assignment, Class-Agnostic):\n" + table)
 
     def evaluate(self):
         comm.synchronize()
@@ -567,3 +760,26 @@ if __name__ == "__main__":
             data, headers=headers, tablefmt="pipe", floatfmt=".3f", stralign="center", numalign="center"
         )
         logger.info("Panoptic Evaluation Results (Class-Agnostic):\n" + table)
+
+        headers = ["", "PQ", "SQ", "RQ", "PR", "RE", "#categories"]
+        data = []
+        for name in ["All", "Things", "Stuff"]:
+            row = [name] + [
+                pq_res[name][k] * 100 for k in ["pqua", "squa", "rqua", "prua", "reua"]
+            ] + [pq_res[name]["n"]]
+            data.append(row)
+        table = tabulate(
+            data, headers=headers, tablefmt="pipe", floatfmt=".3f", stralign="center", numalign="center"
+        )
+        logger.info("Panoptic Evaluation Results (Unique Assignment):\n" + table)
+        
+        data = []
+        for name in ["All", "Things", "Stuff"]:
+            row = [name] + [
+                pq_res[name][k] * 100 for k in ["pquaca", "squaca", "rquaca", "pruaca", "reuaca"]
+            ] + [pq_res[name]["n"]]
+            data.append(row)
+        table = tabulate(
+            data, headers=headers, tablefmt="pipe", floatfmt=".3f", stralign="center", numalign="center"
+        )
+        logger.info("Panoptic Evaluation Results (Unique Assignment, Class-Agnostic):\n" + table)
