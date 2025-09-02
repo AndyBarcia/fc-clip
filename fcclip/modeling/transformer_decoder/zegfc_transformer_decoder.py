@@ -29,6 +29,11 @@ from .fcclip_transformer_decoder import (
     MLP,
     _get_activation_fn
 )
+from .box_regression import (
+    BboxMaskInitialization, 
+    BboxMaskSTN, 
+    BBoxMLPRegression
+)
 
 
 class TextCrossAttentionLayer(nn.Module):
@@ -203,6 +208,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         mask_dim: int,
         mask_embed_type: str = "mlp",
         class_embed_type: str = "mlp",
+        box_reg_type: str = "none",
         enforce_input_project: bool,
         attn_conv_kernel_size: Optional[int] = 3,
         text_attn: bool,
@@ -234,6 +240,21 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         # positional encoding
         N_steps = hidden_dim // 2
         self.pe_layer = PositionEmbeddingSine(N_steps, normalize=True)
+        
+        # Box regression module
+        self.box_reg_type = box_reg_type
+        if self.box_reg_type == "mlp":
+            self._bbox_embed = BBoxMLPRegression(hidden_dim)
+        elif self.box_reg_type in ['bitmask', 'mask2box']:
+            self.mask2box_threshold = 0.0
+            self._bbox_embed = BboxMaskInitialization(
+                fast_bbox = self.box_reg_type=="mask2box", 
+                threshold=self.mask2box_threshold
+            )
+        elif self.box_reg_type == "stn":
+            self._bbox_embed = BboxMaskSTN(pooling="mean", learn_format="cxcywh")
+        else:
+            self._bbox_embed = None
         
         # define Transformer decoder here
         self.num_heads = nheads
@@ -289,6 +310,8 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         self.query_feat = nn.Embedding(num_queries, hidden_dim)
         # learnable query p.e.
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
+        # optional fixed boxes
+        self.query_bbox = nn.Embedding(num_queries, 4) if self._bbox_embed != None else None
 
         # level embedding (we always use 3 scales)
         self.num_feature_levels = 3
@@ -387,6 +410,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         ret["mask_embed_type"] = cfg.MODEL.ZEG_FC.MASK_EMBED_TYPE
         ret["class_embed_type"] = cfg.MODEL.ZEG_FC.CLASS_EMBED_TYPE
         ret["attn_conv_kernel_size"] = cfg.MODEL.ZEG_FC.ATTN_CONV_KERNEL_SIZE
+        ret["box_reg_type"] = cfg.MODEL.ZEG_FC.BOX_REGRESSION_TYPE
         return ret
 
     def forward(self, x, mask_features, mask = None, text_classifier=None, num_templates=None):
@@ -413,9 +437,11 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         # QxNxC
         query_embed = self.query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
         output = self.query_feat.weight.unsqueeze(1).repeat(1, bs, 1)
+        query_bbox_unsigmoid = self.query_bbox.weight.unsqueeze(1).repeat(1, bs, 1) if self.query_bbox else None
 
         predictions_class = []
         predictions_mask = []
+        predictions_bbox = []
 
         # Optional starting cross-attention for text. 
         if self.text_atnn_cls:
@@ -440,11 +466,12 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             mem_attn_logits = None
 
         # prediction heads on learnable query features
-        outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(
+        outputs_class, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
             output, 
             mask_features,
             mem_attn_logits,
             text_attn_logits,
+            query_bbox_unsigmoid=query_bbox_unsigmoid,
             attn_mask_size=size_list[0],
             attn_mask_target_size=size_list[0],
             text_classifier=text_classifier, 
@@ -452,11 +479,13 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         )
         predictions_class.append(outputs_class)
         predictions_mask.append(outputs_mask)
+        predictions_bbox.append(output_box)
 
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
             attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
             # attention: cross-attention first
+            # TODO pass box here
             output, mem_attn_logits = self.transformer_cross_attention_layers[i](
                 output, src[level_index],
                 memory_mask=attn_mask,
@@ -485,11 +514,12 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                 output
             )
 
-            outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(
+            outputs_class, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
                 output, 
                 mask_features, 
                 mem_attn_logits,
                 text_attn_logits,
+                query_bbox_unsigmoid=query_bbox_unsigmoid,
                 attn_mask_size=size_list[i % self.num_feature_levels],
                 attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels],
                 text_classifier=text_classifier, 
@@ -497,14 +527,16 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             )
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
+            predictions_bbox.append(output_box)
 
         assert len(predictions_class) == self.num_layers + 1
 
         out = {
             'pred_logits': predictions_class[-1],
             'pred_masks': predictions_mask[-1],
+            'pred_boxes': predictions_bbox[-1],
             'aux_outputs': self._set_aux_loss(
-                predictions_class if self.mask_classification else None, predictions_mask
+                predictions_class if self.mask_classification else None, predictions_mask, predictions_bbox
             )
         }
         return out
@@ -516,6 +548,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         mask_features, 
         mem_attn_logits,
         text_attn_logits, 
+        query_bbox_unsigmoid,
         attn_mask_size,
         attn_mask_target_size, 
         text_classifier, 
@@ -545,6 +578,19 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             bs = decoder_output.shape[0]
             outputs_mask = outputs_mask.squeeze(1).unflatten(0, (bs, -1))  # [B, Q, H, W]
 
+        # Do box regression if provided with look forward twice
+        if query_bbox_unsigmoid != None:
+            outputs_bbox, query_bbox_unsigmoid_detached = self._bbox_embed(
+                decoder_output, 
+                query_bbox_unsigmoid.transpose(0,1), 
+                outputs_mask, 
+                normalized_space=False
+            )
+            outputs_bbox = outputs_bbox.sigmoid()
+            query_bbox_unsigmoid_detached = query_bbox_unsigmoid_detached.transpose(0,1)
+        else:
+            outputs_bbox, query_bbox_unsigmoid_detached = None, None
+
         # fcclip head
         maskpool_embeddings = self.mask_pooling(x=mask_features, mask=outputs_mask) # [B, Q, C]
         maskpool_embeddings = self._mask_pooling_proj(maskpool_embeddings)
@@ -559,17 +605,20 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         attn_mask = (attn_mask.sigmoid().flatten(2).unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0, 1) < 0.5).bool()
         attn_mask = attn_mask.detach()
 
-        return outputs_class, outputs_mask, attn_mask
+        return outputs_class, outputs_mask, outputs_bbox, query_bbox_unsigmoid_detached, attn_mask
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_seg_masks):
+    def _set_aux_loss(self, outputs_class, outputs_seg_masks, outputs_bboxes):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
         if self.mask_classification:
             return [
-                {"pred_logits": a, "pred_masks": b}
-                for a, b in zip(outputs_class[:-1], outputs_seg_masks[:-1])
+                {"pred_logits": a, "pred_masks": b, "pred_boxes": c}
+                for a, b, c in zip(outputs_class[:-1], outputs_seg_masks[:-1], outputs_bboxes[:-1])
             ]
         else:
-            return [{"pred_masks": b} for b in outputs_seg_masks[:-1]]
+            return [
+                {"pred_masks": b, "pred_boxes": c}
+                for b, c in zip(outputs_seg_masks[:-1], outputs_bboxes[:-1])
+            ]

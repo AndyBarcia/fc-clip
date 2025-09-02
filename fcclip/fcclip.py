@@ -7,6 +7,8 @@ Reference: https://github.com/facebookresearch/Mask2Former/blob/main/mask2former
 from typing import Tuple
 
 import torch
+torch._dynamo.config.suppress_errors = True
+
 from torch import nn
 from torch.nn import functional as F
 
@@ -20,7 +22,7 @@ from detectron2.utils.memory import retry_if_cuda_oom
 
 from .modeling.criterion import SetCriterion
 from .modeling.matcher import HungarianMatcher
-
+from .modeling.transformer_decoder.box_regression import box_xyxy_to_cxcywh
 
 from .modeling.transformer_decoder.fcclip_transformer_decoder import MaskPooling, get_classification_logits
 VILD_PROMPT = [
@@ -229,6 +231,8 @@ class FCCLIP(nn.Module):
         class_weight = cfg.MODEL.MASK_FORMER.CLASS_WEIGHT
         dice_weight = cfg.MODEL.MASK_FORMER.DICE_WEIGHT
         mask_weight = cfg.MODEL.MASK_FORMER.MASK_WEIGHT
+        bbox_weight = cfg.MODEL.MASK_FORMER.BBOX_WEIGHT
+        giou_weight = cfg.MODEL.MASK_FORMER.GIOU_WEIGHT
 
         # building criterion
         matcher = HungarianMatcher(
@@ -238,7 +242,13 @@ class FCCLIP(nn.Module):
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
         )
 
-        weight_dict = {"loss_ce": class_weight, "loss_mask": mask_weight, "loss_dice": dice_weight}
+        weight_dict = {
+            "loss_ce": class_weight, 
+            "loss_mask": mask_weight, 
+            "loss_dice": dice_weight,
+            "loss_bbox": bbox_weight,
+            "loss_giou": giou_weight
+        }
 
         if deep_supervision:
             dec_layers = cfg.MODEL.MASK_FORMER.DEC_LAYERS
@@ -247,7 +257,7 @@ class FCCLIP(nn.Module):
                 aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
             weight_dict.update(aux_weight_dict)
 
-        losses = ["labels", "masks"]
+        losses = ["labels", "masks", "boxes"]
 
         criterion = SetCriterion(
             sem_seg_head.num_classes,
@@ -453,12 +463,15 @@ class FCCLIP(nn.Module):
             gt_masks = targets_per_image.gt_masks
             padded_masks = torch.zeros((gt_masks.shape[0], h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
             padded_masks[:, : gt_masks.shape[1], : gt_masks.shape[2]] = gt_masks
-            new_targets.append(
-                {
-                    "labels": targets_per_image.gt_classes,
-                    "masks": padded_masks,
-                }
-            )
+            attributes = {
+                "labels": targets_per_image.gt_classes,
+                "masks": padded_masks,
+            }
+            if targets_per_image.has("gt_boxes"):
+                h, w = targets_per_image.image_size
+                image_size_xyxy = torch.as_tensor([w, h, w, h], dtype=torch.float, device=self.device)
+                attributes["boxes"] = box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor)/image_size_xyxy
+            new_targets.append(attributes)
         return new_targets
 
     def semantic_inference(self, mask_cls, mask_pred):

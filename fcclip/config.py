@@ -40,6 +40,8 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.CLASS_WEIGHT = 1.0
     cfg.MODEL.MASK_FORMER.DICE_WEIGHT = 1.0
     cfg.MODEL.MASK_FORMER.MASK_WEIGHT = 20.0
+    cfg.MODEL.MASK_FORMER.BBOX_WEIGHT = 1.0
+    cfg.MODEL.MASK_FORMER.GIOU_WEIGHT = 1.0
 
     # transformer config
     cfg.MODEL.MASK_FORMER.NHEADS = 8
@@ -148,4 +150,4 @@ def add_zegfc_config(cfg):
     cfg.MODEL.ZEG_FC.MASK_EMBED_TYPE = "mlp"  # Options: "mlp", "linear"
     cfg.MODEL.ZEG_FC.CLASS_EMBED_TYPE = "mlp"  # Options: "mlp", "linear"
     cfg.MODEL.ZEG_FC.ATTN_CONV_KERNEL_SIZE = None
-
+    cfg.MODEL.ZEG_FC.BOX_REGRESSION_TYPE = None  # Options: "mlp", "bitmask", "mask2box", "stn"
