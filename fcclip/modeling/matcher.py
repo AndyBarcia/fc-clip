@@ -157,6 +157,8 @@ class HungarianMatcher(nn.Module):
                 # by returning empty indices, which is the desired behavior.
                 C = torch.empty(num_queries, 0, device=out_prob.device)
             C = C.reshape(num_queries, -1).cpu()
+            # Make sure the matrix contains no NaN values, or scipy fails 
+            C[C.isnan()] = 0.0
 
             indices.append(linear_sum_assignment(C))
 
