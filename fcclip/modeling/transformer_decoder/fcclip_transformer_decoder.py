@@ -171,13 +171,13 @@ class SelfAttentionLayer(nn.Module):
         pos_emb = pos_emb.transpose(0,1) # (Q,B,C) 
 
         if self.normalize_before:
-            output, logits = self.forward_pre(tgt, tgt_mask,
+            output = self.forward_pre(tgt, tgt_mask,
                                     tgt_key_padding_mask, pos_emb)
         else:
-            output, logits = self.forward_post(tgt, tgt_mask,
+            output = self.forward_post(tgt, tgt_mask,
                                  tgt_key_padding_mask, pos_emb)
 
-        return output.transpose(0,1), logits # (B,Q,C) 
+        return output.transpose(0,1), None # (B,Q,C) 
 
 
 class CrossAttentionLayer(nn.Module):

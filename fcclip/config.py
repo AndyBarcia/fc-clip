@@ -151,5 +151,5 @@ def add_zegfc_config(cfg):
     cfg.MODEL.ZEG_FC.CLASS_EMBED_TYPE = "mlp"  # Options: "mlp", "linear"
     cfg.MODEL.ZEG_FC.ATTN_CONV_KERNEL_SIZE = None
     cfg.MODEL.ZEG_FC.BOX_REGRESSION_TYPE = None  # Options: "mlp", "bitmask", "mask2box", "stn"
-    cfg.MODEL.ZEG_FC.CROSS_ATTN_TYPE = None  # Options: "standard", "pos_mlp_brpb", "pos_mlp_rpb"
-    cfg.MODEL.ZEG_FC.SELF_ATTN_TYPE = None  # Options: "standard", "pos_mlp_brpb", "pos_mlp_rpb"
+    cfg.MODEL.ZEG_FC.CROSS_ATTN_TYPE = "standard"  # Options: "standard", "pos_mlp_brpb", "pos_mlp_rpb"
+    cfg.MODEL.ZEG_FC.SELF_ATTN_TYPE = "standard"  # Options: "standard", "pos_mlp_brpb", "pos_mlp_rpb"
