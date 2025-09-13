@@ -34,6 +34,10 @@ from .box_regression import (
     BboxMaskSTN, 
     BBoxMLPRegression
 )
+from .pos_mlp_bias.functions import (
+    PosMLPAttention,
+    PosMLPSelfAttention
+)
 
 
 class TextCrossAttentionLayer(nn.Module):
@@ -209,6 +213,8 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         mask_embed_type: str = "mlp",
         class_embed_type: str = "mlp",
         box_reg_type: str = "none",
+        cross_attn_type: str = "standard",
+        self_attn_type: str = "standard",
         enforce_input_project: bool,
         attn_conv_kernel_size: Optional[int] = 3,
         text_attn: bool,
@@ -256,6 +262,10 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         else:
             self._bbox_embed = None
         
+        # Attention type
+        self.self_attn_type = self_attn_type
+        self.cross_attn_type = cross_attn_type
+
         # define Transformer decoder here
         self.num_heads = nheads
         self.num_layers = dec_layers
@@ -271,6 +281,14 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                     nhead=nheads,
                     dropout=0.0,
                     normalize_before=pre_norm,
+                ) if self.self_attn_type == "standard" else
+                PosMLPSelfAttention(
+                    dim=hidden_dim,
+                    hidden_dim=16,
+                    n_heads=nheads,
+                    batched_rpb=(self.self_attn_type == "pos_mlp_brpb"),
+                    dropout=0.0,
+                    normalize_before=pre_norm
                 )
             )
 
@@ -280,6 +298,15 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                     nhead=nheads,
                     dropout=0.0,
                     normalize_before=pre_norm,
+                )
+                if self.cross_attn_type == "standard" else
+                PosMLPAttention(
+                    dim=hidden_dim,
+                    hidden_dim=16,
+                    n_heads=nheads,
+                    batched_rpb=(self.cross_attn_type == "pos_mlp_brpb"),
+                    dropout=0.0,
+                    normalize_before=pre_norm
                 )
             )
 
@@ -411,6 +438,8 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         ret["class_embed_type"] = cfg.MODEL.ZEG_FC.CLASS_EMBED_TYPE
         ret["attn_conv_kernel_size"] = cfg.MODEL.ZEG_FC.ATTN_CONV_KERNEL_SIZE
         ret["box_reg_type"] = cfg.MODEL.ZEG_FC.BOX_REGRESSION_TYPE
+        ret["cross_attn_type"] = cfg.MODEL.ZEG_FC.CROSS_ATTN_TYPE
+        ret["self_attn_type"] = cfg.MODEL.ZEG_FC.SELF_ATTN_TYPE
         return ret
 
     def forward(self, x, mask_features, mask = None, text_classifier=None, num_templates=None):
@@ -456,12 +485,14 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         # Optional starting cross-attention for memory attention mask.
         if self.mem_attn_mask:
             output, mem_attn_logits = self.intermediate_mem_cross_attention_layer(
-                output, src[0],
-                memory_mask=None,
-                memory_key_padding_mask=None,  # here we do not apply masking on padded region
-                pos=pos[0], query_pos=query_embed,
-                return_attn_logits=self.mem_attn_mask
+                output.transpose(0,1), # (B,Q,C)
+                src[0].transpose(0,1).view(bs, size_list[0][0], size_list[0][1], -1), # (B,H,W,C)
+                memory_pos_emb=pos[0].transpose(0,1).view(bs, size_list[0][0], size_list[0][1], -1), # (B,H,W,C), 
+                query_pos_emb=query_embed.transpose(0,1), # (B,Q,C)
+                pos=query_bbox_unsigmoid.sigmoid().transpose(0,1), # (B,Q,[x,y,w,j])
+                return_attn_logits=self.mem_attn_mask,
             )
+            output = output.transpose(0,1) # (Q,B,C)
         else:
             mem_attn_logits = None
 
@@ -485,14 +516,17 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             level_index = i % self.num_feature_levels
             attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
             # attention: cross-attention first
-            # TODO pass box here
             output, mem_attn_logits = self.transformer_cross_attention_layers[i](
-                output, src[level_index],
-                memory_mask=attn_mask,
-                memory_key_padding_mask=None,  # here we do not apply masking on padded region
-                pos=pos[level_index], query_pos=query_embed,
-                return_attn_logits=self.mem_attn_mask
+                output.transpose(0,1), # (B,Q,C)
+                src[level_index].transpose(0,1).view(bs, size_list[level_index][0], size_list[level_index][1], -1), # (B,H,W,C)
+                attn_mask=attn_mask.view(bs, self.num_heads, self.num_queries, size_list[level_index][0], size_list[level_index][1]), # (B, num_heads, Q, H,W)
+                memory_pos_emb=pos[level_index].transpose(0,1).view(bs, size_list[level_index][0], size_list[level_index][1], -1), # (B,H,W,C), 
+                query_pos_emb=query_embed.transpose(0,1), # (B,Q,C)
+                pos=query_bbox_unsigmoid.sigmoid().transpose(0,1), # (B,Q,[x,y,w,j])
+                return_attn_logits=self.mem_attn_mask,
             )
+            output = output.transpose(0,1) # (Q,B,C)
+
             # then, text cross-attention
             if self.text_attn:
                 output, text_attn_logits = self.transformer_text_cross_attention_layers[i](
@@ -503,11 +537,12 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             else:
                 text_attn_logits = None
             # then, self-attention
-            output = self.transformer_self_attention_layers[i](
-                output, tgt_mask=None,
-                tgt_key_padding_mask=None,
-                query_pos=query_embed
+            output, _ = self.transformer_self_attention_layers[i](
+                output.transpose(0,1), # (B,Q,C) 
+                pos_emb=query_embed.transpose(0,1), # # (B,Q,C) 
+                pos=query_bbox_unsigmoid.sigmoid().transpose(0,1), # (B,Q,[x,y,w,j])
             )
+            output = output.transpose(0,1) # (Q,B,C)
             
             # FFN
             output = self.transformer_ffn_layers[i](
@@ -560,6 +595,11 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
 
         if self.mem_attn_mask:
             # Get attention logits from memory attention to the propper size.
+
+            #import logging
+            #logger = logging.getLogger("detectron2")
+            #logger.info(f"{mem_attn_logits.shape=}, {attn_mask_size=}, {mask_features.shape=}")
+
             mem_attn_logits = mem_attn_logits.unflatten(-1, attn_mask_size) # [B, Q, H, W]
             mem_attn_logits = F.interpolate(
                 mem_attn_logits, 

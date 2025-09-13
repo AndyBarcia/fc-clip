@@ -159,15 +159,25 @@ class SelfAttentionLayer(nn.Module):
         
         return tgt
 
-    def forward(self, tgt,
-                tgt_mask: Optional[Tensor] = None,
-                tgt_key_padding_mask: Optional[Tensor] = None,
-                query_pos: Optional[Tensor] = None):
+    def forward(
+        self, 
+        tgt, # (B,Q,C) 
+        tgt_mask: Optional[Tensor] = None,
+        tgt_key_padding_mask: Optional[Tensor] = None,
+        pos_emb: Optional[Tensor] = None, # (B,Q,C) 
+        pos: Optional[Tensor] = None
+    ):
+        tgt = tgt.transpose(0,1) # (Q,B,C) 
+        pos_emb = pos_emb.transpose(0,1) # (Q,B,C) 
+
         if self.normalize_before:
-            return self.forward_pre(tgt, tgt_mask,
-                                    tgt_key_padding_mask, query_pos)
-        return self.forward_post(tgt, tgt_mask,
-                                 tgt_key_padding_mask, query_pos)
+            output, logits = self.forward_pre(tgt, tgt_mask,
+                                    tgt_key_padding_mask, pos_emb)
+        else:
+            output, logits = self.forward_post(tgt, tgt_mask,
+                                 tgt_key_padding_mask, pos_emb)
+
+        return output.transpose(0,1), logits # (B,Q,C) 
 
 
 class CrossAttentionLayer(nn.Module):
@@ -222,7 +232,7 @@ class CrossAttentionLayer(nn.Module):
         return attn_logits  # Shape: [bsz, tgt_len, src_len]
     
     def forward_post(self, tgt, memory,
-                     memory_mask: Optional[Tensor] = None,
+                     attn_mask: Optional[Tensor] = None,
                      memory_key_padding_mask: Optional[Tensor] = None,
                      pos: Optional[Tensor] = None,
                      query_pos: Optional[Tensor] = None,
@@ -239,13 +249,13 @@ class CrossAttentionLayer(nn.Module):
             tgt2 = self.multihead_attn(query=q,
                                        key=k,
                                        value=v, 
-                                       attn_mask=memory_mask,
+                                       attn_mask=attn_mask,
                                        key_padding_mask=memory_key_padding_mask)[0]
         else:
             tgt2 = self.multihead_attn(query=q,
                                        key=k,
                                        value=v, 
-                                       attn_mask=memory_mask,
+                                       attn_mask=attn_mask,
                                        key_padding_mask=memory_key_padding_mask)[0]
         
         tgt = tgt + self.dropout(tgt2)
@@ -254,7 +264,7 @@ class CrossAttentionLayer(nn.Module):
         return (tgt, attn_logits) if return_attn_logits else (tgt, None)
     
     def forward_pre(self, tgt, memory,
-                    memory_mask: Optional[Tensor] = None,
+                    attn_mask: Optional[Tensor] = None,
                     memory_key_padding_mask: Optional[Tensor] = None,
                     pos: Optional[Tensor] = None,
                     query_pos: Optional[Tensor] = None,
@@ -272,31 +282,45 @@ class CrossAttentionLayer(nn.Module):
             tgt2 = self.multihead_attn(query=q,
                                        key=k,
                                        value=v, 
-                                       attn_mask=memory_mask,
+                                       attn_mask=attn_mask,
                                        key_padding_mask=memory_key_padding_mask)[0]
         else:
             tgt2 = self.multihead_attn(query=q,
                                        key=k,
                                        value=v, 
-                                       attn_mask=memory_mask,
+                                       attn_mask=attn_mask,
                                        key_padding_mask=memory_key_padding_mask)[0]
         
         tgt = tgt + self.dropout(tgt2)
         return (tgt, attn_logits) if return_attn_logits else (tgt, None)
     
-    def forward(self, tgt, memory,
-                memory_mask: Optional[Tensor] = None,
-                memory_key_padding_mask: Optional[Tensor] = None,
-                pos: Optional[Tensor] = None,
-                query_pos: Optional[Tensor] = None,
-                return_attn_logits: bool = False):
+    def forward(
+        self, 
+        tgt, # (B,Q,C) 
+        memory,  # (B,H,W,C)
+        attn_mask: Optional[Tensor] = None, # (B, num_heads, Q, H, W)
+        memory_key_padding_mask: Optional[Tensor] = None,
+        memory_pos_emb: Optional[Tensor] = None, # (B,H,W,C), 
+        query_pos_emb: Optional[Tensor] = None, # (B,Q,C)
+        return_attn_logits: bool = False,
+        pos: Optional[Tensor] = None, # (B,Q,[x,y,w,j])
+    ):
+        tgt = tgt.transpose(0,1) # (Q,B,C)
+        memory = memory.flatten(1,2).transpose(0,1) # (H*W,B,C)
+        attn_mask = attn_mask.flatten(0,1).flatten(2,3) # (B*num_heads, Q, H*W)
+        memory_pos_emb = memory_pos_emb.flatten(1,2).transpose(0,1) # (H*W,B,C)
+        query_pos_emb = query_pos_emb.transpose(0,1) # (Q,B,C)
+
         if self.normalize_before:
-            return self.forward_pre(tgt, memory, memory_mask,
-                                    memory_key_padding_mask, pos, query_pos,
+            output, logits = self.forward_pre(tgt, memory, attn_mask,
+                                    memory_key_padding_mask, memory_pos_emb, query_pos_emb,
                                     return_attn_logits=return_attn_logits)
-        return self.forward_post(tgt, memory, memory_mask,
-                                 memory_key_padding_mask, pos, query_pos,
+        else:
+            output, logits = self.forward_post(tgt, memory, attn_mask,
+                                 memory_key_padding_mask, memory_pos_emb, query_pos_emb,
                                  return_attn_logits=return_attn_logits)
+    
+        return output.transpose(0,1), logits # (Q,B,C)
 
 
 class FFNLayer(nn.Module):
@@ -558,7 +582,7 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
                 pos=pos[level_index], query_pos=query_embed
             )
 
-            output = self.transformer_self_attention_layers[i](
+            output, _ = self.transformer_self_attention_layers[i](
                 output, tgt_mask=None,
                 tgt_key_padding_mask=None,
                 query_pos=query_embed

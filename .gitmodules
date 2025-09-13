@@ -1,0 +1,3 @@
+[submodule "fcclip/modeling/transformer_decoder/pos_mlp_bias"]
+	path = fcclip/modeling/transformer_decoder/pos_mlp_bias
+	url = git@github.com:AndyBarcia/pos_mlp_bias.git
