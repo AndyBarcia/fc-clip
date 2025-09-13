@@ -163,6 +163,15 @@ class SetCriterion(nn.Module):
         src_masks = src_masks[:, None]
         target_masks = target_masks[:, None]
 
+        # If no masks, finish now. Otherwise we get weird errors. Remember to
+        # use loss_mask.sum() * 0.0 to avoid angering the DDP gods.
+        if src_masks.shape[0] == 0:
+            losses = {
+                "loss_mask": outputs["pred_masks"].sum() * 0.0,
+                "loss_dice": outputs["pred_masks"].sum() * 0.0,
+            }
+            return losses
+
         with torch.no_grad():
             # sample point_coords
             point_coords = get_uncertain_point_coords_with_randomness(
