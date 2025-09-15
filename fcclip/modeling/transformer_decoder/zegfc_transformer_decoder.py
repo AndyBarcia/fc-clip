@@ -36,7 +36,8 @@ from .box_regression import (
 )
 from .pos_mlp_bias.functions import (
     PosMLPAttention,
-    PosMLPSelfAttention
+    PosMLPSelfAttention,
+    PosMLP
 )
 
 
@@ -215,6 +216,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         box_reg_type: str = "none",
         cross_attn_type: str = "standard",
         self_attn_type: str = "standard",
+        mask_pos_mlp_type: str = "none",
         enforce_input_project: bool,
         attn_conv_kernel_size: Optional[int] = 3,
         text_attn: bool,
@@ -406,6 +408,12 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                     kernel_size=self.attn_conv_kernel_size, groups=1, padding="same", bias=False
                 )
             )
+        
+        self.mask_pos_mlp_type = mask_pos_mlp_type
+        if self.mask_pos_mlp_type != "none":
+            self.mask_pos_mlp = PosMLP(hidden_dim, 16, batched=("brpb" in self.mask_pos_mlp_type))
+        else:
+            self.mask_pos_mlp = None
 
     @classmethod
     def from_config(cls, cfg, in_channels, mask_classification):
@@ -440,6 +448,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         ret["box_reg_type"] = cfg.MODEL.ZEG_FC.BOX_REGRESSION_TYPE
         ret["cross_attn_type"] = cfg.MODEL.ZEG_FC.CROSS_ATTN_TYPE
         ret["self_attn_type"] = cfg.MODEL.ZEG_FC.SELF_ATTN_TYPE
+        ret["mask_pos_mlp_type"] = cfg.MODEL.ZEG_FC.MASK_POS_MLP_TYPE
         return ret
 
     def forward(self, x, mask_features, mask = None, text_classifier=None, num_templates=None):
@@ -630,6 +639,14 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             query_bbox_unsigmoid_detached = query_bbox_unsigmoid_detached.transpose(0,1)
         else:
             outputs_bbox, query_bbox_unsigmoid_detached = None, None
+
+        # Apply pos mlp bias
+        if self.mask_pos_mlp is not None:            
+            outputs_mask = outputs_mask + self.mask_pos_mlp(
+                outputs_bbox,
+                outputs_mask.shape[-2:],
+                decoder_output
+            )
 
         # fcclip head
         maskpool_embeddings = self.mask_pooling(x=mask_features, mask=outputs_mask) # [B, Q, C]
