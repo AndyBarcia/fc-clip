@@ -327,7 +327,7 @@ class Trainer(DefaultTrainer):
                 ), "CityscapesEvaluator currently do not work with multiple machines."
                 evaluator_list.append(CityscapesInstanceEvaluator(dataset_name))
         # ADE20K
-        if evaluator_type == "ade20k_panoptic_seg" and cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON:
+        if evaluator_type in ["ade20k_panoptic_seg", "zs_ade20k_panoptic_seg"] and cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON:
             evaluator_list.append(InstanceSegEvaluator(dataset_name, output_dir=output_folder))
         # LVIS
         if evaluator_type == "lvis":

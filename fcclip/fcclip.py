@@ -22,7 +22,7 @@ from detectron2.utils.memory import retry_if_cuda_oom
 
 from .modeling.criterion import SetCriterion
 from .modeling.matcher import HungarianMatcher
-from .modeling.transformer_decoder.box_regression import box_xyxy_to_cxcywh
+from .modeling.transformer_decoder.box_regression import box_xyxy_to_cxcywh, box_cxcywh_to_xyxy
 
 from .modeling.transformer_decoder.fcclip_transformer_decoder import MaskPooling, get_classification_logits
 VILD_PROMPT = [
@@ -360,6 +360,7 @@ class FCCLIP(nn.Module):
         else:
             mask_cls_results = outputs["pred_logits"]
             mask_pred_results = outputs["pred_masks"]
+            mask_box_results = outputs.get("pred_boxes")
 
             # We ensemble the pred logits of in-vocab and out-vocab
             clip_feature = features["clip_vis_dense"]
@@ -422,9 +423,13 @@ class FCCLIP(nn.Module):
 
             del outputs
 
+            # Prepare an iterator for boxes, which could be None
+            if mask_box_results is None:
+                mask_box_results = [None] * len(batched_inputs)
+
             processed_results = []
-            for mask_cls_result, mask_pred_result, input_per_image, image_size in zip(
-                mask_cls_results, mask_pred_results, batched_inputs, images.image_sizes
+            for mask_cls_result, mask_pred_result, mask_box_result, input_per_image, image_size in zip(
+                mask_cls_results, mask_pred_results, mask_box_results, batched_inputs, images.image_sizes
             ):
                 height = input_per_image.get("height", image_size[0])
                 width = input_per_image.get("width", image_size[1])
@@ -450,7 +455,7 @@ class FCCLIP(nn.Module):
                 
                 # instance segmentation inference
                 if self.instance_on:
-                    instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result)
+                    instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, mask_box_result)
                     processed_results[-1]["instances"] = instance_r
 
             return processed_results
@@ -538,7 +543,7 @@ class FCCLIP(nn.Module):
 
             return panoptic_seg, segments_info
 
-    def instance_inference(self, mask_cls, mask_pred):
+    def instance_inference(self, mask_cls, mask_pred, mask_box):
         # mask_pred is already processed to have the same shape as original input
         image_size = mask_pred.shape[-2:]
 
@@ -571,9 +576,25 @@ class FCCLIP(nn.Module):
         result = Instances(image_size)
         # mask (before sigmoid)
         result.pred_masks = (mask_pred > 0).float()
-        result.pred_boxes = Boxes(torch.zeros(mask_pred.size(0), 4))
-        # Uncomment the following to get boxes from masks (this is slow)
-        # result.pred_boxes = BitMasks(mask_pred > 0).get_bounding_boxes()
+        
+        if mask_box is not None:
+            # Select the boxes corresponding to the top-k queries
+            pred_boxes = mask_box[topk_indices]
+            if self.panoptic_on:
+                # Filter boxes for "thing" classes if necessary
+                pred_boxes = pred_boxes[keep]
+            
+            # pred_boxes are in normalized cxcywh format, convert to unnormalized xyxy
+            boxes = box_cxcywh_to_xyxy(pred_boxes)
+            # and un-normalize
+            h, w = image_size
+            scale_fct = torch.tensor([w, h, w, h], device=boxes.device)
+            result.pred_boxes = Boxes(boxes * scale_fct)
+        else:
+            # Fallback if boxes are not provided
+            #result.pred_boxes = Boxes(torch.zeros(mask_pred.size(0), 4))
+            # Uncomment the following to get boxes from masks (this is slow)
+            result.pred_boxes = BitMasks(mask_pred > 0).get_bounding_boxes()
 
         # calculate average mask prob
         mask_scores_per_image = (mask_pred.sigmoid().flatten(1) * result.pred_masks.flatten(1)).sum(1) / (result.pred_masks.flatten(1).sum(1) + 1e-6)
