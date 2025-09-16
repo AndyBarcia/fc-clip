@@ -8,6 +8,7 @@ import math
 import numpy as np
 import urllib
 from io import BytesIO
+from urllib.parse import urlparse
 from functools import partial
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union, Callable
 
@@ -1419,9 +1420,12 @@ class DINOv3(Backbone):
             dropout_prob=0.0,
         )
 
-        with urllib.request.urlopen(tokenizer_path) as response:
-            file_buf = BytesIO(response.read())
-            self.text_tokenizer = Tokenizer(vocab_path=file_buf)
+        if urlparse(tokenizer_path).scheme in ('http', 'https'):
+            with urllib.request.urlopen(tokenizer_path) as response:
+                file_buf = BytesIO(response.read())
+                self.text_tokenizer = Tokenizer(vocab_path=file_buf)
+        else:
+            self.text_tokenizer = Tokenizer(vocab_path=tokenizer_path)
 
         self.text_model = TextTower(
             backbone=text_backbone,
@@ -1480,13 +1484,19 @@ class DINOv3(Backbone):
 
         # Load visual backbone weights
         # cls_token, storage_tokens, mask_token, patch_embed.*, rope_embed.*, blocks.*, norm.*
-        backbone_state = torch.hub.load_state_dict_from_url(backbone_path, map_location="cpu") 
+        if urlparse(backbone_path).scheme in ('http', 'https'):
+            backbone_state = torch.hub.load_state_dict_from_url(backbone_path, map_location="cpu") 
+        else:
+            backbone_state = torch.load(backbone_path, map_location="cpu")
         self.visual_model.backbone.load_state_dict(backbone_state, strict=True)
 
         # Load adapter weights which include the visual head and the entire text model
         # We use strict=False because adapter_state does not contain the visual backbone weights
         # visual_model.head.*, text_model.backbone.*, text_model.head.*, logit_scale
-        adapter_state = torch.hub.load_state_dict_from_url(adapter_path, map_location="cpu") 
+        if urlparse(adapter_path).scheme in ('http', 'https'):
+            adapter_state = torch.hub.load_state_dict_from_url(adapter_path, map_location="cpu")
+        else:
+            adapter_state = torch.load(adapter_path, map_location="cpu")
         self.load_state_dict(adapter_state, strict=False)
 
         self._out_feature_strides = {
@@ -1512,6 +1522,7 @@ class DINOv3(Backbone):
             param.requires_grad = False
         for param in self.visual_model.parameters():
             param.requires_grad = False
+        self.logit_scale.requires_grad = False
     
     def encode_text(self, text: torch.Tensor, normalize: bool = False) -> torch.Tensor:
         features = self.text_model(text)
