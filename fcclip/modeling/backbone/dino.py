@@ -1399,6 +1399,8 @@ class Tokenizer(SimpleTokenizer):
 class DINOv3(Backbone):
     def __init__(self, cfg, input_shape):
         super().__init__()
+        self.model_name = "dinov3"
+
         # Path of text_model and visual head
         adapter_path = cfg.MODEL.FC_CLIP.DINOV3_ADAPTER_PATH
         # Path of visual backbone

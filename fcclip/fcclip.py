@@ -371,6 +371,17 @@ class FCCLIP(nn.Module):
                 pooled_clip_feature = self.backbone.visual_prediction_forward(pooled_clip_feature)
             elif "rn" in self.backbone.model_name.lower():
                 pooled_clip_feature = self.backbone.visual_prediction_forward(clip_feature, mask_for_pooling)
+            elif "dinov3" in self.backbone.model_name.lower():
+                # DINOv3's final embedding is a concatenation of the processed [CLS] token
+                # and the mean-pooled processed patch tokens. Each part has half the dimension
+                # of the final embedding.
+                final_embed_dim = features["clip_embedding"].shape[-1]
+                part_dim = final_embed_dim // 2
+                class_token = features["clip_embedding"][:, :part_dim]
+                pooled_patch_tokens = self.mask_pooling(clip_feature, mask_for_pooling)
+                num_queries = pooled_patch_tokens.shape[1]
+                class_token_expanded = class_token.unsqueeze(1).expand(-1, num_queries, -1)                
+                pooled_clip_feature = torch.cat([class_token_expanded, pooled_patch_tokens], dim=-1)
             else:
                 raise NotImplementedError
 
