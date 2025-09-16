@@ -107,6 +107,7 @@ def add_maskformer2_config(cfg):
 
     # MSDeformAttn encoder configs
     cfg.MODEL.SEM_SEG_HEAD.DEFORMABLE_TRANSFORMER_ENCODER_IN_FEATURES = ["res3", "res4", "res5"]
+    cfg.MODEL.SEM_SEG_HEAD.DEFORMABLE_TRANSFORMER_ENCODER_OUT_FEATURES = 3
     cfg.MODEL.SEM_SEG_HEAD.DEFORMABLE_TRANSFORMER_ENCODER_N_POINTS = 4
     cfg.MODEL.SEM_SEG_HEAD.DEFORMABLE_TRANSFORMER_ENCODER_N_HEADS = 8
 
@@ -138,6 +139,11 @@ def add_fcclip_config(cfg):
     cfg.MODEL.FC_CLIP.GEOMETRIC_ENSEMBLE_ALPHA = 0.4
     cfg.MODEL.FC_CLIP.GEOMETRIC_ENSEMBLE_BETA = 0.8
     cfg.MODEL.FC_CLIP.ENSEMBLE_ON_VALID_MASK = False
+    # DINOv3 backbone config. Note that access to the DINOv3 weights
+    # is forbidden without the appropiate policy key in the url. 
+    cfg.MODEL.FC_CLIP.DINOV3_TOKENIZER_PATH = "https://dl.fbaipublicfiles.com/dinov3/thirdparty/bpe_simple_vocab_16e6.txt.gz"
+    cfg.MODEL.FC_CLIP.DINOV3_BACKBONE_PATH = "https://dinov3.llamameta.net/dinov3_vitl16/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
+    cfg.MODEL.FC_CLIP.DINOV3_ADAPTER_PATH = "https://dinov3.llamameta.net/dinov3_vitl16/dinov3_vitl16_dinotxt_vision_head_and_text_encoder-a442d8f5.pth"
 
 
 def add_zegfc_config(cfg):

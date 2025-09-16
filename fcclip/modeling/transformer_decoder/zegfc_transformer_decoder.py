@@ -222,7 +222,8 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         text_attn: bool,
         text_atnn_cls: bool,
         mem_attn_mask: bool,
-        clip_embedding_dim: int
+        clip_embedding_dim: int,
+        num_transformer_out_features: int,
     ):
         """
         NOTE: this interface is experimental.
@@ -343,7 +344,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         self.query_bbox = nn.Embedding(num_queries, 4) if self._bbox_embed != None else None
 
         # level embedding (we always use 3 scales)
-        self.num_feature_levels = 3
+        self.num_feature_levels = num_transformer_out_features
         self.level_embed = nn.Embedding(self.num_feature_levels, hidden_dim)
         self.input_proj = nn.ModuleList()
         for _ in range(self.num_feature_levels):
@@ -449,6 +450,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         ret["cross_attn_type"] = cfg.MODEL.ZEG_FC.CROSS_ATTN_TYPE
         ret["self_attn_type"] = cfg.MODEL.ZEG_FC.SELF_ATTN_TYPE
         ret["mask_pos_mlp_type"] = cfg.MODEL.ZEG_FC.MASK_POS_MLP_TYPE
+        ret["num_transformer_out_features"] = cfg.MODEL.SEM_SEG_HEAD.DEFORMABLE_TRANSFORMER_ENCODER_OUT_FEATURES
         return ret
 
     def forward(self, x, mask_features, mask = None, text_classifier=None, num_templates=None):

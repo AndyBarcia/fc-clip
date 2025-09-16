@@ -213,6 +213,7 @@ class MSDeformAttnPixelDecoder(nn.Module):
         norm: Optional[Union[str, Callable]] = None,
         # deformable transformer encoder args
         transformer_in_features: List[str],
+        num_transformer_out_feature: int,
         common_stride: int,
     ):
         """
@@ -237,7 +238,7 @@ class MSDeformAttnPixelDecoder(nn.Module):
         self.in_features = [k for k, v in input_shape]  # starting from "res2" to "res5"
         self.feature_strides = [v.stride for k, v in input_shape]
         self.feature_channels = [v.channels for k, v in input_shape]
-        
+
         # this is the input shape of transformer encoder (could use less features than pixel decoder
         transformer_input_shape = sorted(transformer_input_shape.items(), key=lambda x: x[1].stride)
         self.transformer_in_features = [k for k, v in transformer_input_shape]  # starting from "res2" to "res5"
@@ -265,19 +266,8 @@ class MSDeformAttnPixelDecoder(nn.Module):
             nn.init.xavier_uniform_(proj[0].weight, gain=1)
             nn.init.constant_(proj[0].bias, 0)
 
-        self.transformer = MSDeformAttnTransformerEncoderOnly(
-            d_model=conv_dim,
-            dropout=transformer_dropout,
-            nhead=transformer_nheads,
-            dim_feedforward=transformer_dim_feedforward,
-            num_encoder_layers=transformer_enc_layers,
-            num_feature_levels=self.transformer_num_feature_levels,
-        )
-        N_steps = conv_dim // 2
-        self.pe_layer = PositionEmbeddingSine(N_steps, normalize=True)
-
-        self.mask_dim = mask_dim
         # use 1x1 conv instead
+        self.mask_dim = mask_dim
         self.mask_features = Conv2d(
             conv_dim,
             mask_dim,
@@ -286,8 +276,24 @@ class MSDeformAttnPixelDecoder(nn.Module):
             padding=0,
         )
         weight_init.c2_xavier_fill(self.mask_features)
+
+        # Create encoder transformer. Avoid creating it if not needed.
+        if transformer_enc_layers <= 0:
+            self.transformer = None
+            self.pe_layer = None
+        else:
+            self.transformer = MSDeformAttnTransformerEncoderOnly(
+                d_model=conv_dim,
+                dropout=transformer_dropout,
+                nhead=transformer_nheads,
+                dim_feedforward=transformer_dim_feedforward,
+                num_encoder_layers=transformer_enc_layers,
+                num_feature_levels=self.transformer_num_feature_levels,
+            )
+            N_steps = conv_dim // 2
+            self.pe_layer = PositionEmbeddingSine(N_steps, normalize=True)
         
-        self.maskformer_num_feature_levels = 3  # always use 3 scales
+        self.maskformer_num_feature_levels = num_transformer_out_feature
         self.common_stride = common_stride
 
         # extra fpn levels
@@ -340,11 +346,10 @@ class MSDeformAttnPixelDecoder(nn.Module):
         ret["transformer_nheads"] = cfg.MODEL.MASK_FORMER.NHEADS
         # ret["transformer_dim_feedforward"] = cfg.MODEL.MASK_FORMER.DIM_FEEDFORWARD
         ret["transformer_dim_feedforward"] = 1024  # use 1024 for deformable transformer encoder
-        ret[
-            "transformer_enc_layers"
-        ] = cfg.MODEL.SEM_SEG_HEAD.TRANSFORMER_ENC_LAYERS  # a separate config
+        ret["transformer_enc_layers"] = cfg.MODEL.SEM_SEG_HEAD.TRANSFORMER_ENC_LAYERS  # a separate config
         ret["transformer_in_features"] = cfg.MODEL.SEM_SEG_HEAD.DEFORMABLE_TRANSFORMER_ENCODER_IN_FEATURES
         ret["common_stride"] = cfg.MODEL.SEM_SEG_HEAD.COMMON_STRIDE
+        ret["num_transformer_out_feature"] = cfg.MODEL.SEM_SEG_HEAD.DEFORMABLE_TRANSFORMER_ENCODER_OUT_FEATURES
         return ret
 
     @autocast(enabled=False)
@@ -355,24 +360,27 @@ class MSDeformAttnPixelDecoder(nn.Module):
         for idx, f in enumerate(self.transformer_in_features[::-1]):
             x = features[f].float()  # deformable detr does not support half precision
             srcs.append(self.input_proj[idx](x))
-            pos.append(self.pe_layer(x))
+            pos.append(self.pe_layer(x) if self.pe_layer is not None else None)
 
-        y, spatial_shapes, level_start_index = self.transformer(srcs, pos)
-        bs = y.shape[0]
-
-        split_size_or_sections = [None] * self.transformer_num_feature_levels
-        for i in range(self.transformer_num_feature_levels):
-            if i < self.transformer_num_feature_levels - 1:
-                split_size_or_sections[i] = level_start_index[i + 1] - level_start_index[i]
-            else:
-                split_size_or_sections[i] = y.shape[1] - level_start_index[i]
-        y = torch.split(y, split_size_or_sections, dim=1)
-
+        # Apply transformer encoder.
         out = []
-        multi_scale_features = []
-        num_cur_levels = 0
-        for i, z in enumerate(y):
-            out.append(z.transpose(1, 2).view(bs, -1, spatial_shapes[i][0], spatial_shapes[i][1]))
+        if self.transformer is not None:
+            y, spatial_shapes, level_start_index = self.transformer(srcs, pos)
+            bs = y.shape[0]
+
+            split_size_or_sections = [None] * self.transformer_num_feature_levels
+            for i in range(self.transformer_num_feature_levels):
+                if i < self.transformer_num_feature_levels - 1:
+                    split_size_or_sections[i] = level_start_index[i + 1] - level_start_index[i]
+                else:
+                    split_size_or_sections[i] = y.shape[1] - level_start_index[i]
+            y = torch.split(y, split_size_or_sections, dim=1)
+
+            for i, z in enumerate(y):
+                out.append(z.transpose(1, 2).view(bs, -1, spatial_shapes[i][0], spatial_shapes[i][1]))
+        else:
+            # If no transformer encoder is used, the projected features are passed directly.
+            out = srcs # (B,C,H,W)
 
         # append `out` with extra FPN levels
         # Reverse feature maps into top-down order (from low to high resolution)
@@ -386,6 +394,8 @@ class MSDeformAttnPixelDecoder(nn.Module):
             y = output_conv(y)
             out.append(y)
 
+        multi_scale_features = []
+        num_cur_levels = 0
         for o in out:
             if num_cur_levels < self.maskformer_num_feature_levels:
                 multi_scale_features.append(o)
