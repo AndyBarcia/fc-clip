@@ -215,7 +215,7 @@ class BboxMaskInitialization(nn.Module):
         self.fast_bbox = fast_bbox
         self.threshold = threshold
 
-    def forward(self, masks, x=None, reference_points=None, normalized_space=True):
+    def forward(self, x=None, reference_points=None, masks=None, normalized_space=True):
         """
         Args:
             masks: Masks associated with the queries
@@ -255,8 +255,8 @@ class BboxMaskInitialization(nn.Module):
             outputs_unsigmoid = outputs
 
         # Step 5: Reshape
-        outputs = outputs.transpose(0, 1) # (Q, B, 4)
-        outputs_unsigmoid = outputs_unsigmoid.transpose(0, 1) # (Q, B, 4)
+        #outputs = outputs.transpose(0, 1) # (Q, B, 4)
+        #outputs_unsigmoid = outputs_unsigmoid.transpose(0, 1) # (Q, B, 4)
 
         return outputs, outputs_unsigmoid
 
@@ -292,7 +292,7 @@ class BboxMaskSTN(nn.Module):
             nn.Linear(64, 4)
         )
 
-    def forward(self, masks, x=None, reference_points=None, normalized_space=True):
+    def forward(self, x=None, reference_points=None, masks=None, normalized_space=True):
         """
         Args:
             masks: Masks associated with the queries
