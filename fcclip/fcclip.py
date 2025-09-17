@@ -385,7 +385,7 @@ class FCCLIP(nn.Module):
             else:
                 raise NotImplementedError
 
-            out_vocab_cls_results = get_classification_logits(pooled_clip_feature, text_classifier, self.backbone.clip_model.logit_scale, num_templates)
+            out_vocab_cls_results = get_classification_logits(pooled_clip_feature, text_classifier, self.backbone.logit_scale, num_templates)
             in_vocab_cls_results = mask_cls_results[..., :-1] # remove void
             out_vocab_cls_results = out_vocab_cls_results[..., :-1] # remove void
 

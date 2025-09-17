@@ -228,6 +228,10 @@ class CLIP(Backbone):
             return self.extract_features(x)
     
     @property
+    def logit_scale(self):
+        return self.clip_model.logit_scale
+
+    @property
     def dim_latent(self):
         return self.clip_model.text_projection.shape[-1]
     
