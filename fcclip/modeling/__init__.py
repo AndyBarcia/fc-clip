@@ -16,4 +16,5 @@ limitations under the License.
 from .backbone.clip import CLIP
 from .backbone.dino import DINOv3
 from .pixel_decoder.msdeformattn import MSDeformAttnPixelDecoder
+from .pixel_decoder.single_feature_decoder import SingleFeaturePixelDecoder
 from .meta_arch.fcclip_head import FCCLIPHead

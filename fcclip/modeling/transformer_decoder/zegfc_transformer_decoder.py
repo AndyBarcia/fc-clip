@@ -37,7 +37,8 @@ from .box_regression import (
 from .pos_mlp_bias.functions import (
     PosMLPAttention,
     PosMLPSelfAttention,
-    PosMLP
+    PosMLP,
+    PosGaussianAttention
 )
 
 
@@ -308,6 +309,12 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                     hidden_dim=16,
                     n_heads=nheads,
                     batched_rpb=(self.cross_attn_type == "pos_mlp_brpb"),
+                    dropout=0.0,
+                    normalize_before=pre_norm
+                ) if "rpb" in self.cross_attn_type else
+                PosGaussianAttention(
+                    dim=hidden_dim,
+                    n_heads=nheads,
                     dropout=0.0,
                     normalize_before=pre_norm
                 )
