@@ -311,12 +311,16 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                     batched_rpb=(self.cross_attn_type == "pos_mlp_brpb"),
                     dropout=0.0,
                     normalize_before=pre_norm
-                ) if "rpb" in self.cross_attn_type else
+                ) 
+                if "rpb" in self.cross_attn_type else
                 PosGaussianAttention(
                     dim=hidden_dim,
                     n_heads=nheads,
                     dropout=0.0,
-                    normalize_before=pre_norm
+                    normalize_before=pre_norm,
+                    learned_scale=("learned_scale" in self.cross_attn_type),
+                    normalize=("normalize" in self.cross_attn_type),
+                    only_gaussian_logits=("only_gaussian_logits" in self.cross_attn_type),
                 )
             )
 
