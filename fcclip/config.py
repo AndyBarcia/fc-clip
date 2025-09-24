@@ -38,6 +38,7 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.DEEP_SUPERVISION = True
     cfg.MODEL.MASK_FORMER.NO_OBJECT_WEIGHT = 0.1
     cfg.MODEL.MASK_FORMER.CLASS_WEIGHT = 1.0
+    cfg.MODEL.MASK_FORMER.CLASS_FOCAL_WEIGHT = 1.0
     cfg.MODEL.MASK_FORMER.DICE_WEIGHT = 1.0
     cfg.MODEL.MASK_FORMER.MASK_WEIGHT = 20.0
     cfg.MODEL.MASK_FORMER.BBOX_WEIGHT = 1.0
@@ -139,6 +140,9 @@ def add_fcclip_config(cfg):
     cfg.MODEL.FC_CLIP.GEOMETRIC_ENSEMBLE_ALPHA = 0.4
     cfg.MODEL.FC_CLIP.GEOMETRIC_ENSEMBLE_BETA = 0.8
     cfg.MODEL.FC_CLIP.ENSEMBLE_ON_VALID_MASK = False
+    cfg.MODEL.FC_CLIP.USE_NEL_COST = False
+    cfg.MODEL.FC_CLIP.FOCAL_ALPHA = 0.8
+    cfg.MODEL.FC_CLIP.FOCAL_GAMMA = 2.0
     # DINOv3 backbone config. Note that access to the DINOv3 weights
     # is forbidden without the appropiate policy key in the url. 
     cfg.MODEL.FC_CLIP.DINOV3_TOKENIZER_PATH = "https://dl.fbaipublicfiles.com/dinov3/thirdparty/bpe_simple_vocab_16e6.txt.gz"

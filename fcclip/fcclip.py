@@ -70,6 +70,7 @@ class FCCLIP(nn.Module):
         panoptic_on: bool,
         instance_on: bool,
         test_topk_per_image: int,
+        use_sigomid: bool,
         # FC-CLIP
         geometric_ensemble_alpha: float,
         geometric_ensemble_beta: float,
@@ -121,6 +122,7 @@ class FCCLIP(nn.Module):
         self.instance_on = instance_on
         self.panoptic_on = panoptic_on
         self.test_topk_per_image = test_topk_per_image
+        self.use_sigomid = use_sigomid
 
         if not self.semantic_on:
             assert self.sem_seg_postprocess_before_inference
@@ -229,6 +231,7 @@ class FCCLIP(nn.Module):
 
         # loss weights
         class_weight = cfg.MODEL.MASK_FORMER.CLASS_WEIGHT
+        class_focal_weight = cfg.MODEL.MASK_FORMER.CLASS_FOCAL_WEIGHT
         dice_weight = cfg.MODEL.MASK_FORMER.DICE_WEIGHT
         mask_weight = cfg.MODEL.MASK_FORMER.MASK_WEIGHT
         bbox_weight = cfg.MODEL.MASK_FORMER.BBOX_WEIGHT
@@ -240,10 +243,14 @@ class FCCLIP(nn.Module):
             cost_mask=mask_weight,
             cost_dice=dice_weight,
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
+            use_nel_cost=cfg.MODEL.FC_CLIP.USE_NEL_COST,
+            focal_alpha=cfg.MODEL.FC_CLIP.FOCAL_ALPHA,
+            focal_gamma=cfg.MODEL.FC_CLIP.FOCAL_GAMMA
         )
 
         weight_dict = {
             "loss_ce": class_weight, 
+            "loss_label_focal": class_focal_weight,
             "loss_mask": mask_weight, 
             "loss_dice": dice_weight,
             "loss_bbox": bbox_weight,
@@ -268,6 +275,9 @@ class FCCLIP(nn.Module):
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
             oversample_ratio=cfg.MODEL.MASK_FORMER.OVERSAMPLE_RATIO,
             importance_sample_ratio=cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO,
+            use_nel_loss=cfg.MODEL.FC_CLIP.USE_NEL_COST,
+            focal_alpha=cfg.MODEL.FC_CLIP.FOCAL_ALPHA,
+            focal_gamma=cfg.MODEL.FC_CLIP.FOCAL_GAMMA
         )
 
         return {
@@ -294,7 +304,8 @@ class FCCLIP(nn.Module):
             "test_topk_per_image": cfg.TEST.DETECTIONS_PER_IMAGE,
             "geometric_ensemble_alpha": cfg.MODEL.FC_CLIP.GEOMETRIC_ENSEMBLE_ALPHA,
             "geometric_ensemble_beta": cfg.MODEL.FC_CLIP.GEOMETRIC_ENSEMBLE_BETA,
-            "ensemble_on_valid_mask": cfg.MODEL.FC_CLIP.ENSEMBLE_ON_VALID_MASK
+            "ensemble_on_valid_mask": cfg.MODEL.FC_CLIP.ENSEMBLE_ON_VALID_MASK,
+            "use_sigomid": cfg.MODEL.FC_CLIP.USE_NEL_COST,
         }
 
     @property
@@ -497,7 +508,11 @@ class FCCLIP(nn.Module):
         return semseg
 
     def panoptic_inference(self, mask_cls, mask_pred):
-        scores, labels = F.softmax(mask_cls, dim=-1).max(-1)
+        if self.self.use_sigomid:
+            scores, labels = F.sigmoid(mask_cls).max(-1)
+        else:
+            scores, labels = F.softmax(mask_cls, dim=-1).max(-1)
+
         mask_pred = mask_pred.sigmoid()
         num_classes = len(self.test_metadata.stuff_classes)
         keep = labels.ne(num_classes) & (scores > self.object_mask_threshold)

@@ -79,7 +79,16 @@ class HungarianMatcher(nn.Module):
     while the others are un-matched (and thus treated as non-objects).
     """
 
-    def __init__(self, cost_class: float = 1, cost_mask: float = 1, cost_dice: float = 1, num_points: int = 0):
+    def __init__(
+        self, 
+        cost_class: float = 1, 
+        cost_mask: float = 1, 
+        cost_dice: float = 1, 
+        num_points: int = 0,
+        use_nel_cost: bool = False,
+        focal_alpha: float = 0.25,
+        focal_gamma: float = 2.0
+    ):
         """Creates the matcher
 
         Params:
@@ -91,6 +100,9 @@ class HungarianMatcher(nn.Module):
         self.cost_class = cost_class
         self.cost_mask = cost_mask
         self.cost_dice = cost_dice
+        self.use_nel_cost = use_nel_cost
+        self.focal_alpha = focal_alpha
+        self.focal_gamma = focal_gamma
 
         assert cost_class != 0 or cost_mask != 0 or cost_dice != 0, "all costs cant be 0"
 
@@ -105,13 +117,22 @@ class HungarianMatcher(nn.Module):
 
         # Iterate through batch size
         for b in range(bs):
-
-            out_prob = outputs["pred_logits"][b].softmax(-1)  # [num_queries, num_classes]
+            
+            if self.use_nel_cost:
+                out_prob = outputs["pred_logits"][b].sigmoid()  # [num_queries, num_classes]
+            else:
+                out_prob = outputs["pred_logits"][b].softmax(-1)  # [num_queries, num_classes]
             tgt_ids = targets[b]["labels"]
 
             if tgt_ids.numel() > 0:                
                 # Compute the classification cost.
-                cost_class = -out_prob[:, tgt_ids]
+                if self.use_nel_cost:
+                    # focal loss
+                    neg_cost_class = (1 - self.focal_alpha) * (out_prob ** self.focal_gamma) * (-(1 - out_prob + 1e-8).log())
+                    pos_cost_class = self.focal_alpha * ((1 - out_prob) ** self.focal_gamma) * (-(out_prob + 1e-8).log())
+                    cost_class = pos_cost_class[:, tgt_ids] - neg_cost_class[:, tgt_ids]
+                else:
+                    cost_class = -out_prob[:, tgt_ids]
 
                 out_mask = outputs["pred_masks"][b]  # [num_queries, H_pred, W_pred]
                 tgt_mask = targets[b]["masks"].to(out_mask)

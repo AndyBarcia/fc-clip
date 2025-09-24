@@ -75,6 +75,40 @@ sigmoid_ce_loss_jit = torch.jit.script(
 )  # type: torch.jit.ScriptModule
 
 
+def sigmoid_focal_loss(inputs, targets, num_masks, alpha: float = 0.25, gamma: float = 2):
+    """
+    Loss used in RetinaNet for dense detection: https://arxiv.org/abs/1708.02002.
+    Args:
+        inputs: A float tensor of arbitrary shape.
+                The predictions for each example.
+        targets: A float tensor with the same shape as inputs. Stores the binary
+                 classification label for each element in inputs
+                (0 for the negative class and 1 for the positive class).
+        alpha: (optional) Weighting factor in range (0,1) to balance
+                positive vs negative examples. Default = -1 (no weighting).
+        gamma: Exponent of the modulating factor (1 - p_t) to
+               balance easy vs hard examples.
+    Returns:
+        Loss tensor
+    """
+    prob = inputs.sigmoid()
+    ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+    p_t = prob * targets + (1 - prob) * (1 - targets)
+    loss = ce_loss * ((1 - p_t) ** gamma)
+
+    if alpha >= 0:
+        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+        loss = alpha_t * loss
+
+
+    return loss.mean(1).sum() / num_masks
+
+
+sigmoid_focal_loss_jit = torch.jit.script(
+    sigmoid_focal_loss
+)  # type: torch.jit.ScriptModule
+
+
 def calculate_uncertainty(logits):
     """
     We estimate uncerainty as L1 distance between 0.0 and the logit prediction in 'logits' for the
@@ -99,8 +133,20 @@ class SetCriterion(nn.Module):
         2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
 
-    def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses,
-                 num_points, oversample_ratio, importance_sample_ratio):
+    def __init__(
+        self,
+        num_classes,
+        matcher,
+        weight_dict,
+        eos_coef,
+        losses,
+        num_points,
+        oversample_ratio,
+        importance_sample_ratio,
+        use_nel_loss: bool = False,
+        focal_alpha: float = 0.8,
+        focal_gamma: float = 2.0,
+    ):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -108,6 +154,8 @@ class SetCriterion(nn.Module):
             weight_dict: dict containing as key the names of the losses and as values their relative weight.
             eos_coef: relative classification weight applied to the no-object category
             losses: list of all the losses to be applied. See get_loss for list of available losses.
+            use_nel_loss: whether to use Non-mutually Exclusive Loss (NEL) instead of CE
+            nel_alpha / nel_beta / nel_gamma: weights and focal gamma for NEL
         """
         super().__init__()
         self.num_classes = num_classes
@@ -118,6 +166,11 @@ class SetCriterion(nn.Module):
         empty_weight = torch.ones(self.num_classes + 1)
         empty_weight[-1] = self.eos_coef
         self.register_buffer("empty_weight", empty_weight)
+
+        # NEL toggles / hyperparams
+        self.use_nel_loss = use_nel_loss
+        self.focal_gamma = focal_gamma
+        self.focal_alpha = focal_alpha
 
         # pointwise mask loss parameters
         self.num_points = num_points
@@ -138,8 +191,33 @@ class SetCriterion(nn.Module):
         )
         target_classes[idx] = target_classes_o
 
+        # TODO THIS IS AN ERROR. IT SHOULD BE SCALED BY NUM_MASKS. THIS GIVES DIFFERENT RESULTS
+        # IN A DISTRIBUTED SETTING. 
         loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
         losses = {"loss_ce": loss_ce}
+        return losses
+    
+    def loss_labels_nel(self, outputs, targets, indices, num_masks):
+        """Classification loss (Binary focal loss)
+        targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
+        """
+        assert 'pred_logits' in outputs
+        src_logits = outputs['pred_logits']
+
+        idx = self._get_src_permutation_idx(indices)
+        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+        target_classes = torch.full(src_logits.shape[:2], self.num_classes,
+                                    dtype=torch.int64, device=src_logits.device)
+        target_classes[idx] = target_classes_o
+
+        target_classes_onehot = torch.zeros([src_logits.shape[0], src_logits.shape[1], src_logits.shape[2]+1],
+                                            dtype=src_logits.dtype, layout=src_logits.layout, device=src_logits.device)
+        target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
+
+        target_classes_onehot = target_classes_onehot[:,:,:-1]
+        loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_masks, alpha=self.focal_alpha, gamma=self.focal_gamma) * src_logits.shape[1]
+        losses = {'loss_label_focal': loss_ce}
+
         return losses
     
     def loss_masks(self, outputs, targets, indices, num_masks):
@@ -240,7 +318,7 @@ class SetCriterion(nn.Module):
 
     def get_loss(self, loss, outputs, targets, indices, num_masks):
         loss_map = {
-            'labels': self.loss_labels,
+            'labels': self.loss_labels_nel if self.use_nel_loss else self.loss_labels,
             'masks': self.loss_masks,
             'boxes': self.loss_boxes
         }
