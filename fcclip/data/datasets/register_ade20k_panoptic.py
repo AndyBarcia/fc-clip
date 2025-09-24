@@ -137,7 +137,7 @@ _PREDEFINED_SPLITS_ADE20K_PANOPTIC = {
 }
 
 
-UNSEEN_ADE20K_CATEGORY_IDS =  [
+UNSEEN_ADE20K_IN_COCO_CATEGORY_IDS =  [
     # 93 Categories in ADE20K not present in COCO.
     13, # ground
     17, # plant
@@ -234,8 +234,65 @@ UNSEEN_ADE20K_CATEGORY_IDS =  [
     149, # flag
 ]
 
+UNSEEN_ADE20K_IN_LVIS_COCO_CATEGORY_IDS = [
+    13,  # ground
+    29,  # field
+    35,  # press
+    38,  # rail
+    42,  # pillar
+    51,  # covered stand
+    52,  # path
+    54,  # runway
+    55,  # vitrine
+    56,  # snooker table
+    59,  # staircase
+    68,  # hill
+    73,  # kitchen island
+    75,  # swivel chair
+    77,  # bar
+    78,  # arcade machine
+    79,  # shanty
+    84,  # tower
+    86,  # sunblind
+    87,  # street lamp
+    88,  # booth
+    90,  # plane
+    91,  # dirt track
+    92,  # clothes
+    93,  # pole
+    94,  # soil
+    95,  # handrail
+    96,  # moving stairway
+    97,  # hassock
+    101, # stage
+    105, # transporter
+    106, # canopy
+    109, # pool
+    111, # cask
+    112, # handbasket
+    113, # falls
+    117, # cradle
+    121, # stair
+    122, # storage tank
+    123, # trade name
+    126, # animal
+    128, # lake
+    133, # exhaust hood
+    134, # sconce
+    140, # pier
+    141, # crt screen
+    144, # bulletin board
+    145, # shower
+    147, # drinking glass
+]
 
-def get_metadata():
+def get_metadata(seen_dataset):
+    assert seen_dataset in ["coco", "lvis_coco"], "seen_dataset must be 'coco' or 'lvis_coco'"
+    if seen_dataset == "coco":
+        UNSEEN_ADE20K_CATEGORY_IDS = UNSEEN_ADE20K_IN_COCO_CATEGORY_IDS
+    elif seen_dataset == "lvis_coco":
+        UNSEEN_ADE20K_CATEGORY_IDS = UNSEEN_ADE20K_IN_LVIS_COCO_CATEGORY_IDS
+
     meta = {}
     # The following metadata maps contiguous id from [0, #thing categories +
     # #stuff categories) to their names and colors. We have to replica of the
@@ -327,22 +384,21 @@ def get_metadata():
 
 
 def register_all_ade20k_panoptic(root):
-    metadata = get_metadata()
     for (
         prefix,
         (image_root, panoptic_root, panoptic_json, semantic_root, instance_json),
     ) in _PREDEFINED_SPLITS_ADE20K_PANOPTIC.items():
-        # The "standard" version of COCO panoptic segmentation dataset,
-        # e.g. used by Panoptic-DeepLab
-        register_ade20k_panoptic(
-            prefix,
-            metadata,
-            os.path.join(root, image_root),
-            os.path.join(root, panoptic_root),
-            os.path.join(root, semantic_root),
-            os.path.join(root, panoptic_json),
-            os.path.join(root, instance_json),
-        )
+        for seen_dataset in ["coco", "lvis_coco"]:
+            metadata = get_metadata(seen_dataset)
+            register_ade20k_panoptic(
+                prefix+"_with_seen_"+seen_dataset,
+                metadata,
+                os.path.join(root, image_root),
+                os.path.join(root, panoptic_root),
+                os.path.join(root, semantic_root),
+                os.path.join(root, panoptic_json),
+                os.path.join(root, instance_json),
+            )
 
 def register_all_ade20k_semantic(root):
     root = os.path.join(root, "ADEChallengeData2016")

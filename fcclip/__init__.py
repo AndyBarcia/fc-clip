@@ -22,6 +22,7 @@ from .config import add_maskformer2_config, add_fcclip_config, add_zegfc_config
 # dataset loading
 from .data.dataset_mappers.coco_instance_new_baseline_dataset_mapper import COCOInstanceNewBaselineDatasetMapper
 from .data.dataset_mappers.coco_panoptic_new_baseline_dataset_mapper import COCOPanopticNewBaselineDatasetMapper
+from .data.dataset_mappers.lvis_panoptic_dataset_mapper import LVISPanopticDatasetMapper
 from .data.dataset_mappers.mask_former_instance_dataset_mapper import (
     MaskFormerInstanceDatasetMapper,
 )

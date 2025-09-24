@@ -21,8 +21,8 @@ MODEL:
     MEM_ATTN_MASK: False
   FC_CLIP:
     DINOV3_TOKENIZER_PATH: "https://dl.fbaipublicfiles.com/dinov3/thirdparty/bpe_simple_vocab_16e6.txt.gz"
-    DINOV3_BACKBONE_PATH: "https://dinov3.llamameta.net/dinov3_vitl16/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth?Policy=eyJTdGF0ZW1lbnQiOlt7InVuaXF1ZV9oYXNoIjoib2Nscndwa2JnbmNxMm1qejB1YXQ2eThzIiwiUmVzb3VyY2UiOiJodHRwczpcL1wvZGlub3YzLmxsYW1hbWV0YS5uZXRcLyoiLCJDb25kaXRpb24iOnsiRGF0ZUxlc3NUaGFuIjp7IkFXUzpFcG9jaFRpbWUiOjE3NTgxOTI2MzF9fX1dfQ__&Signature=VjjvIjoU7vhAfXU3NR-uxxbRyQ7ikhRLxYfNneZGpciEf9S61Q5j-aZavNKdoBH1dg36X-sxtQHKQBIKHnx1Hd6uxPTMdC4yghT9NaFDtnL8lgYbkrh160P25Vt2eyKTaXiJaS1pTMIh98coR3j5Dq4BIt9P52fWrwrNkzTAoeaQe8SFteuBeKgr2P7VrRscRvAVxTT6ARX-c4CG9LyvpJ9RX2ArFB82PI3WRRYU1M0VLJesBa1kDrv0irblGNQMP%7EO6EajYYoMyuww%7EE5rplK8EW6UaON43gUf7NkmNE8rHqpUhBH9gRVYCywA6BLeNi4Pe33QlCTmfdxQY16lvTg__&Key-Pair-Id=K15QRJLYKIFSLZ&Download-Request-ID=1514661533022617"
-    DINOV3_ADAPTER_PATH: "https://dinov3.llamameta.net/dinov3_vitl16/dinov3_vitl16_dinotxt_vision_head_and_text_encoder-a442d8f5.pth?Policy=eyJTdGF0ZW1lbnQiOlt7InVuaXF1ZV9oYXNoIjoib2Nscndwa2JnbmNxMm1qejB1YXQ2eThzIiwiUmVzb3VyY2UiOiJodHRwczpcL1wvZGlub3YzLmxsYW1hbWV0YS5uZXRcLyoiLCJDb25kaXRpb24iOnsiRGF0ZUxlc3NUaGFuIjp7IkFXUzpFcG9jaFRpbWUiOjE3NTgxOTI2MzF9fX1dfQ__&Signature=VjjvIjoU7vhAfXU3NR-uxxbRyQ7ikhRLxYfNneZGpciEf9S61Q5j-aZavNKdoBH1dg36X-sxtQHKQBIKHnx1Hd6uxPTMdC4yghT9NaFDtnL8lgYbkrh160P25Vt2eyKTaXiJaS1pTMIh98coR3j5Dq4BIt9P52fWrwrNkzTAoeaQe8SFteuBeKgr2P7VrRscRvAVxTT6ARX-c4CG9LyvpJ9RX2ArFB82PI3WRRYU1M0VLJesBa1kDrv0irblGNQMP%7EO6EajYYoMyuww%7EE5rplK8EW6UaON43gUf7NkmNE8rHqpUhBH9gRVYCywA6BLeNi4Pe33QlCTmfdxQY16lvTg__&Key-Pair-Id=K15QRJLYKIFSLZ&Download-Request-ID=1514661533022617"
+    DINOV3_BACKBONE_PATH: "models/dinov3_vitl16.pth"
+    DINOV3_ADAPTER_PATH: "models/dinov3_text_adapter.pth"
     EMBED_DIM: 2048
     GEOMETRIC_ENSEMBLE_ALPHA: 0.4
     GEOMETRIC_ENSEMBLE_BETA: 0.8
@@ -37,4 +37,4 @@ MODEL:
 
 DATASETS:
   TRAIN: ("openvocab_coco_2017_train_panoptic_with_sem_seg",)
-  TEST: ("openvocab_ade20k_panoptic_val",)
+  TEST: ("openvocab_ade20k_panoptic_val_with_seen_coco",)

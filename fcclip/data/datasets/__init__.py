@@ -17,6 +17,8 @@ limitations under the License.
 from . import (
     register_coco_panoptic_annos_semseg,
     register_ade20k_panoptic,
+    register_lvis_panoptic_annos,
+    register_lvis_coco_panoptic_annos,
     register_cityscapes_panoptic,
     register_mapillary_vistas_panoptic,
     register_ade20k_full,
