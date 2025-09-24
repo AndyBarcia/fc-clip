@@ -38,7 +38,8 @@ from .pos_mlp_bias.functions import (
     PosMLPAttention,
     PosMLPSelfAttention,
     PosMLP,
-    PosGaussianAttention
+    PosGaussianAttention,
+    PosPairGaussianAttention
 )
 
 
@@ -313,6 +314,17 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                     normalize_before=pre_norm
                 ) 
                 if "rpb" in self.cross_attn_type else
+                PosPairGaussianAttention(
+                    dim=hidden_dim,
+                    n_heads=nheads,
+                    dropout=0.0,
+                    normalize_before=pre_norm,
+                    learned_scale=("learned_scale" in self.cross_attn_type),
+                    normalize=("normalize" in self.cross_attn_type),
+                    only_gaussian_logits=("only_gaussian_logits" in self.cross_attn_type),
+                    forced_multiscale=("forced_multiscale" in self.cross_attn_type),
+                )
+                if "pair_gaussian" in self.cross_attn_type else
                 PosGaussianAttention(
                     dim=hidden_dim,
                     n_heads=nheads,
