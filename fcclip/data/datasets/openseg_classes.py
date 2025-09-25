@@ -2253,7 +2253,7 @@ LVIS_COCO_CATEGORIES = [
     {"color": [249, 146, 244], "id": 695, "isthing": 1, "name": "mitten"},
     {"color": [11, 177, 108], "id": 696, "isthing": 1, "name": "mixer_(kitchen_tool)"},
     {"color": [15, 194, 17], "id": 697, "isthing": 1, "name": "money"},
-    {"color": [36, 2, 243], "id": 698, "isthing": 1, "name": "monitor_(computer_equipment) computer_monitor"},
+    {"color": [36, 2, 243], "id": 698, "isthing": 1, "name": "monitor_(computer_equipment)"},
     {"color": [105, 233, 196], "id": 699, "isthing": 1, "name": "monkey"},
     {"color": [116, 235, 11], "id": 700, "isthing": 1, "name": "motor"},
     {"color": [79, 98, 196], "id": 701, "isthing": 1, "name": "motor_scooter"},

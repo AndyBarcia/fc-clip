@@ -159,7 +159,7 @@
 159:bubble gum
 160:bucket,pail
 161:horse buggy
-162:horned cow
+162:bull,horned cow
 163:bulldog
 164:bulldozer,dozer
 165:bullet train
@@ -695,7 +695,7 @@
 695:mitten
 696:mixer (kitchen tool),stand mixer
 697:money
-698:monitor (computer equipment) computer monitor
+698:monitor (computer equipment),computer monitor
 699:monkey
 700:motor
 701:motor scooter,scooter
