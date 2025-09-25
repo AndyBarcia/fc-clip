@@ -179,7 +179,7 @@ class HungarianMatcher(nn.Module):
                 C = torch.empty(num_queries, 0, device=out_prob.device)
             C = C.reshape(num_queries, -1).cpu()
             # Make sure the matrix contains no NaN values, or scipy fails 
-            C[C.isnan()] = 0.0
+            C = torch.nan_to_num(C, nan=0.0, posinf=1e+5, neginf=-1e+5)
 
             indices.append(linear_sum_assignment(C))
 
