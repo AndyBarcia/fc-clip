@@ -136,15 +136,29 @@ if __name__ == "__main__":
             if args.output:
                 if os.path.isdir(args.output):
                     assert os.path.isdir(args.output), args.output
-                    out_filename = os.path.join(args.output, os.path.basename(path))
+                    # Save each image in the dictionary to the output directory
+                    for key, image in visualized_output.items():
+                        base_name = os.path.splitext(os.path.basename(path))[0]
+                        out_filename = os.path.join(args.output, f"{base_name}_{key}.png")
+                        image.save(out_filename)
                 else:
                     assert len(args.input) == 1, "Please specify a directory with args.output"
-                    out_filename = args.output
-                visualized_output.save(out_filename)
+                    # Save each image with the output filename as base and key as suffix
+                    base_name = os.path.splitext(args.output)[0]
+                    ext = os.path.splitext(args.output)[1] or '.png'
+                    for key, image in visualized_output.items():
+                        out_filename = f"{base_name}_{key}{ext}"
+                        image.save(out_filename)
             else:
-                cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-                cv2.imshow(WINDOW_NAME, visualized_output.get_image()[:, :, ::-1])
+                # Display each image in the dictionary
+                for key, image in visualized_output.items():
+                    window_name = f"{WINDOW_NAME}_{key}"
+                    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+                    cv2.imshow(window_name, image.get_image()[:, :, ::-1])
+                
+                # Wait for key press to close all windows
                 if cv2.waitKey(0) == 27:
+                    cv2.destroyAllWindows()
                     break  # esc to quit
     elif args.webcam:
         assert args.input is None, "Cannot have both --input and --webcam!"
