@@ -508,7 +508,7 @@ class FCCLIP(nn.Module):
         return semseg
 
     def panoptic_inference(self, mask_cls, mask_pred):
-        if self.self.use_sigomid:
+        if self.use_sigomid:
             scores, labels = F.sigmoid(mask_cls).max(-1)
         else:
             scores, labels = F.softmax(mask_cls, dim=-1).max(-1)
