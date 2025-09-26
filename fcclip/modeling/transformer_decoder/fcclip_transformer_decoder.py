@@ -36,7 +36,7 @@ def build_transformer_decoder(cfg, in_channels, mask_classification=True):
     return TRANSFORMER_DECODER_REGISTRY.get(name)(cfg, in_channels, mask_classification)
 
 
-def get_classification_logits(x, text_classifier, logit_scale, num_templates=None, text_attn_logits=None):
+def get_classification_logits(x, text_classifier, logit_scale, logit_bias=None, num_templates=None, text_attn_logits=None):
     # x in shape of [B, *, C]
     # text_classifier: either [num_classes, C] or [B, num_classes, C]
     # text_attn_logits: optional [B, Q, num_classes]
@@ -67,6 +67,9 @@ def get_classification_logits(x, text_classifier, logit_scale, num_templates=Non
     else:
         raise ValueError(f"text_classifier must be 2D or 3D, got {text_classifier.dim()}D")
     
+    if logit_bias is not None:
+        pred_logits = pred_logits + logit_bias
+
     # Max ensembling over templates
     final_pred_logits = []
     cur_idx = 0

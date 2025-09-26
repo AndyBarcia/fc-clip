@@ -226,6 +226,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         mem_attn_mask: bool,
         clip_embedding_dim: int,
         num_transformer_out_features: int,
+        use_nel_loss: bool,
     ):
         """
         NOTE: this interface is experimental.
@@ -400,7 +401,12 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             weight_init.c2_xavier_fill(self.class_embed)
         else:
             raise ValueError(f"Unknown class_embed_type: {self.class_embed_type}")
+        
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        if use_nel_loss:
+            self.logit_bias = nn.Parameter(torch.ones([]) * -10.0) # Sig-LIP initialization
+        else:
+            self.logit_bias = None
 
         # ZEG-FC
         self.text_attn = text_attn
@@ -474,6 +480,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         ret["self_attn_type"] = cfg.MODEL.ZEG_FC.SELF_ATTN_TYPE
         ret["mask_pos_mlp_type"] = cfg.MODEL.ZEG_FC.MASK_POS_MLP_TYPE
         ret["num_transformer_out_features"] = cfg.MODEL.SEM_SEG_HEAD.DEFORMABLE_TRANSFORMER_ENCODER_OUT_FEATURES
+        ret["use_nel_loss"] = cfg.MODEL.FC_CLIP.USE_NEL_COST
         return ret
 
     def forward(self, x, mask_features, mask = None, text_classifier=None, num_templates=None):
@@ -677,7 +684,14 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         maskpool_embeddings = self.mask_pooling(x=mask_features, mask=outputs_mask) # [B, Q, C]
         maskpool_embeddings = self._mask_pooling_proj(maskpool_embeddings)
         class_embed = self.class_embed(maskpool_embeddings + decoder_output)
-        outputs_class = get_classification_logits(class_embed, text_classifier, self.logit_scale, num_templates, text_attn_logits)
+        outputs_class = get_classification_logits(
+            class_embed, 
+            text_classifier, 
+            self.logit_scale, 
+            self.logit_bias, 
+            num_templates, 
+            text_attn_logits
+        )
 
         # NOTE: prediction is of higher-resolution
         # [B, Q, H, W] -> [B, Q, H*W] -> [B, h, Q, H*W] -> [B*h, Q, HW]
