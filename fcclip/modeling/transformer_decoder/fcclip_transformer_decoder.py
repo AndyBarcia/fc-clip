@@ -8,7 +8,7 @@ Reference: https://github.com/facebookresearch/Mask2Former/blob/main/mask2former
 import math
 import logging
 import fvcore.nn.weight_init as weight_init
-from typing import Optional
+from typing import Optional, Tuple
 import numpy as np
 import torch
 from torch import nn, Tensor
@@ -325,6 +325,130 @@ class CrossAttentionLayer(nn.Module):
     
         return output.transpose(0,1), logits # (Q,B,C)
 
+class SlotCrossAttention(nn.Module):
+    def __init__(
+        self, 
+        d_model: int, 
+        n_heads: int, 
+        dropout: float = 0.1, 
+        normalize_before: bool = False
+    ):
+        super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model ({d_model}) debe ser divisible por nhead ({n_heads})")
+
+        self.d_model = d_model
+        self.nhead = n_heads
+        self.head_dim = d_model // n_heads
+        self.scale = self.head_dim ** -0.5
+        self.normalize_before = normalize_before
+
+        # Capas de proyección lineal para Q, K, V
+        self.to_q = nn.Linear(d_model, d_model, bias=False)
+        self.to_k = nn.Linear(d_model, d_model, bias=False)
+        self.to_v = nn.Linear(d_model, d_model, bias=False)
+
+        # Capa de salida
+        self.to_out = nn.Linear(d_model, d_model)
+
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def with_pos_embed(self, tensor: Tensor, pos: Optional[Tensor]) -> Tensor:
+        return tensor if pos is None else tensor + pos
+
+    def _slot_attention_forward(
+        self, 
+        q_input: Tensor, 
+        k_input: Tensor, 
+        v_input: Tensor,
+        attn_mask: Optional[Tensor] = None,
+        key_padding_mask: Optional[Tensor] = None
+    ) -> Tuple[Tensor, Tensor]:
+        B, Q, C = q_input.shape
+        _B, K, _C = k_input.shape
+
+        q = self.to_q(q_input).view(B, Q, self.nhead, self.head_dim).transpose(1, 2) # (B, H, Q, D)
+        k = self.to_k(k_input).view(B, K, self.nhead, self.head_dim).transpose(1, 2) # (B, H, K, D)
+        v = self.to_v(v_input).view(B, K, self.nhead, self.head_dim).transpose(1, 2) # (B, H, K, D)
+
+        dots = torch.einsum('bhid,bhjd->bhij', q, k) * self.scale # (B, H, Q, K)
+
+        # Aplicar máscaras antes del softmax
+        if attn_mask is not None:
+            # attn_mask (B, H, Q, K) es binaria. True significa enmascarar.
+            # Rellenamos con -inf donde la máscara es True.
+            dots = dots.masked_fill(attn_mask, float('-inf')) # <-- CAMBIO CLAVE
+
+        if key_padding_mask is not None:
+            # key_padding_mask (B, K) es binaria. True significa enmascarar.
+            mask = key_padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, K)
+            dots = dots.masked_fill(mask, float('-inf'))
+
+        attn = dots.softmax(dim=2)
+        attn = attn / (attn.sum(dim=-1, keepdim=True) + 1e-8)
+
+        updates = torch.einsum('bhij,bhjd->bhid', attn, v)
+        updates = updates.transpose(1, 2).contiguous().view(B, Q, C)
+        output = self.to_out(updates)
+        
+        return output, attn
+
+    def forward_post(self, tgt, memory, attn_mask, memory_key_padding_mask, memory_pos_emb, query_pos_emb, return_attn_logits):
+        q_input = self.with_pos_embed(tgt, query_pos_emb)
+        k_input = self.with_pos_embed(memory, memory_pos_emb)
+        tgt2, attn = self._slot_attention_forward(
+            q_input, k_input, memory, attn_mask, memory_key_padding_mask
+        )
+        tgt = tgt + self.dropout(tgt2)
+        tgt = self.norm(tgt)
+        return (tgt, attn) if return_attn_logits else (tgt, None)
+
+    def forward_pre(self, tgt, memory, attn_mask, memory_key_padding_mask, memory_pos_emb, query_pos_emb, return_attn_logits):
+        tgt2 = self.norm(tgt)
+        q_input = self.with_pos_embed(tgt2, query_pos_emb)
+        k_input = self.with_pos_embed(memory, memory_pos_emb)
+        tgt3, attn = self._slot_attention_forward(
+            q_input, k_input, memory, attn_mask, memory_key_padding_mask
+        )
+        tgt = tgt + self.dropout(tgt3)
+        return (tgt, attn) if return_attn_logits else (tgt, None)
+
+    def forward(
+        self, 
+        tgt: Tensor, # (B, Q, C) 
+        memory: Tensor,  # (B, H, W, C)
+        attn_mask: Optional[Tensor] = None, # (B, num_heads, Q, H, W)
+        memory_key_padding_mask: Optional[Tensor] = None, # (B, H*W)
+        memory_pos_emb: Optional[Tensor] = None, # (B, H, W, C), 
+        query_pos_emb: Optional[Tensor] = None, # (B, Q, C)
+        return_attn_logits: bool = False,
+        pos: Optional[Tensor] = None,
+    ):
+        memory = memory.flatten(1, 2)
+        if memory_pos_emb is not None:
+            memory_pos_emb = memory_pos_emb.flatten(1, 2)
+        
+        if attn_mask is not None:
+            attn_mask = attn_mask.flatten(3, 4).bool()
+
+        if self.normalize_before:
+            output, logits = self.forward_pre(
+                tgt, memory, attn_mask, memory_key_padding_mask, memory_pos_emb, query_pos_emb, return_attn_logits
+            )
+        else:
+            output, logits = self.forward_post(
+                tgt, memory, attn_mask, memory_key_padding_mask, memory_pos_emb, query_pos_emb, return_attn_logits
+            )
+    
+        return output, logits
 
 class FFNLayer(nn.Module):
 
