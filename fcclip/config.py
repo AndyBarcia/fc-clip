@@ -39,10 +39,12 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.NO_OBJECT_WEIGHT = 0.1
     cfg.MODEL.MASK_FORMER.CLASS_WEIGHT = 1.0
     cfg.MODEL.MASK_FORMER.CLASS_FOCAL_WEIGHT = 1.0
+    cfg.MODEL.MASK_FORMER.NUM_SUPPORT_QUERIES = 50
     cfg.MODEL.MASK_FORMER.DICE_WEIGHT = 1.0
     cfg.MODEL.MASK_FORMER.MASK_WEIGHT = 20.0
     cfg.MODEL.MASK_FORMER.BBOX_WEIGHT = 1.0
     cfg.MODEL.MASK_FORMER.GIOU_WEIGHT = 1.0
+    cfg.MODEL.MASK_FORMER.ROUDN_WEIGHT = 1.0
 
     # transformer config
     cfg.MODEL.MASK_FORMER.NHEADS = 8
@@ -164,3 +166,4 @@ def add_zegfc_config(cfg):
     cfg.MODEL.ZEG_FC.CROSS_ATTN_TYPE = "standard"  # Options: "standard", "pos_mlp_brpb", "pos_mlp_rpb", "gaussian"
     cfg.MODEL.ZEG_FC.SELF_ATTN_TYPE = "standard"  # Options: "standard", "pos_mlp_brpb", "pos_mlp_rpb"
     cfg.MODEL.ZEG_FC.MASK_POS_MLP_TYPE = "none"  # Options: "none", "brpb", "rpb"
+    cfg.MODEL.ZEG_FC.USE_ONE2MANY_HEAD = False

@@ -21,7 +21,9 @@ from detectron2.structures import Boxes, ImageList, Instances, BitMasks
 from detectron2.utils.memory import retry_if_cuda_oom
 
 from .modeling.criterion import SetCriterion
+from .modeling.one2many_criterion import One2ManySetCriterion
 from .modeling.matcher import HungarianMatcher
+from .modeling.one2many_matcher import HungarianOne2ManyMatcher
 from .modeling.transformer_decoder.box_regression import box_xyxy_to_cxcywh, box_cxcywh_to_xyxy
 
 from .modeling.transformer_decoder.fcclip_transformer_decoder import MaskPooling, get_classification_logits
@@ -75,6 +77,7 @@ class FCCLIP(nn.Module):
         geometric_ensemble_alpha: float,
         geometric_ensemble_beta: float,
         ensemble_on_valid_mask: bool,
+        use_one2many_head: bool
     ):
         """
         Args:
@@ -132,6 +135,7 @@ class FCCLIP(nn.Module):
         self.geometric_ensemble_alpha = geometric_ensemble_alpha
         self.geometric_ensemble_beta = geometric_ensemble_beta
         self.ensemble_on_valid_mask = ensemble_on_valid_mask
+        self.use_one2many_head = use_one2many_head
 
         self.train_text_classifier = None
         self.test_text_classifier = None
@@ -225,6 +229,9 @@ class FCCLIP(nn.Module):
         backbone = build_backbone(cfg)
         sem_seg_head = build_sem_seg_head(cfg, backbone.output_shape())
 
+        # Whether to use one2many head
+        use_one2many_head = cfg.MODEL.ZEG_FC.USE_ONE2MANY_HEAD
+
         # Loss parameters:
         deep_supervision = cfg.MODEL.MASK_FORMER.DEEP_SUPERVISION
         no_object_weight = cfg.MODEL.MASK_FORMER.NO_OBJECT_WEIGHT
@@ -236,9 +243,11 @@ class FCCLIP(nn.Module):
         mask_weight = cfg.MODEL.MASK_FORMER.MASK_WEIGHT
         bbox_weight = cfg.MODEL.MASK_FORMER.BBOX_WEIGHT
         giou_weight = cfg.MODEL.MASK_FORMER.GIOU_WEIGHT
+        round_weight = cfg.MODEL.MASK_FORMER.ROUDN_WEIGHT
 
         # building criterion
-        matcher = HungarianMatcher(
+        matcher_class = HungarianOne2ManyMatcher if use_one2many_head else HungarianMatcher
+        matcher = matcher_class(
             cost_class=class_weight,
             cost_mask=mask_weight,
             cost_dice=dice_weight,
@@ -253,6 +262,7 @@ class FCCLIP(nn.Module):
             "loss_label_focal": class_focal_weight,
             "loss_mask": mask_weight, 
             "loss_dice": dice_weight,
+            "loss_round": round_weight,
             "loss_bbox": bbox_weight,
             "loss_giou": giou_weight
         }
@@ -265,8 +275,11 @@ class FCCLIP(nn.Module):
             weight_dict.update(aux_weight_dict)
 
         losses = ["labels", "masks", "boxes"]
+        if use_one2many_head:
+            losses.append("rounds")
 
-        criterion = SetCriterion(
+        criterion_class = One2ManySetCriterion if use_one2many_head else SetCriterion
+        criterion = criterion_class(
             sem_seg_head.num_classes,
             matcher=matcher,
             weight_dict=weight_dict,
@@ -297,6 +310,7 @@ class FCCLIP(nn.Module):
             ),
             "pixel_mean": cfg.MODEL.PIXEL_MEAN,
             "pixel_std": cfg.MODEL.PIXEL_STD,
+            "use_one2many_head": cfg.MODEL.ZEG_FC.USE_ONE2MANY_HEAD,
             # inference
             "semantic_on": cfg.MODEL.MASK_FORMER.TEST.SEMANTIC_ON,
             "instance_on": cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON,
@@ -372,6 +386,7 @@ class FCCLIP(nn.Module):
             mask_cls_results = outputs["pred_logits"]
             mask_pred_results = outputs["pred_masks"]
             mask_box_results = outputs.get("pred_boxes")
+            mask_round_results = outputs.get("pred_round")
 
             # We ensemble the pred logits of in-vocab and out-vocab
             clip_feature = features["clip_vis_dense"]
@@ -396,7 +411,13 @@ class FCCLIP(nn.Module):
             else:
                 raise NotImplementedError
 
-            out_vocab_cls_results = get_classification_logits(pooled_clip_feature, text_classifier, self.backbone.logit_scale, num_templates)
+            out_vocab_cls_results = get_classification_logits(
+                pooled_clip_feature, 
+                text_classifier, 
+                self.backbone.logit_scale, 
+                None, 
+                num_templates
+            )
             in_vocab_cls_results = mask_cls_results[..., :-1] # remove void
             out_vocab_cls_results = out_vocab_cls_results[..., :-1] # remove void
 
@@ -448,10 +469,12 @@ class FCCLIP(nn.Module):
             # Prepare an iterator for boxes, which could be None
             if mask_box_results is None:
                 mask_box_results = [None] * len(batched_inputs)
+            if mask_round_results is None:
+                mask_round_results = [None] * len(batched_inputs)
 
             processed_results = []
-            for mask_cls_result, mask_pred_result, mask_box_result, input_per_image, image_size in zip(
-                mask_cls_results, mask_pred_results, mask_box_results, batched_inputs, images.image_sizes
+            for mask_cls_result, mask_pred_result, mask_box_result, mask_round_result, input_per_image, image_size in zip(
+                mask_cls_results, mask_pred_results, mask_box_results, mask_round_results, batched_inputs, images.image_sizes
             ):
                 height = input_per_image.get("height", image_size[0])
                 width = input_per_image.get("width", image_size[1])
@@ -472,7 +495,7 @@ class FCCLIP(nn.Module):
 
                 # panoptic segmentation inference
                 if self.panoptic_on:
-                    panoptic_r = retry_if_cuda_oom(self.panoptic_inference)(mask_cls_result, mask_pred_result)
+                    panoptic_r = retry_if_cuda_oom(self.panoptic_inference)(mask_cls_result, mask_pred_result, mask_round_result)
                     processed_results[-1]["panoptic_seg"] = panoptic_r
                 
                 # instance segmentation inference
@@ -507,15 +530,21 @@ class FCCLIP(nn.Module):
         semseg = torch.einsum("qc,qhw->chw", mask_cls, mask_pred)
         return semseg
 
-    def panoptic_inference(self, mask_cls, mask_pred):
+    def panoptic_inference(self, mask_cls, mask_pred, mask_round_result):
         if self.use_sigomid:
             scores, labels = F.sigmoid(mask_cls).max(-1)
         else:
             scores, labels = F.softmax(mask_cls, dim=-1).max(-1)
 
+        if self.use_one2many_head:
+            scores = mask_round_result.sigmoid().squeeze(-1)
+            object_mask_threshold = 0.5
+        else:
+            object_mask_threshold = self.object_mask_threshold
+
         mask_pred = mask_pred.sigmoid()
         num_classes = len(self.test_metadata.stuff_classes)
-        keep = labels.ne(num_classes) & (scores > self.object_mask_threshold)
+        keep = labels.ne(num_classes) & (scores > object_mask_threshold)
         cur_scores = scores[keep]
         cur_classes = labels[keep]
         cur_masks = mask_pred[keep]

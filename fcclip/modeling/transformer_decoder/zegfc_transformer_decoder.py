@@ -208,6 +208,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         *,
         hidden_dim: int,
         num_queries: int,
+        num_support_queries: int,
         nheads: int,
         dim_feedforward: int,
         dec_layers: int,
@@ -227,6 +228,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         clip_embedding_dim: int,
         num_transformer_out_features: int,
         use_nel_loss: bool,
+        use_one2many_head: bool
     ):
         """
         NOTE: this interface is experimental.
@@ -235,6 +237,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             mask_classification: whether to add mask classifier or not
             hidden_dim: Transformer feature dimension
             num_queries: number of queries
+            num_support_queries: number of support queries
             nheads: number of heads
             dim_feedforward: feature dimension in feedforward network
             enc_layers: number of Transformer encoder layers
@@ -360,12 +363,14 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         self.decoder_norm = nn.LayerNorm(hidden_dim)
 
         self.num_queries = num_queries
+        self.num_support_queries = num_support_queries
+        total_queries = self.num_queries + self.num_support_queries
         # learnable query features
-        self.query_feat = nn.Embedding(num_queries, hidden_dim)
+        self.query_feat = nn.Embedding(total_queries, hidden_dim)
         # learnable query p.e.
-        self.query_embed = nn.Embedding(num_queries, hidden_dim)
+        self.query_embed = nn.Embedding(total_queries, hidden_dim)
         # optional fixed boxes
-        self.query_bbox = nn.Embedding(num_queries, 4) if self._bbox_embed != None else None
+        self.query_bbox = nn.Embedding(total_queries, 4) if self._bbox_embed != None else None
 
         # level embedding (we always use 3 scales)
         self.num_feature_levels = num_transformer_out_features
@@ -401,6 +406,12 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             weight_init.c2_xavier_fill(self.class_embed)
         else:
             raise ValueError(f"Unknown class_embed_type: {self.class_embed_type}")
+        
+        self.use_one2many_head = use_one2many_head
+        if self.use_one2many_head:
+            self.round_pred_embed = MLP(hidden_dim, hidden_dim, 1, 3)
+        else:
+            self.round_pred_embed = None
         
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         if use_nel_loss:
@@ -453,6 +464,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         
         ret["hidden_dim"] = cfg.MODEL.MASK_FORMER.HIDDEN_DIM
         ret["num_queries"] = cfg.MODEL.MASK_FORMER.NUM_OBJECT_QUERIES
+        ret["num_support_queries"] = cfg.MODEL.MASK_FORMER.NUM_SUPPORT_QUERIES
         # Transformer parameters:
         ret["nheads"] = cfg.MODEL.MASK_FORMER.NHEADS
         ret["dim_feedforward"] = cfg.MODEL.MASK_FORMER.DIM_FEEDFORWARD
@@ -481,6 +493,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         ret["mask_pos_mlp_type"] = cfg.MODEL.ZEG_FC.MASK_POS_MLP_TYPE
         ret["num_transformer_out_features"] = cfg.MODEL.SEM_SEG_HEAD.DEFORMABLE_TRANSFORMER_ENCODER_OUT_FEATURES
         ret["use_nel_loss"] = cfg.MODEL.FC_CLIP.USE_NEL_COST
+        ret["use_one2many_head"] = cfg.MODEL.ZEG_FC.USE_ONE2MANY_HEAD
         return ret
 
     def forward(self, x, mask_features, mask = None, text_classifier=None, num_templates=None):
@@ -512,6 +525,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         predictions_class = []
         predictions_mask = []
         predictions_bbox = []
+        predictions_round = []
 
         # Optional starting cross-attention for text. 
         if self.text_atnn_cls:
@@ -538,29 +552,51 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             mem_attn_logits = None
 
         # prediction heads on learnable query features
-        outputs_class, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
-            output, 
+        main_output = output[:self.num_queries]
+        main_query_bbox_unsigmoid = query_bbox_unsigmoid[:self.num_queries] if query_bbox_unsigmoid is not None else None
+        main_mem_attn_logits = mem_attn_logits[:, :self.num_queries] if mem_attn_logits is not None else None
+        main_text_attn_logits = text_attn_logits[:, :self.num_queries] if text_attn_logits is not None else None
+
+        outputs_class, outputs_mask, output_box, outputs_round, updated_main_query_bbox_unsigmoid, main_attn_mask = self.forward_prediction_heads(
+            main_output,
             mask_features,
-            mem_attn_logits,
-            text_attn_logits,
-            query_bbox_unsigmoid=query_bbox_unsigmoid,
+            main_mem_attn_logits,
+            main_text_attn_logits,
+            query_bbox_unsigmoid=main_query_bbox_unsigmoid,
             attn_mask_size=size_list[0],
             attn_mask_target_size=size_list[0],
-            text_classifier=text_classifier, 
-            num_templates=num_templates
+            text_classifier=text_classifier,
+            num_templates=num_templates,
         )
         predictions_class.append(outputs_class)
         predictions_mask.append(outputs_mask)
         predictions_bbox.append(output_box)
+        predictions_round.append(outputs_round)
+        
+        if self.num_support_queries > 0:
+            if query_bbox_unsigmoid is not None:
+                support_query_bbox_unsigmoid = query_bbox_unsigmoid[self.num_queries:]
+                query_bbox_unsigmoid = torch.cat([updated_main_query_bbox_unsigmoid, support_query_bbox_unsigmoid], dim=0)
+            
+            b_h, _, hw = main_attn_mask.shape
+            support_attn_mask = torch.zeros(
+                b_h, self.num_support_queries, hw, dtype=torch.bool, device=output.device
+            )
+            attn_mask = torch.cat([main_attn_mask, support_attn_mask], dim=1)
+        else:
+            query_bbox_unsigmoid = updated_main_query_bbox_unsigmoid
+            attn_mask = main_attn_mask
 
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
             attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
+            
+            total_queries = self.num_queries + self.num_support_queries
             # attention: cross-attention first
             output, mem_attn_logits = self.transformer_cross_attention_layers[i](
                 output.transpose(0,1), # (B,Q,C)
                 src[level_index].transpose(0,1).view(bs, size_list[level_index][0], size_list[level_index][1], -1), # (B,H,W,C)
-                attn_mask=attn_mask.view(bs, self.num_heads, self.num_queries, size_list[level_index][0], size_list[level_index][1]), # (B, num_heads, Q, H,W)
+                attn_mask=attn_mask.view(bs, self.num_heads, total_queries, size_list[level_index][0], size_list[level_index][1]), # (B, num_heads, Q, H,W)
                 memory_pos_emb=pos[level_index].transpose(0,1).view(bs, size_list[level_index][0], size_list[level_index][1], -1), # (B,H,W,C), 
                 query_pos_emb=query_embed.transpose(0,1), # (B,Q,C)
                 pos=query_bbox_unsigmoid.sigmoid().transpose(0,1) if query_bbox_unsigmoid is not None else None, # (B,Q,[x,y,w,j])
@@ -590,20 +626,41 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                 output
             )
 
-            outputs_class, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
-                output, 
-                mask_features, 
-                mem_attn_logits,
-                text_attn_logits,
-                query_bbox_unsigmoid=query_bbox_unsigmoid,
+            main_output = output[:self.num_queries]
+            main_query_bbox_unsigmoid = query_bbox_unsigmoid[:self.num_queries] if query_bbox_unsigmoid is not None else None
+            main_mem_attn_logits = mem_attn_logits[:, :self.num_queries] if mem_attn_logits is not None else None
+            main_text_attn_logits = text_attn_logits[:, :self.num_queries] if text_attn_logits is not None else None
+
+            outputs_class, outputs_mask, output_box, outputs_round, updated_main_query_bbox_unsigmoid, main_attn_mask = self.forward_prediction_heads(
+                main_output,
+                mask_features,
+                main_mem_attn_logits,
+                main_text_attn_logits,
+                query_bbox_unsigmoid=main_query_bbox_unsigmoid,
                 attn_mask_size=size_list[i % self.num_feature_levels],
                 attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels],
-                text_classifier=text_classifier, 
-                num_templates=num_templates
+                text_classifier=text_classifier,
+                num_templates=num_templates,
             )
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
             predictions_bbox.append(output_box)
+            predictions_round.append(outputs_round)
+
+            if self.num_support_queries > 0:
+                if query_bbox_unsigmoid is not None:
+                    support_query_bbox_unsigmoid = query_bbox_unsigmoid[self.num_queries:]
+                    query_bbox_unsigmoid = torch.cat([updated_main_query_bbox_unsigmoid, support_query_bbox_unsigmoid], dim=0)
+            
+                b_h, _, hw = main_attn_mask.shape
+                support_attn_mask = torch.zeros(
+                    b_h, self.num_support_queries, hw, dtype=torch.bool, device=output.device
+                )
+                attn_mask = torch.cat([main_attn_mask, support_attn_mask], dim=1)
+            else:
+                query_bbox_unsigmoid = updated_main_query_bbox_unsigmoid
+                attn_mask = main_attn_mask
+
 
         assert len(predictions_class) == self.num_layers + 1
 
@@ -611,8 +668,12 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             'pred_logits': predictions_class[-1],
             'pred_masks': predictions_mask[-1],
             'pred_boxes': predictions_bbox[-1],
+            'pred_round': predictions_round[-1],
             'aux_outputs': self._set_aux_loss(
-                predictions_class if self.mask_classification else None, predictions_mask, predictions_bbox
+                predictions_class if self.mask_classification else None, 
+                predictions_mask, 
+                predictions_bbox,
+                predictions_round
             )
         }
         return out
@@ -632,15 +693,16 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
     ):
         decoder_output = self.decoder_norm(output)
         decoder_output = decoder_output.transpose(0, 1)
+
         mask_embed = self.mask_embed(decoder_output)
+
+        if self.use_one2many_head:
+            outputs_round = self.round_pred_embed(decoder_output)
+        else:
+            outputs_round = None
 
         if self.mem_attn_mask:
             # Get attention logits from memory attention to the propper size.
-
-            #import logging
-            #logger = logging.getLogger("detectron2")
-            #logger.info(f"{mem_attn_logits.shape=}, {attn_mask_size=}, {mask_features.shape=}")
-
             mem_attn_logits = mem_attn_logits.unflatten(-1, attn_mask_size) # [B, Q, H, W]
             mem_attn_logits = F.interpolate(
                 mem_attn_logits, 
@@ -701,20 +763,20 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         attn_mask = (attn_mask.sigmoid().flatten(2).unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0, 1) < 0.5).bool()
         attn_mask = attn_mask.detach()
 
-        return outputs_class, outputs_mask, outputs_bbox, query_bbox_unsigmoid_detached, attn_mask
+        return outputs_class, outputs_mask, outputs_bbox, outputs_round, query_bbox_unsigmoid_detached, attn_mask
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_seg_masks, outputs_bboxes):
+    def _set_aux_loss(self, outputs_class, outputs_seg_masks, outputs_bboxes, outputs_round):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
         if self.mask_classification:
             return [
-                {"pred_logits": a, "pred_masks": b, "pred_boxes": c}
-                for a, b, c in zip(outputs_class[:-1], outputs_seg_masks[:-1], outputs_bboxes[:-1])
+                {"pred_logits": a, "pred_masks": b, "pred_boxes": c, "pred_round": d}
+                for a, b, c, d in zip(outputs_class[:-1], outputs_seg_masks[:-1], outputs_bboxes[:-1], outputs_round[:-1])
             ]
         else:
             return [
-                {"pred_masks": b, "pred_boxes": c}
-                for b, c in zip(outputs_seg_masks[:-1], outputs_bboxes[:-1])
+                {"pred_masks": b, "pred_boxes": c, "pred_round": d}
+                for b, c, d in zip(outputs_seg_masks[:-1], outputs_bboxes[:-1], outputs_round[:-1])
             ]

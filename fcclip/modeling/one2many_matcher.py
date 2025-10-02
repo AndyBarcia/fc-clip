@@ -15,63 +15,10 @@ from torch.cuda.amp import autocast
 
 from detectron2.projects.point_rend.point_features import point_sample
 
+from .matcher import batch_dice_loss_jit
+from .matcher import batch_sigmoid_ce_loss_jit
 
-def batch_dice_loss(inputs: torch.Tensor, targets: torch.Tensor):
-    """
-    Compute the DICE loss, similar to generalized IOU for masks
-    Args:
-        inputs: A float tensor of arbitrary shape.
-                The predictions for each example.
-        targets: A float tensor with the same shape as inputs. Stores the binary
-                 classification label for each element in inputs
-                (0 for the negative class and 1 for the positive class).
-    """
-    inputs = inputs.sigmoid()
-    inputs = inputs.flatten(1)
-    numerator = 2 * torch.einsum("nc,mc->nm", inputs, targets)
-    denominator = inputs.sum(-1)[:, None] + targets.sum(-1)[None, :]
-    loss = 1 - (numerator + 1) / (denominator + 1)
-    return loss
-
-
-batch_dice_loss_jit = torch.jit.script(
-    batch_dice_loss
-)  # type: torch.jit.ScriptModule
-
-
-def batch_sigmoid_ce_loss(inputs: torch.Tensor, targets: torch.Tensor):
-    """
-    Args:
-        inputs: A float tensor of arbitrary shape.
-                The predictions for each example.
-        targets: A float tensor with the same shape as inputs. Stores the binary
-                 classification label for each element in inputs
-                (0 for the negative class and 1 for the positive class).
-    Returns:
-        Loss tensor
-    """
-    hw = inputs.shape[1]
-
-    pos = F.binary_cross_entropy_with_logits(
-        inputs, torch.ones_like(inputs), reduction="none"
-    )
-    neg = F.binary_cross_entropy_with_logits(
-        inputs, torch.zeros_like(inputs), reduction="none"
-    )
-
-    loss = torch.einsum("nc,mc->nm", pos, targets) + torch.einsum(
-        "nc,mc->nm", neg, (1 - targets)
-    )
-
-    return loss / hw
-
-
-batch_sigmoid_ce_loss_jit = torch.jit.script(
-    batch_sigmoid_ce_loss
-)  # type: torch.jit.ScriptModule
-
-
-class HungarianMatcher(nn.Module):
+class HungarianOne2ManyMatcher(nn.Module):
     """This class computes an assignment between the targets and the predictions of the network
 
     For efficiency reasons, the targets don't include the no_object. Because of this, in general,
@@ -113,8 +60,8 @@ class HungarianMatcher(nn.Module):
         """More memory-friendly matching"""
         bs, num_queries = outputs["pred_logits"].shape[:2]
 
-        one_to_one_indices = []
-        one_to_many_indices = []
+        indices = []
+        rounds = []
 
         # Iterate through batch size
         for b in range(bs):
@@ -173,26 +120,73 @@ class HungarianMatcher(nn.Module):
                     + self.cost_dice * cost_dice
                 )
             else:
-                # This block runs if there are NO ground-truth objects.
-                # We create an empty cost matrix. The shape [num_queries, 0] is
-                # important. linear_sum_assignment will correctly handle this
-                # by returning empty indices, which is the desired behavior.
                 C = torch.empty(num_queries, 0, device=out_prob.device)
+
             C = C.reshape(num_queries, -1).cpu()
             # Make sure the matrix contains no NaN values, or scipy fails 
             C = torch.nan_to_num(C, nan=0.0, posinf=1e+5, neginf=-1e+5)
             
-            # First, compute the one-to-one matches
-            o2o_assignment = linear_sum_assignment(C)
-            one_to_one_indices.append(o2o_assignment)
+            num_gts = C.shape[1]
+            
+            if num_gts == 0:
+                # No ground truths, so no matches
+                indices.append((torch.tensor([], dtype=torch.long), torch.tensor([], dtype=torch.long)))
+                rounds.append(torch.full((num_queries,), -1, dtype=torch.long))
+                continue
 
-        # Convert to torch tensors
-        one_to_one_indices = [
-            (torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64))
-            for i, j in one_to_one_indices
-        ]
+            # Repeat ground truths to cover all detections
+            num_repeats = (num_queries + num_gts - 1) // num_gts
+            tiled_C = C.repeat(1, num_repeats)
 
-        return one_to_one_indices
+            # The cost matrix for assignment should be at least as wide as it is tall
+            # to ensure every detection gets a match.
+            cost_matrix_for_assignment = tiled_C[:, :num_queries]
+            
+            # Perform Hungarian matching
+            row_ind, col_ind = linear_sum_assignment(cost_matrix_for_assignment)
+
+            # Convert to tensors
+            row_ind_tensor = torch.as_tensor(row_ind, dtype=torch.long)
+            col_ind_tensor = torch.as_tensor(col_ind, dtype=torch.long)
+
+            # Map the column indices from the tiled matrix back to the original ground truth indices
+            original_gt_indices = col_ind_tensor % num_gts
+
+            # Store the final indices for loss computation
+            indices.append((row_ind_tensor, original_gt_indices))
+
+            # --- Calculate the "round" based on the cost-ordering for each GT ---
+            all_rounds = torch.full((num_queries,), -1, dtype=torch.long)
+            
+            # Get the costs of the final matches from the original cost matrix C
+            match_costs = C[row_ind_tensor, original_gt_indices]
+
+            # Find unique ground truths that have been matched
+            unique_gts = torch.unique(original_gt_indices)
+
+            for gt_idx in unique_gts:
+                # Find all detections matched to this ground truth
+                mask_current_gt = (original_gt_indices == gt_idx)
+                
+                # Get the detection indices and their corresponding costs
+                detections_for_gt = row_ind_tensor[mask_current_gt]
+                costs_for_gt = match_costs[mask_current_gt]
+                
+                # Sort these detections by their cost
+                sorted_cost_indices = torch.argsort(costs_for_gt)
+                
+                # The "round" is the rank in this sorted list (0, 1, 2, ...)
+                ranks = torch.arange(len(sorted_cost_indices))
+                
+                # Get the original detection indices in their sorted order
+                sorted_detections_for_gt = detections_for_gt[sorted_cost_indices]
+                
+                # Assign the ranks to the corresponding detection indices in the final rounds tensor
+                all_rounds[sorted_detections_for_gt] = ranks
+
+            rounds.append(all_rounds)
+
+        return indices, rounds
 
     @torch.no_grad()
     def forward(self, outputs, targets):
