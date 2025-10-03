@@ -229,7 +229,9 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         clip_embedding_dim: int,
         num_transformer_out_features: int,
         use_nel_loss: bool,
-        use_one2many_head: bool
+        use_one2many_head: bool,
+        query_init_type: str = "learned",
+        support_query_init_type: str = "learned",
     ):
         """
         NOTE: this interface is experimental.
@@ -373,13 +375,37 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
 
         self.num_queries = num_queries
         self.num_support_queries = num_support_queries
-        total_queries = self.num_queries + self.num_support_queries
-        # learnable query features
-        self.query_feat = nn.Embedding(total_queries, hidden_dim)
-        # learnable query p.e.
-        self.query_embed = nn.Embedding(total_queries, hidden_dim)
+        self.query_init_type = query_init_type
+        self.support_query_init_type = support_query_init_type
+
+        # Initialization for main queries' features and positional embeddings
+        if self.query_init_type == "learned":
+            self.main_query_feat = nn.Embedding(self.num_queries, hidden_dim)
+            self.main_query_embed = nn.Embedding(self.num_queries, hidden_dim)
+        elif self.query_init_type == "random_gaussian":
+            self.main_query_feat_mean = nn.Parameter(torch.zeros(self.num_queries, hidden_dim))
+            self.main_query_feat_log_std = nn.Parameter(torch.zeros(self.num_queries, hidden_dim))
+            self.main_query_embed_mean = nn.Parameter(torch.zeros(self.num_queries, hidden_dim))
+            self.main_query_embed_log_std = nn.Parameter(torch.zeros(self.num_queries, hidden_dim))
+        else:
+            raise ValueError(f"Unknown query_init_type: {self.query_init_type}")
+
+        # Initialization for support queries' features and positional embeddings
+        if self.num_support_queries > 0:
+            if self.support_query_init_type == "learned":
+                self.support_query_feat = nn.Embedding(self.num_support_queries, hidden_dim)
+                self.support_query_embed = nn.Embedding(self.num_support_queries, hidden_dim)
+            elif self.support_query_init_type == "random_gaussian":
+                self.support_query_feat_mean = nn.Parameter(torch.zeros(self.num_support_queries, hidden_dim))
+                self.support_query_feat_log_std = nn.Parameter(torch.zeros(self.num_support_queries, hidden_dim))
+                self.support_query_embed_mean = nn.Parameter(torch.zeros(self.num_support_queries, hidden_dim))
+                self.support_query_embed_log_std = nn.Parameter(torch.zeros(self.num_support_queries, hidden_dim))
+            else:
+                raise ValueError(f"Unknown support_query_init_type: {self.support_query_init_type}")
+
         # optional fixed boxes
-        self.query_bbox = nn.Embedding(total_queries, 4) if self._bbox_embed != None else None
+        total_queries = self.num_queries + self.num_support_queries
+        self.query_bbox = nn.Embedding(total_queries, 4) if self._bbox_embed is not None else None
 
         # level embedding (we always use 3 scales)
         self.num_feature_levels = num_transformer_out_features
@@ -503,6 +529,8 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         ret["num_transformer_out_features"] = cfg.MODEL.SEM_SEG_HEAD.DEFORMABLE_TRANSFORMER_ENCODER_OUT_FEATURES
         ret["use_nel_loss"] = cfg.MODEL.FC_CLIP.USE_NEL_COST
         ret["use_one2many_head"] = cfg.MODEL.ZEG_FC.USE_ONE2MANY_HEAD
+        ret["query_init_type"] = cfg.MODEL.ZEG_FC.QUERY_INIT_TYPE
+        ret["support_query_init_type"] = cfg.MODEL.ZEG_FC.SUPPORT_QUERY_INIT_TYPE
         return ret
 
     def forward(self, x, mask_features, mask = None, text_classifier=None, num_templates=None):
@@ -526,10 +554,39 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
 
         _, bs, _ = src[0].shape
 
+        # Construct main query features and embeddings based on initialization strategy
+        if self.query_init_type == 'learned':
+            main_query_feat = self.main_query_feat.weight
+            main_query_embed = self.main_query_embed.weight
+        else:  # random_gaussian
+            feat_std = torch.exp(self.main_query_feat_log_std)
+            main_query_feat = self.main_query_feat_mean + feat_std * torch.randn_like(self.main_query_feat_mean)
+            embed_std = torch.exp(self.main_query_embed_log_std)
+            main_query_embed = self.main_query_embed_mean + embed_std * torch.randn_like(self.main_query_embed_mean)
+
+        # Construct support query features and embeddings and combine with main queries
+        if self.num_support_queries > 0:
+            if self.support_query_init_type == 'learned':
+                support_query_feat = self.support_query_feat.weight
+                support_query_embed = self.support_query_embed.weight
+            else:  # random_gaussian
+                support_feat_std = torch.exp(self.support_query_feat_log_std)
+                support_query_feat = self.support_query_feat_mean + support_feat_std * torch.randn_like(self.support_query_feat_mean)
+                support_embed_std = torch.exp(self.support_query_embed_log_std)
+                support_query_embed = self.support_query_embed_mean + support_embed_std * torch.randn_like(self.support_query_embed_mean)
+
+            query_feat = torch.cat([main_query_feat, support_query_feat], dim=0)
+            query_embed = torch.cat([main_query_embed, support_query_embed], dim=0)
+        else:
+            query_feat = main_query_feat
+            query_embed = main_query_embed
+
+        # Prepare queries for the transformer decoder
         # QxNxC
-        query_embed = self.query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
-        output = self.query_feat.weight.unsqueeze(1).repeat(1, bs, 1)
-        query_bbox_unsigmoid = self.query_bbox.weight.unsqueeze(1).repeat(1, bs, 1) if self.query_bbox else None
+        query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
+        output = query_feat.unsqueeze(1).repeat(1, bs, 1)
+        query_bbox_unsigmoid = self.query_bbox.weight.unsqueeze(1).repeat(1, bs, 1) if self._bbox_embed is not None else None
+
 
         predictions_class = []
         predictions_mask = []

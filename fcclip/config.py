@@ -167,3 +167,5 @@ def add_zegfc_config(cfg):
     cfg.MODEL.ZEG_FC.SELF_ATTN_TYPE = "standard"  # Options: "standard", "pos_mlp_brpb", "pos_mlp_rpb"
     cfg.MODEL.ZEG_FC.MASK_POS_MLP_TYPE = "none"  # Options: "none", "brpb", "rpb"
     cfg.MODEL.ZEG_FC.USE_ONE2MANY_HEAD = False
+    cfg.MODEL.ZEG_FC.QUERY_INIT_TYPE = "learned"  # Options: "learned", "random_gaussian"
+    cfg.MODEL.ZEG_FC.SUPPORT_QUERY_INIT_TYPE = "learned" # Options: "learned", "random_gaussian"
