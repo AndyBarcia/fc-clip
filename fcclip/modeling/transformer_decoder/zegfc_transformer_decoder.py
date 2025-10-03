@@ -25,6 +25,7 @@ from .fcclip_transformer_decoder import (
     MaskPooling,
     SelfAttentionLayer,
     CrossAttentionLayer,
+    SlotCrossAttention,
     FFNLayer,
     MLP,
     _get_activation_fn
@@ -338,6 +339,14 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                     normalize=("normalize" in self.cross_attn_type),
                     only_gaussian_logits=("only_gaussian_logits" in self.cross_attn_type),
                 )
+                if "gaussian" in self.cross_attn_type else
+                SlotCrossAttention(
+                    dim=hidden_dim,
+                    n_heads=nheads,
+                    dropout=0.0,
+                    normalize_before=pre_norm,
+                )
+                if "slot"in self.cross_attn_type else None
             )
 
             if text_attn:

@@ -328,30 +328,30 @@ class CrossAttentionLayer(nn.Module):
 class SlotCrossAttention(nn.Module):
     def __init__(
         self, 
-        d_model: int, 
+        dim: int, 
         n_heads: int, 
         dropout: float = 0.1, 
         normalize_before: bool = False
     ):
         super().__init__()
-        if d_model % n_heads != 0:
-            raise ValueError(f"d_model ({d_model}) debe ser divisible por nhead ({n_heads})")
+        if dim % n_heads != 0:
+            raise ValueError(f"d_model ({dim}) debe ser divisible por nhead ({n_heads})")
 
-        self.d_model = d_model
+        self.d_model = dim
         self.nhead = n_heads
-        self.head_dim = d_model // n_heads
+        self.head_dim = dim // n_heads
         self.scale = self.head_dim ** -0.5
         self.normalize_before = normalize_before
 
         # Capas de proyección lineal para Q, K, V
-        self.to_q = nn.Linear(d_model, d_model, bias=False)
-        self.to_k = nn.Linear(d_model, d_model, bias=False)
-        self.to_v = nn.Linear(d_model, d_model, bias=False)
+        self.to_q = nn.Linear(dim, dim, bias=False)
+        self.to_k = nn.Linear(dim, dim, bias=False)
+        self.to_v = nn.Linear(dim, dim, bias=False)
 
         # Capa de salida
-        self.to_out = nn.Linear(d_model, d_model)
+        self.to_out = nn.Linear(dim, dim)
 
-        self.norm = nn.LayerNorm(d_model)
+        self.norm = nn.LayerNorm(dim)
         self.dropout = nn.Dropout(dropout)
         
         self._reset_parameters()
