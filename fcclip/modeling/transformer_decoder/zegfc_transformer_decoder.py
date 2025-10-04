@@ -391,21 +391,24 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             raise ValueError(f"Unknown query_init_type: {self.query_init_type}")
 
         # Initialization for support queries' features and positional embeddings
-        if self.num_support_queries > 0:
-            if self.support_query_init_type == "learned":
+        if self.support_query_init_type == "learned":
+            if self.num_support_queries > 0:
                 self.support_query_feat = nn.Embedding(self.num_support_queries, hidden_dim)
                 self.support_query_embed = nn.Embedding(self.num_support_queries, hidden_dim)
-            elif self.support_query_init_type == "random_gaussian":
+        elif self.support_query_init_type == "random_gaussian":
+             if self.num_support_queries > 0:
                 self.support_query_feat_mean = nn.Parameter(torch.zeros(self.num_support_queries, hidden_dim))
                 self.support_query_feat_log_std = nn.Parameter(torch.zeros(self.num_support_queries, hidden_dim))
                 self.support_query_embed_mean = nn.Parameter(torch.zeros(self.num_support_queries, hidden_dim))
                 self.support_query_embed_log_std = nn.Parameter(torch.zeros(self.num_support_queries, hidden_dim))
-            else:
-                raise ValueError(f"Unknown support_query_init_type: {self.support_query_init_type}")
+        elif self.support_query_init_type == "text_driven":
+            self.support_query_feat_proj = nn.Linear(clip_embedding_dim, hidden_dim)
+            self.support_query_embed_proj = nn.Linear(clip_embedding_dim, hidden_dim)
+        else:
+            raise ValueError(f"Unknown support_query_init_type: {self.support_query_init_type}")
 
         # optional fixed boxes
-        total_queries = self.num_queries + self.num_support_queries
-        self.query_bbox = nn.Embedding(total_queries, 4) if self._bbox_embed is not None else None
+        self.query_bbox = nn.Embedding(self.num_queries, 4) if self._bbox_embed is not None else None
 
         # level embedding (we always use 3 scales)
         self.num_feature_levels = num_transformer_out_features
@@ -554,7 +557,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
 
         _, bs, _ = src[0].shape
 
-        # Construct main query features and embeddings based on initialization strategy
+        # Initialize main queries
         if self.query_init_type == 'learned':
             main_query_feat = self.main_query_feat.weight
             main_query_embed = self.main_query_embed.weight
@@ -564,30 +567,62 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             embed_std = torch.exp(self.main_query_embed_log_std)
             main_query_embed = self.main_query_embed_mean + embed_std * torch.randn_like(self.main_query_embed_mean)
 
-        # Construct support query features and embeddings and combine with main queries
-        if self.num_support_queries > 0:
-            if self.support_query_init_type == 'learned':
-                support_query_feat = self.support_query_feat.weight
-                support_query_embed = self.support_query_embed.weight
-            else:  # random_gaussian
+        output = main_query_feat.unsqueeze(1).repeat(1, bs, 1)
+        query_embed = main_query_embed.unsqueeze(1).repeat(1, bs, 1)
+        current_num_support_queries = 0
+
+        # Initialize and append support queries
+        if self.support_query_init_type == 'learned':
+            if self.num_support_queries > 0:
+                support_query_feat = self.support_query_feat.weight.unsqueeze(1).repeat(1, bs, 1)
+                support_query_embed = self.support_query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
+                output = torch.cat([output, support_query_feat], dim=0)
+                query_embed = torch.cat([query_embed, support_query_embed], dim=0)
+                current_num_support_queries = self.num_support_queries
+
+        elif self.support_query_init_type == 'random_gaussian':
+            if self.num_support_queries > 0:
                 support_feat_std = torch.exp(self.support_query_feat_log_std)
                 support_query_feat = self.support_query_feat_mean + support_feat_std * torch.randn_like(self.support_query_feat_mean)
+                support_query_feat = support_query_feat.unsqueeze(1).repeat(1, bs, 1)
+
                 support_embed_std = torch.exp(self.support_query_embed_log_std)
                 support_query_embed = self.support_query_embed_mean + support_embed_std * torch.randn_like(self.support_query_embed_mean)
+                support_query_embed = support_query_embed.unsqueeze(1).repeat(1, bs, 1)
 
-            query_feat = torch.cat([main_query_feat, support_query_feat], dim=0)
-            query_embed = torch.cat([main_query_embed, support_query_embed], dim=0)
-        else:
-            query_feat = main_query_feat
-            query_embed = main_query_embed
+                output = torch.cat([output, support_query_feat], dim=0)
+                query_embed = torch.cat([query_embed, support_query_embed], dim=0)
+                current_num_support_queries = self.num_support_queries
 
-        # Prepare queries for the transformer decoder
-        # QxNxC
-        query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
-        output = query_feat.unsqueeze(1).repeat(1, bs, 1)
-        query_bbox_unsigmoid = self.query_bbox.weight.unsqueeze(1).repeat(1, bs, 1) if self._bbox_embed is not None else None
+        elif self.support_query_init_type == 'text_driven':
+            if text_classifier is not None and text_classifier.numel() > 0:
+                # Handle both batched (B, T, C) and unbatched (T, C) text embeddings
+                if text_classifier.dim() == 3:  # Batched input: (B, T, C)
+                    support_query_feat = self.support_query_feat_proj(text_classifier).permute(1, 0, 2)
+                    support_query_embed = self.support_query_embed_proj(text_classifier).permute(1, 0, 2)
+                    current_num_support_queries = text_classifier.shape[1]
+                else:  # Unbatched input: (T, C), expand to batch size
+                    support_query_feat = self.support_query_feat_proj(text_classifier).unsqueeze(1).repeat(1, bs, 1)
+                    support_query_embed = self.support_query_embed_proj(text_classifier).unsqueeze(1).repeat(1, bs, 1)
+                    current_num_support_queries = text_classifier.shape[0]
 
-
+                output = torch.cat([output, support_query_feat], dim=0)
+                query_embed = torch.cat([query_embed, support_query_embed], dim=0)
+        
+        # 3. Initialize bounding boxes
+        query_bbox_unsigmoid = None
+        if self._bbox_embed is not None:
+            # Bbox for main queries are learned
+            main_query_bbox_unsigmoid = self.query_bbox.weight.unsqueeze(1).repeat(1, bs, 1)
+            if current_num_support_queries > 0:
+                # Bbox for support queries are initialized to zeros
+                support_query_bbox_unsigmoid = torch.zeros(
+                    current_num_support_queries, bs, 4, device=output.device, dtype=output.dtype
+                )
+                query_bbox_unsigmoid = torch.cat([main_query_bbox_unsigmoid, support_query_bbox_unsigmoid], dim=0)
+            else:
+                query_bbox_unsigmoid = main_query_bbox_unsigmoid
+        
         predictions_class = []
         predictions_mask = []
         predictions_bbox = []
@@ -639,14 +674,14 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         predictions_bbox.append(output_box)
         predictions_round.append(outputs_round)
         
-        if self.num_support_queries > 0:
+        if current_num_support_queries > 0:
             if query_bbox_unsigmoid is not None:
                 support_query_bbox_unsigmoid = query_bbox_unsigmoid[self.num_queries:]
                 query_bbox_unsigmoid = torch.cat([updated_main_query_bbox_unsigmoid, support_query_bbox_unsigmoid], dim=0)
             
             b_h, _, hw = main_attn_mask.shape
             support_attn_mask = torch.zeros(
-                b_h, self.num_support_queries, hw, dtype=torch.bool, device=output.device
+                b_h, current_num_support_queries, hw, dtype=torch.bool, device=output.device
             )
             attn_mask = torch.cat([main_attn_mask, support_attn_mask], dim=1)
         else:
@@ -657,7 +692,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             level_index = i % self.num_feature_levels
             attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
             
-            total_queries = self.num_queries + self.num_support_queries
+            total_queries = self.num_queries + current_num_support_queries
             # attention: cross-attention first
             output, mem_attn_logits = self.transformer_cross_attention_layers[i](
                 output.transpose(0,1), # (B,Q,C)
@@ -713,14 +748,14 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             predictions_bbox.append(output_box)
             predictions_round.append(outputs_round)
 
-            if self.num_support_queries > 0:
+            if current_num_support_queries > 0:
                 if query_bbox_unsigmoid is not None:
                     support_query_bbox_unsigmoid = query_bbox_unsigmoid[self.num_queries:]
                     query_bbox_unsigmoid = torch.cat([updated_main_query_bbox_unsigmoid, support_query_bbox_unsigmoid], dim=0)
             
                 b_h, _, hw = main_attn_mask.shape
                 support_attn_mask = torch.zeros(
-                    b_h, self.num_support_queries, hw, dtype=torch.bool, device=output.device
+                    b_h, current_num_support_queries, hw, dtype=torch.bool, device=output.device
                 )
                 attn_mask = torch.cat([main_attn_mask, support_attn_mask], dim=1)
             else:
