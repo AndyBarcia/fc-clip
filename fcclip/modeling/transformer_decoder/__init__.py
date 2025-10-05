@@ -15,3 +15,4 @@ limitations under the License.
 """
 from .fcclip_transformer_decoder import MultiScaleMaskedTransformerDecoder
 from .zegfc_transformer_decoder import MultiScaleExtendedMaskedTransformerDecoder
+from .pansem_transformer_decoder import PanopticAndSemanticTransformerDecoder

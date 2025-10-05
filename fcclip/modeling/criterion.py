@@ -224,11 +224,11 @@ class SetCriterion(nn.Module):
         """Compute the losses related to the masks: the focal loss and the dice loss.
         targets dicts must contain the key "masks" containing a tensor of dim [nb_target_boxes, h, w]
         """
-        assert "pred_masks" in outputs
+        assert "pred_panoptic_masks" in outputs
 
         src_idx = self._get_src_permutation_idx(indices)
         tgt_idx = self._get_tgt_permutation_idx(indices)
-        src_masks = outputs["pred_masks"]
+        src_masks = outputs["pred_panoptic_masks"]
         src_masks = src_masks[src_idx]
         masks = [t["masks"] for t in targets]
         # TODO use valid to mask invalid areas due to padding in loss
@@ -245,8 +245,8 @@ class SetCriterion(nn.Module):
         # use loss_mask.sum() * 0.0 to avoid angering the DDP gods.
         if src_masks.shape[0] == 0:
             losses = {
-                "loss_mask": outputs["pred_masks"].sum() * 0.0,
-                "loss_dice": outputs["pred_masks"].sum() * 0.0,
+                "loss_mask": outputs["pred_panoptic_masks"].sum() * 0.0,
+                "loss_dice": outputs["pred_panoptic_masks"].sum() * 0.0,
             }
             return losses
 
@@ -280,7 +280,72 @@ class SetCriterion(nn.Module):
         del src_masks
         del target_masks
         return losses
-    
+
+    def loss_semantic(self, outputs, targets, indices, num_masks):
+        """
+        Compute pixel-wise sigmoid focal loss and dice loss for semantic segmentation.
+        """
+        assert "pred_semantic_masks" in outputs
+        src_logits = outputs["pred_semantic_masks"]
+
+        # Get the padded shape of the ground truth masks
+        mask_shape = targets[0]["masks"].shape[-2:]
+        
+        # Create a target tensor for semantic segmentation ground truth
+        target_sem_idx = torch.full(
+            (len(targets), *mask_shape),
+            self.num_classes,  # Use num_classes as the ignore_index for background
+            dtype=torch.long,
+            device=src_logits.device
+        )
+
+        # Populate the target tensor from instance masks
+        for i, T in enumerate(targets):
+            for mask, label in zip(T["masks"], T["labels"]):
+                target_sem_idx[i][mask] = label
+
+        # Upsample predictions to match the target size
+        src_logits = F.interpolate(
+            src_logits, size=target_sem_idx.shape[-2:], mode="bilinear", align_corners=False
+        )
+        
+        # Prepare one-hot target for Dice and Focal loss
+        # Shape: (B, C, H, W)
+        # The ignore index is handled correctly as it becomes a zero vector
+        target_sem_one_hot = F.one_hot(
+            target_sem_idx, num_classes=self.num_classes + 1
+        ).permute(0, 3, 1, 2)[:, :self.num_classes, :, :].to(src_logits.dtype)
+        
+        # Dice Loss
+        src_flat = src_logits.sigmoid().flatten(2)
+        target_flat = target_sem_one_hot.flatten(2)
+        loss_dice = dice_loss_jit(src_flat, target_flat, num_masks),
+
+        # Flatten and select only valid pixels (non-ignored)
+        valid_mask = (target_sem_idx != self.num_classes)
+        num_pixels = valid_mask.sum()
+
+        src_logits_flat = src_logits.permute(0, 2, 3, 1)[valid_mask]
+        target_sem_one_hot_flat = target_sem_one_hot.permute(0, 2, 3, 1)[valid_mask]
+
+        if num_pixels > 0:
+            loss_mask = sigmoid_focal_loss_jit(
+                src_logits_flat,
+                target_sem_one_hot_flat,
+                num_pixels,
+                alpha=self.focal_alpha,
+                gamma=self.focal_gamma
+            )
+        else:
+            loss_mask = (src_logits_flat.sum() * 0.0)
+
+        losses = {
+            "loss_semantic_mask": loss_mask,
+            "loss_semantic_dice": loss_dice
+        }
+
+        return losses
+
     def loss_boxes(self, outputs, targets, indices, num_boxes):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
            targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
@@ -320,7 +385,8 @@ class SetCriterion(nn.Module):
         loss_map = {
             'labels': self.loss_labels_nel if self.use_nel_loss else self.loss_labels,
             'masks': self.loss_masks,
-            'boxes': self.loss_boxes
+            'boxes': self.loss_boxes,
+            'semantic': self.loss_semantic,
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_masks)
@@ -349,6 +415,9 @@ class SetCriterion(nn.Module):
         # Compute all the requested losses
         losses = {}
         for loss in self.losses:
+            # Skip losses for which the required predictions are not present
+            if loss == 'semantic' and 'pred_semantic_masks' not in outputs:
+                continue
             losses.update(self.get_loss(loss, outputs, targets, indices, num_masks))
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
@@ -356,6 +425,11 @@ class SetCriterion(nn.Module):
             for i, aux_outputs in enumerate(outputs["aux_outputs"]):
                 indices = self.matcher(aux_outputs, targets)
                 for loss in self.losses:
+                    # Skip losses for which the required predictions are not present in aux outputs
+                    if loss == 'semantic' and 'pred_semantic_masks' not in aux_outputs:
+                        continue
+                    if loss == 'boxes' and 'pred_boxes' not in aux_outputs:
+                        continue
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_masks)
                     l_dict = {k + f"_{i}": v for k, v in l_dict.items()}
                     losses.update(l_dict)

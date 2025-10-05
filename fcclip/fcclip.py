@@ -261,7 +261,9 @@ class FCCLIP(nn.Module):
             "loss_ce": class_weight, 
             "loss_label_focal": class_focal_weight,
             "loss_mask": mask_weight, 
+            "loss_semantic_mask": mask_weight,
             "loss_dice": dice_weight,
+            "loss_semantic_dice": dice_weight,
             "loss_round": round_weight,
             "loss_bbox": bbox_weight,
             "loss_giou": giou_weight
@@ -274,7 +276,7 @@ class FCCLIP(nn.Module):
                 aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
             weight_dict.update(aux_weight_dict)
 
-        losses = ["labels", "masks", "boxes"]
+        losses = ["labels", "masks", "semantic", "boxes"]
         if use_one2many_head:
             losses.append("rounds")
 
@@ -384,7 +386,8 @@ class FCCLIP(nn.Module):
             return losses
         else:
             mask_cls_results = outputs["pred_logits"]
-            mask_pred_results = outputs["pred_masks"]
+            mask_pred_results = outputs["pred_panoptic_masks"]
+            mask_sem_results = outputs.get("pred_semantic_masks")
             mask_box_results = outputs.get("pred_boxes")
             mask_round_results = outputs.get("pred_round")
 
@@ -463,6 +466,13 @@ class FCCLIP(nn.Module):
                 mode="bilinear",
                 align_corners=False,
             )
+            if mask_sem_results is not None:
+                mask_sem_results = F.interpolate(
+                    mask_sem_results,
+                    size=(images.tensor.shape[-2], images.tensor.shape[-1]),
+                    mode="bilinear",
+                    align_corners=False,
+                )
 
             del outputs
 
@@ -471,10 +481,12 @@ class FCCLIP(nn.Module):
                 mask_box_results = [None] * len(batched_inputs)
             if mask_round_results is None:
                 mask_round_results = [None] * len(batched_inputs)
+            if mask_sem_results is None:
+                mask_sem_results = [None] * len(batched_inputs)
 
             processed_results = []
-            for mask_cls_result, mask_pred_result, mask_box_result, mask_round_result, input_per_image, image_size in zip(
-                mask_cls_results, mask_pred_results, mask_box_results, mask_round_results, batched_inputs, images.image_sizes
+            for mask_cls_result, mask_pred_result, mask_sem_result, mask_box_result, mask_round_result, input_per_image, image_size in zip(
+                mask_cls_results, mask_pred_results, mask_sem_results, mask_box_results, mask_round_results, batched_inputs, images.image_sizes
             ):
                 height = input_per_image.get("height", image_size[0])
                 width = input_per_image.get("width", image_size[1])
@@ -488,7 +500,10 @@ class FCCLIP(nn.Module):
 
                 # semantic segmentation inference
                 if self.semantic_on:
-                    r = retry_if_cuda_oom(self.semantic_inference)(mask_cls_result, mask_pred_result)
+                    if mask_sem_result is not None:
+                        r = retry_if_cuda_oom(self.semantic_inference)(mask_cls_result, mask_pred_result)
+                    else:
+                        r = mask_sem_result
                     if not self.sem_seg_postprocess_before_inference:
                         r = retry_if_cuda_oom(sem_seg_postprocess)(r, image_size, height, width)
                     processed_results[-1]["sem_seg"] = r

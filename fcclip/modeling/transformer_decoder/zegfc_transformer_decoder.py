@@ -767,7 +767,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
 
         out = {
             'pred_logits': predictions_class[-1],
-            'pred_masks': predictions_mask[-1],
+            'pred_panoptic_masks': predictions_mask[-1],
             'pred_boxes': predictions_bbox[-1],
             'pred_round': predictions_round[-1],
             'aux_outputs': self._set_aux_loss(
@@ -873,11 +873,11 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         # as a dict having both a Tensor and a list.
         if self.mask_classification:
             return [
-                {"pred_logits": a, "pred_masks": b, "pred_boxes": c, "pred_round": d}
+                {"pred_logits": a, "pred_panoptic_masks": b, "pred_boxes": c, "pred_round": d}
                 for a, b, c, d in zip(outputs_class[:-1], outputs_seg_masks[:-1], outputs_bboxes[:-1], outputs_round[:-1])
             ]
         else:
             return [
-                {"pred_masks": b, "pred_boxes": c, "pred_round": d}
+                {"pred_panoptic_masks": b, "pred_boxes": c, "pred_round": d}
                 for b, c, d in zip(outputs_seg_masks[:-1], outputs_bboxes[:-1], outputs_round[:-1])
             ]
