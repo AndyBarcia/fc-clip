@@ -55,7 +55,6 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
         *,
         hidden_dim: int,
         num_panoptic_queries: int,
-        num_semantic_queries: int,
         nheads: int,
         dim_feedforward: int,
         dec_layers: int,
@@ -84,7 +83,6 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
             mask_classification: whether to add mask classifier or not
             hidden_dim: Transformer feature dimension
             num_panoptic_queries: number of panoptic queries
-            num_semantic_queries: number of semantic queries
             nheads: number of heads
             dim_feedforward: feature dimension in feedforward network
             enc_layers: number of Transformer encoder layers
@@ -127,6 +125,7 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
         self.num_layers = dec_layers
         self.transformer_self_attention_layers = nn.ModuleList()
         self.transformer_cross_attention_layers = nn.ModuleList()
+        self.transformer_semantic_cross_attention_layers = nn.ModuleList()
         self.transformer_text_cross_attention_layers = nn.ModuleList()
         self.transformer_ffn_layers = nn.ModuleList()
 
@@ -148,7 +147,7 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
                 )
             )
 
-            self.transformer_cross_attention_layers.append(
+            cross_attn_layer = (
                 CrossAttentionLayer(
                     d_model=hidden_dim,
                     nhead=nheads,
@@ -194,6 +193,55 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
                 )
                 if "slot"in self.cross_attn_type else None
             )
+            self.transformer_cross_attention_layers.append(cross_attn_layer)
+            
+            semantic_cross_attn_layer = (
+                CrossAttentionLayer(
+                    d_model=hidden_dim,
+                    nhead=nheads,
+                    dropout=0.0,
+                    normalize_before=pre_norm,
+                )
+                if self.cross_attn_type == "standard" else
+                PosMLPAttention(
+                    dim=hidden_dim,
+                    hidden_dim=16,
+                    n_heads=nheads,
+                    batched_rpb=(self.cross_attn_type == "pos_mlp_brpb"),
+                    dropout=0.0,
+                    normalize_before=pre_norm
+                ) 
+                if "rpb" in self.cross_attn_type else
+                PosPairGaussianAttention(
+                    dim=hidden_dim,
+                    n_heads=nheads,
+                    dropout=0.0,
+                    normalize_before=pre_norm,
+                    learned_scale=("learned_scale" in self.cross_attn_type),
+                    normalize=("normalize" in self.cross_attn_type),
+                    only_gaussian_logits=("only_gaussian_logits" in self.cross_attn_type),
+                    forced_multiscale=("forced_multiscale" in self.cross_attn_type),
+                )
+                if "pair_gaussian" in self.cross_attn_type else
+                PosGaussianAttention(
+                    dim=hidden_dim,
+                    n_heads=nheads,
+                    dropout=0.0,
+                    normalize_before=pre_norm,
+                    learned_scale=("learned_scale" in self.cross_attn_type),
+                    normalize=("normalize" in self.cross_attn_type),
+                    only_gaussian_logits=("only_gaussian_logits" in self.cross_attn_type),
+                )
+                if "gaussian" in self.cross_attn_type else
+                SlotCrossAttention(
+                    dim=hidden_dim,
+                    n_heads=nheads,
+                    dropout=0.0,
+                    normalize_before=pre_norm,
+                )
+                if "slot"in self.cross_attn_type else None
+            )
+            self.transformer_semantic_cross_attention_layers.append(semantic_cross_attn_layer)
 
             self.transformer_ffn_layers.append(
                 FFNLayer(
@@ -207,7 +255,6 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
         self.decoder_norm = nn.LayerNorm(hidden_dim)
 
         self.num_panoptic_queries = num_panoptic_queries
-        self.num_semantic_queries = num_semantic_queries
         self.panoptic_query_init_type = panoptic_query_init_type
 
         # Initialization for panoptic queries' features and positional embeddings
@@ -291,7 +338,6 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
         
         ret["hidden_dim"] = cfg.MODEL.MASK_FORMER.HIDDEN_DIM
         ret["num_panoptic_queries"] = cfg.MODEL.MASK_FORMER.NUM_OBJECT_QUERIES
-        ret["num_semantic_queries"] = cfg.MODEL.MASK_FORMER.NUM_SEMANTIC_QUERIES
         # Transformer parameters:
         ret["nheads"] = cfg.MODEL.MASK_FORMER.NHEADS
         ret["dim_feedforward"] = cfg.MODEL.MASK_FORMER.DIM_FEEDFORWARD
@@ -353,31 +399,29 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
             panoptic_query_feat = self.panoptic_query_feat_mean + feat_std * torch.randn_like(self.panoptic_query_feat_mean)
             embed_std = torch.exp(self.panoptic_query_embed_log_std)
             panoptic_query_embed = self.panoptic_query_embed_mean + embed_std * torch.randn_like(self.panoptic_query_embed_mean)
-
-        output = panoptic_query_feat.unsqueeze(1).repeat(1, bs, 1)
-        query_embed = panoptic_query_embed.unsqueeze(1).repeat(1, bs, 1)
+        panoptic_query_feat = panoptic_query_feat.unsqueeze(1).repeat(1, bs, 1)
+        panoptic_query_embed = panoptic_query_embed.unsqueeze(1).repeat(1, bs, 1)
         
         # Initialize and append semantic queries
-        if semantic_text_embeddings is not None and self.num_semantic_queries > 0:
-            if semantic_text_embeddings.dim() == 3:  # Batched input: (B, T, C)
-                semantic_query_feat = self.semantic_query_feat_proj(semantic_text_embeddings).permute(1, 0, 2)
-                semantic_query_embed = self.semantic_query_embed_proj(semantic_text_embeddings).permute(1, 0, 2)
-            else:  # Unbatched input: (T, C), expand to batch size
-                semantic_query_feat = self.semantic_query_feat_proj(semantic_text_embeddings).unsqueeze(1).repeat(1, bs, 1)
-                semantic_query_embed = self.semantic_query_embed_proj(semantic_text_embeddings).unsqueeze(1).repeat(1, bs, 1)
-            output = torch.cat([output, semantic_query_feat], dim=0)
-            query_embed = torch.cat([query_embed, semantic_query_embed], dim=0)
+        num_semantic_queries = semantic_text_embeddings.shape[-2] # T
+        if semantic_text_embeddings.dim() == 3:
+            # Batched input: (B, T, C)
+            semantic_query_feat = self.semantic_query_feat_proj(semantic_text_embeddings).permute(1, 0, 2)
+            semantic_query_embed = self.semantic_query_embed_proj(semantic_text_embeddings).permute(1, 0, 2)
+        else:  
+            # Unbatched input: (T, C), expand to batch size
+            semantic_query_feat = self.semantic_query_feat_proj(semantic_text_embeddings).unsqueeze(1).repeat(1, bs, 1)
+            semantic_query_embed = self.semantic_query_embed_proj(semantic_text_embeddings).unsqueeze(1).repeat(1, bs, 1)
+        
+        # Merge panoptic and semantic queries.
+        output = torch.cat([panoptic_query_feat, semantic_query_feat], dim=0)
+        query_embed = torch.cat([panoptic_query_embed, semantic_query_embed], dim=0)
 
-        # 3. Initialize bounding boxes
+        # Initialize bounding boxes for panoptic queries
         query_bbox_unsigmoid = None
         if self._bbox_embed is not None:
             # Bbox for panoptic queries are learned
             panoptic_query_bbox_unsigmoid = self.query_bbox.weight.unsqueeze(1).repeat(1, bs, 1)
-            # Bbox for semantic queries are initialized to zeros
-            semantic_query_bbox_unsigmoid = torch.zeros(
-                self.num_semantic_queries, bs, 4, device=output.device, dtype=output.dtype
-            )
-            query_bbox_unsigmoid = torch.cat([panoptic_query_bbox_unsigmoid, semantic_query_bbox_unsigmoid], dim=0)
         
         predictions_class = []
         predictions_panoptic_mask = []
@@ -386,12 +430,20 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
         predictions_round = []
 
         # prediction heads on learnable query features
-        outputs_class, outputs_panoptic_mask, outputs_semantic_mask, output_box, outputs_round, updated_query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
+        (
+            outputs_class, 
+            outputs_panoptic_mask, 
+            outputs_semantic_mask, 
+            output_box, 
+            outputs_round, 
+            panoptic_query_bbox_unsigmoid, 
+            attn_mask
+        ) = self.forward_prediction_heads(
             output=output, 
             mask_features=mask_features, 
             mem_attn_logits=None,
             text_attn_logits=None,
-            query_bbox_unsigmoid=query_bbox_unsigmoid,
+            panoptic_query_bbox_unsigmoid=panoptic_query_bbox_unsigmoid,
             attn_mask_size=size_list[0],
             attn_mask_target_size=size_list[0],
             text_classifier=text_classifier, 
@@ -403,47 +455,78 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
         predictions_bbox.append(output_box)
         predictions_round.append(outputs_round)
         
-        query_bbox_unsigmoid = updated_query_bbox_unsigmoid
-
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
             attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
             
-            total_queries = self.num_panoptic_queries + self.num_semantic_queries
-            # attention: cross-attention first
-            output, mem_attn_logits = self.transformer_cross_attention_layers[i](
-                output.transpose(0,1), # (B,Q,C)
-                src[level_index].transpose(0,1).view(bs, size_list[level_index][0], size_list[level_index][1], -1), # (B,H,W,C)
-                attn_mask=attn_mask.view(bs, self.num_heads, total_queries, size_list[level_index][0], size_list[level_index][1]), # (B, num_heads, Q, H,W)
-                memory_pos_emb=pos[level_index].transpose(0,1).view(bs, size_list[level_index][0], size_list[level_index][1], -1), # (B,H,W,C), 
-                query_pos_emb=query_embed.transpose(0,1), # (B,Q,C)
-                pos=query_bbox_unsigmoid.sigmoid().transpose(0,1) if query_bbox_unsigmoid is not None else None, # (B,Q,[x,y,w,j])
+            total_queries = self.num_panoptic_queries + num_semantic_queries
+
+            # Split queries, positional embeddings, and bounding boxes for separate cross-attention
+            panoptic_queries_output = output[:self.num_panoptic_queries]
+            semantic_queries_output = output[self.num_panoptic_queries:]
+
+            panoptic_query_embed = query_embed[:self.num_panoptic_queries]
+            semantic_query_embed = query_embed[self.num_panoptic_queries:]
+
+            # Reshape and split the attention mask
+            reshaped_attn_mask = attn_mask.view(bs, self.num_heads, total_queries, size_list[level_index][0], size_list[level_index][1])
+            panoptic_attn_mask = reshaped_attn_mask[:, :, :self.num_panoptic_queries, :, :]
+            semantic_attn_mask = reshaped_attn_mask[:, :, self.num_panoptic_queries:, :, :]
+
+            # Panoptic Cross-Attention
+            panoptic_output, _ = self.transformer_cross_attention_layers[i](
+                panoptic_queries_output.transpose(0, 1),  # (B, Q_p, C)
+                src[level_index].transpose(0, 1).view(bs, size_list[level_index][0], size_list[level_index][1], -1),  # (B, H, W, C)
+                attn_mask=panoptic_attn_mask,  # (B, num_heads, Q_p, H, W)
+                memory_pos_emb=pos[level_index].transpose(0, 1).view(bs, size_list[level_index][0], size_list[level_index][1], -1),  # (B, H, W, C)
+                query_pos_emb=panoptic_query_embed.transpose(0, 1),  # (B, Q_p, C)
+                pos=panoptic_query_bbox_unsigmoid.sigmoid().transpose(0, 1) if panoptic_query_bbox_unsigmoid is not None else None,  # (B, Q_p, [x,y,w,h])
+                return_attn_logits=False,  # Panoptic queries don't use memory attention logits
+            )
+            panoptic_output = panoptic_output.transpose(0, 1)  # (Q_p, B, C)
+
+            # Semantic Cross-Attention
+            # TODO Should we at least merge KV parameters of this?
+            semantic_output, mem_attn_logits = self.transformer_semantic_cross_attention_layers[i](
+                semantic_queries_output.transpose(0, 1),  # (B, Q_s, C)
+                src[level_index].transpose(0, 1).view(bs, size_list[level_index][0], size_list[level_index][1], -1),  # (B, H, W, C)
+                attn_mask=semantic_attn_mask,  # (B, num_heads, Q_s, H, W)
+                memory_pos_emb=pos[level_index].transpose(0, 1).view(bs, size_list[level_index][0], size_list[level_index][1], -1),  # (B, H, W, C)
+                query_pos_emb=semantic_query_embed.transpose(0, 1),  # (B, Q_s, C)
+                pos=None, # No bounding boxes for semantic
                 return_attn_logits=self.mem_attn_mask,
             )
-            output = output.transpose(0,1) # (Q,B,C)
-
-            # then, self-attention
+            semantic_output = semantic_output.transpose(0, 1)  # (Q_s, B, C)
+            output = torch.cat([panoptic_output, semantic_output], dim=0)
+            
+            # Then, self-attention
             output, self_attn_logits = self.transformer_self_attention_layers[i](
                 output.transpose(0,1), # (B,Q,C) 
                 pos_emb=query_embed.transpose(0,1), # # (B,Q,C) 
-                pos=query_bbox_unsigmoid.sigmoid().transpose(0,1) if query_bbox_unsigmoid is not None else None, # (B,Q,[x,y,w,j])
+                pos=None,
                 return_attn_logits=self.text_atnn_cls
             )
             output = output.transpose(0,1) # (Q,B,C)
             
-            # The text attention logits come from the self-attention between panoptic queries
-            # and semantic queries.
+            # The text attention logits come from the self-attention 
+            # between panoptic queries and semantic queries.
             if self.text_atnn_cls:
                 text_attn_logits = self_attn_logits[:,:self.num_panoptic_queries, self.num_panoptic_queries:]
             else:
                 text_attn_logits = None
 
             # FFN
-            output = self.transformer_ffn_layers[i](
-                output
-            )
+            output = self.transformer_ffn_layers[i](output)
 
-            outputs_class, outputs_panoptic_mask, outputs_semantic_mask, output_box, outputs_round, updated_query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
+            (
+                outputs_class, 
+                outputs_panoptic_mask, 
+                outputs_semantic_mask, 
+                output_box, 
+                outputs_round, 
+                panoptic_query_bbox_unsigmoid, 
+                attn_mask
+            ) = self.forward_prediction_heads(
                 output=output, 
                 mask_features=mask_features, 
                 mem_attn_logits=mem_attn_logits,
@@ -460,8 +543,6 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
             predictions_bbox.append(output_box)
             predictions_round.append(outputs_round)
             
-            query_bbox_unsigmoid = updated_query_bbox_unsigmoid
-
         assert len(predictions_class) == self.num_layers + 1
 
         out = {
@@ -487,7 +568,7 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
         mask_features, 
         mem_attn_logits,
         text_attn_logits,
-        query_bbox_unsigmoid,
+        panoptic_query_bbox_unsigmoid,
         attn_mask_size,
         attn_mask_target_size, 
         text_classifier, 
@@ -511,9 +592,9 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
         outputs_panoptic_mask = torch.einsum("bqc,bchw->bqhw", panoptic_mask_embed, mask_features)
         outputs_semantic_mask = torch.einsum("bqc,bchw->bqhw", semantic_mask_embed, mask_features)
 
-        if self.mem_attn_mask:
+        if self.mem_attn_mask and mem_attn_logits is not None:
             # Add attention logits of the semantic queries to the semantic masks, ZegCLIP-style.
-            mem_attn_logits = mem_attn_logits[:,self.num_panoptic_queries:].unflatten(-1, attn_mask_size) # [B, Q, H, W]
+            mem_attn_logits = mem_attn_logits.unflatten(-1, attn_mask_size) # [B, Q, H, W]
             mem_attn_logits = F.interpolate(
                 mem_attn_logits, 
                 size=mask_features.shape[-2:], 
@@ -523,9 +604,7 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
             outputs_semantic_mask = outputs_semantic_mask + mem_attn_logits
 
         # Do box regression if provided with look forward twice
-        if query_bbox_unsigmoid != None:
-            panoptic_query_bbox_unsigmoid = query_bbox_unsigmoid[:self.num_panoptic_queries]
-            
+        if panoptic_query_bbox_unsigmoid != None:            
             outputs_bbox, query_bbox_unsigmoid_detached = self._bbox_embed(
                 panoptic_output, 
                 panoptic_query_bbox_unsigmoid.transpose(0,1), 
@@ -534,11 +613,6 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
             )
             outputs_bbox = outputs_bbox.sigmoid()
             query_bbox_unsigmoid_detached = query_bbox_unsigmoid_detached.transpose(0,1)
-            
-            # semantic queries do not have box predictions, so we keep their bbox unsigmoid as is
-            query_bbox_unsigmoid_detached = torch.cat(
-                [query_bbox_unsigmoid_detached, query_bbox_unsigmoid[self.num_panoptic_queries:]], dim=0
-            )
         else:
             outputs_bbox, query_bbox_unsigmoid_detached = None, None
 
