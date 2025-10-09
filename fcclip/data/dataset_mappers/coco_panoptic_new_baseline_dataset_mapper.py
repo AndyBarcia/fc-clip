@@ -143,28 +143,52 @@ class COCOPanopticNewBaselineDatasetMapper:
 
             pan_seg_gt = rgb2id(pan_seg_gt)
 
-            instances = Instances(image_shape)
+            # Find the maximum ID to size the lookup array
+            max_id = max(segment_info["id"] for segment_info in segments_info)
+
+            # Create a lookup array for vectorized mapping
+            seg_id_to_seq_id = torch.zeros((max_id + 1,), dtype=pan_seg_gt.dtype)
+            seg_id_to_class_id = torch.zeros((max_id + 1, ), dtype=pan_seg_gt.dtype)
             classes = []
-            masks = []
-            for segment_info in segments_info:
-                class_id = segment_info["category_id"]
-                if not segment_info["iscrowd"]:
-                    classes.append(class_id)
-                    masks.append(pan_seg_gt == segment_info["id"])
+            for idx, segment_info in enumerate(segments_info):
+                if segment_info["iscrowd"]:
+                    continue
+                    
+                classes.append(segment_info["category_id"])
+                seg_id_to_seq_id[segment_info["id"]] = idx + 1
+                seg_id_to_class_id[segment_info["id"]] = segment_info["category_id"]
 
-            classes = np.array(classes)
-            instances.gt_classes = torch.tensor(classes, dtype=torch.int64)
-            if len(masks) == 0:
-                # Some image does not have annotation (all ignored)
-                instances.gt_masks = torch.zeros((0, pan_seg_gt.shape[-2], pan_seg_gt.shape[-1]))
-                instances.gt_boxes = Boxes(torch.zeros((0, 4)))
-            else:
-                masks = BitMasks(
-                    torch.stack([torch.from_numpy(np.ascontiguousarray(x.copy())) for x in masks])
-                )
-                instances.gt_masks = masks.tensor
-                instances.gt_boxes = masks.get_bounding_boxes()
+            # Apply the mapping in one vectorized operation
+            pan_seg_gt_sequential = seg_id_to_seq_id[pan_seg_gt] # (H,W)
+            sem_seg_gt = seg_id_to_class_id[pan_seg_gt] # (H,W)
+            gt_labels = torch.tensor(classes, dtype=torch.int64) # (GT)
+            
+            gt_boxes = [] # (GT,4)
+            for idx, segment_info in enumerate(segments_info):
+                if segment_info["iscrowd"]:
+                    continue
 
-            dataset_dict["instances"] = instances
+                mask = (pan_seg_gt_sequential == idx+1)
+                if not mask.any():
+                    gt_boxes.append([0, 0, 0, 0])
+                    continue
+                
+                H,W = pan_seg_gt_sequential.shape
+                ys, xs = np.where(mask)
+                x_min = int(xs.min()) / W
+                y_min = int(ys.min()) / H
+                x_max = int(xs.max()) / W
+                y_max = int(ys.max()) / H
+
+                # xyxy unnormalized format
+                gt_boxes.append([x_min, y_min, x_max, y_max])
+            gt_boxes = torch.tensor(gt_boxes)
+
+            dataset_dict["instances"] = {
+                "pan_seg": pan_seg_gt_sequential,
+                "sem_seg": sem_seg_gt,
+                "labels": gt_labels,
+                "boxes": gt_boxes
+            }
 
         return dataset_dict

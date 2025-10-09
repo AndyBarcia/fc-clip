@@ -261,9 +261,9 @@ class FCCLIP(nn.Module):
             "loss_ce": class_weight, 
             "loss_label_focal": class_focal_weight,
             "loss_mask": mask_weight, 
-            "loss_semantic_mask": mask_weight,
+            "loss_semantic_mask": mask_weight*10.0,
             "loss_dice": dice_weight,
-            "loss_semantic_dice": dice_weight,
+            "loss_semantic_dice": dice_weight*10.0,
             "loss_round": round_weight,
             "loss_bbox": bbox_weight,
             "loss_giou": giou_weight
@@ -369,7 +369,7 @@ class FCCLIP(nn.Module):
         if self.training:
             # mask classification target
             if "instances" in batched_inputs[0]:
-                gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
+                gt_instances = [x["instances"] for x in batched_inputs]
                 targets = self.prepare_targets(gt_instances, images)
             else:
                 targets = None
@@ -521,23 +521,12 @@ class FCCLIP(nn.Module):
             return processed_results
 
     def prepare_targets(self, targets, images):
-        h_pad, w_pad = images.tensor.shape[-2:]
-        new_targets = []
-        for targets_per_image in targets:
-            # pad gt
-            gt_masks = targets_per_image.gt_masks
-            padded_masks = torch.zeros((gt_masks.shape[0], h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
-            padded_masks[:, : gt_masks.shape[1], : gt_masks.shape[2]] = gt_masks
-            attributes = {
-                "labels": targets_per_image.gt_classes,
-                "masks": padded_masks,
-            }
-            if targets_per_image.has("gt_boxes"):
-                h, w = targets_per_image.image_size
-                image_size_xyxy = torch.as_tensor([w, h, w, h], dtype=torch.float, device=self.device)
-                attributes["boxes"] = box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor)/image_size_xyxy
-            new_targets.append(attributes)
-        return new_targets
+        return {
+            "pan_seg": torch.stack([x["pan_seg"] for x in targets], dim=0).to(self.device), # (B,H,W)
+            "sem_seg": torch.stack([x["sem_seg"] for x in targets], dim=0).to(self.device), # (B,H,W)
+            "labels": [x["labels"].to(self.device) for x in targets], # [(GT,)]
+            "boxes": [x["boxes"].to(self.device) for x in targets], # [(GT,)]
+        }
 
     def semantic_inference(self, mask_cls, mask_pred):
         mask_cls = F.softmax(mask_cls, dim=-1)[..., :-1]

@@ -116,72 +116,102 @@ class MaskPooling(nn.Module):
         return mask_pooled_x
 
 class SelfAttentionLayer(nn.Module):
-
     def __init__(self, d_model, nhead, dropout=0.0,
                  activation="relu", normalize_before=False):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
-
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
-
         self.activation = _get_activation_fn(activation)
         self.normalize_before = normalize_before
-
         self._reset_parameters()
-    
+
     def _reset_parameters(self):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def with_pos_embed(self, tensor, pos: Optional[Tensor]):
+    def with_pos_embed(self, tensor, pos: Optional[torch.Tensor]):
         return tensor if pos is None else tensor + pos
 
+    def _compute_attn_logits(self, q, k):
+        # Project queries and keys
+        if self.self_attn._qkv_same_embed_dim:
+            w_q, w_k, _ = self.self_attn.in_proj_weight.chunk(3, dim=0)
+            b_q, b_k, _ = self.self_attn.in_proj_bias.chunk(3)
+        else:
+            w_q = self.self_attn.q_proj_weight
+            w_k = self.self_attn.k_proj_weight
+            b_q = self.self_attn.in_proj_bias[:self.self_attn.embed_dim] if self.self_attn.in_proj_bias is not None else None
+            b_k = self.self_attn.in_proj_bias[self.self_attn.embed_dim:2*self.self_attn.embed_dim] if self.self_attn.in_proj_bias is not None else None
+
+        q = F.linear(q, w_q, b_q)
+        k = F.linear(k, w_k, b_k)
+
+        # Prepare dimensions
+        tgt_len, bsz, embed_dim = q.size()
+        head_dim = embed_dim // self.self_attn.num_heads
+        
+        # Reshape queries and keys
+        q = q.contiguous().view(tgt_len, bsz, self.self_attn.num_heads, head_dim)
+        k = k.contiguous().view(k.size(0), bsz, self.self_attn.num_heads, head_dim)
+        
+        # Compute scaled dot-product attention logits
+        attn_logits = torch.einsum('ibhd,jbhd->bij', q, k) / math.sqrt(head_dim)
+        return attn_logits  # Shape: [bsz, tgt_len, src_len]
+
     def forward_post(self, tgt,
-                     tgt_mask: Optional[Tensor] = None,
-                     tgt_key_padding_mask: Optional[Tensor] = None,
-                     query_pos: Optional[Tensor] = None):
+                     tgt_mask: Optional[torch.Tensor] = None,
+                     tgt_key_padding_mask: Optional[torch.Tensor] = None,
+                     query_pos: Optional[torch.Tensor] = None,
+                     return_attn_logits: bool = False):
         q = k = self.with_pos_embed(tgt, query_pos)
+        
+        attn_logits = None
+        if return_attn_logits:
+            attn_logits = self._compute_attn_logits(q, k)
+
         tgt2 = self.self_attn(q, k, value=tgt, attn_mask=tgt_mask,
                               key_padding_mask=tgt_key_padding_mask)[0]
         tgt = tgt + self.dropout(tgt2)
         tgt = self.norm(tgt)
-
-        return tgt
+        return tgt, attn_logits
 
     def forward_pre(self, tgt,
-                    tgt_mask: Optional[Tensor] = None,
-                    tgt_key_padding_mask: Optional[Tensor] = None,
-                    query_pos: Optional[Tensor] = None):
+                    tgt_mask: Optional[torch.Tensor] = None,
+                    tgt_key_padding_mask: Optional[torch.Tensor] = None,
+                    query_pos: Optional[torch.Tensor] = None,
+                    return_attn_logits: bool = False):
         tgt2 = self.norm(tgt)
         q = k = self.with_pos_embed(tgt2, query_pos)
+
+        attn_logits = None
+        if return_attn_logits:
+            attn_logits = self._compute_attn_logits(q, k)
+
         tgt2 = self.self_attn(q, k, value=tgt2, attn_mask=tgt_mask,
                               key_padding_mask=tgt_key_padding_mask)[0]
         tgt = tgt + self.dropout(tgt2)
-        
-        return tgt
+        return tgt, attn_logits
 
-    def forward(
-        self, 
-        tgt, # (B,Q,C) 
-        tgt_mask: Optional[Tensor] = None,
-        tgt_key_padding_mask: Optional[Tensor] = None,
-        pos_emb: Optional[Tensor] = None, # (B,Q,C) 
-        pos: Optional[Tensor] = None
-    ):
-        tgt = tgt.transpose(0,1) # (Q,B,C) 
-        pos_emb = pos_emb.transpose(0,1) # (Q,B,C) 
+    def forward(self, tgt,
+                tgt_mask: Optional[torch.Tensor] = None,
+                tgt_key_padding_mask: Optional[torch.Tensor] = None,
+                pos_emb: Optional[torch.Tensor] = None,
+                return_attn_logits: bool = False,
+                pos: Optional[torch.Tensor] = None):
+        tgt = tgt.transpose(0, 1)
+        if pos_emb is not None:
+            pos_emb = pos_emb.transpose(0, 1)
 
         if self.normalize_before:
-            output = self.forward_pre(tgt, tgt_mask,
-                                    tgt_key_padding_mask, pos_emb)
+            output, attn_logits = self.forward_pre(tgt, tgt_mask,
+                                                   tgt_key_padding_mask, pos_emb, return_attn_logits)
         else:
-            output = self.forward_post(tgt, tgt_mask,
-                                 tgt_key_padding_mask, pos_emb)
+            output, attn_logits = self.forward_post(tgt, tgt_mask,
+                                                    tgt_key_padding_mask, pos_emb, return_attn_logits)
 
-        return output.transpose(0,1), None # (B,Q,C) 
-
+        return output.transpose(0, 1), attn_logits
 
 class CrossAttentionLayer(nn.Module):
     def __init__(self, d_model, nhead, dropout=0.0,
@@ -734,7 +764,7 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
 
         out = {
             'pred_logits': predictions_class[-1],
-            'pred_masks': predictions_mask[-1],
+            'pred_panoptic_masks': predictions_mask[-1],
             'aux_outputs': self._set_aux_loss(
                 predictions_class if self.mask_classification else None, predictions_mask
             )
@@ -774,8 +804,8 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         # as a dict having both a Tensor and a list.
         if self.mask_classification:
             return [
-                {"pred_logits": a, "pred_masks": b}
+                {"pred_logits": a, "pred_panoptic_masks": b}
                 for a, b in zip(outputs_class[:-1], outputs_seg_masks[:-1])
             ]
         else:
-            return [{"pred_masks": b} for b in outputs_seg_masks[:-1]]
+            return [{"pred_panoptic_masks": b} for b in outputs_seg_masks[:-1]]

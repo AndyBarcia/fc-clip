@@ -15,6 +15,7 @@ from torch.cuda.amp import autocast
 
 from detectron2.projects.point_rend.point_features import point_sample
 
+from mask_loss.functions import hungarian_matching
 
 def batch_dice_loss(inputs: torch.Tensor, targets: torch.Tensor):
     """
@@ -114,7 +115,6 @@ class HungarianMatcher(nn.Module):
         bs, num_queries = outputs["pred_logits"].shape[:2]
 
         one_to_one_indices = []
-        one_to_many_indices = []
 
         # Iterate through batch size
         for b in range(bs):
@@ -135,7 +135,7 @@ class HungarianMatcher(nn.Module):
                 else:
                     cost_class = -out_prob[:, tgt_ids]
 
-                out_mask = outputs["pred_masks"][b]  # [num_queries, H_pred, W_pred]
+                out_mask = outputs["pred_panoptic_masks"][b]  # [num_queries, H_pred, W_pred]
                 tgt_mask = targets[b]["masks"].to(out_mask)
 
                 out_mask = out_mask[:, None]

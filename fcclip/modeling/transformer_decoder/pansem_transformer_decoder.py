@@ -65,9 +65,7 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
         box_reg_type: str = "none",
         cross_attn_type: str = "standard",
         self_attn_type: str = "standard",
-        mask_pos_mlp_type: str = "none",
         enforce_input_project: bool,
-        attn_conv_kernel_size: Optional[int] = 3,
         text_atnn_cls: bool,
         mem_attn_mask: bool,
         clip_embedding_dim: int,
@@ -241,6 +239,9 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
                 )
                 if "slot"in self.cross_attn_type else None
             )
+
+            # Add option so that parameters are shared.
+
             self.transformer_semantic_cross_attention_layers.append(semantic_cross_attn_layer)
 
             self.transformer_ffn_layers.append(
@@ -358,18 +359,16 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
         ret["clip_embedding_dim"] = cfg.MODEL.FC_CLIP.EMBED_DIM
         ret["mask_embed_type"] = cfg.MODEL.ZEG_FC.MASK_EMBED_TYPE
         ret["class_embed_type"] = cfg.MODEL.ZEG_FC.CLASS_EMBED_TYPE
-        ret["attn_conv_kernel_size"] = cfg.MODEL.ZEG_FC.ATTN_CONV_KERNEL_SIZE
         ret["box_reg_type"] = cfg.MODEL.ZEG_FC.BOX_REGRESSION_TYPE
         ret["cross_attn_type"] = cfg.MODEL.ZEG_FC.CROSS_ATTN_TYPE
         ret["self_attn_type"] = cfg.MODEL.ZEG_FC.SELF_ATTN_TYPE
-        ret["mask_pos_mlp_type"] = cfg.MODEL.ZEG_FC.MASK_POS_MLP_TYPE
         ret["num_transformer_out_features"] = cfg.MODEL.SEM_SEG_HEAD.DEFORMABLE_TRANSFORMER_ENCODER_OUT_FEATURES
         ret["use_nel_loss"] = cfg.MODEL.FC_CLIP.USE_NEL_COST
         ret["use_one2many_head"] = cfg.MODEL.ZEG_FC.USE_ONE2MANY_HEAD
         ret["panoptic_query_init_type"] = cfg.MODEL.ZEG_FC.QUERY_INIT_TYPE
         return ret
 
-    def forward(self, x, mask_features, mask = None, text_classifier=None, semantic_text_embeddings=None, num_templates=None):
+    def forward(self, x, mask_features, mask = None, text_classifier=None, num_templates=None):
         # x is a list of multi-scale feature
         assert len(x) == self.num_feature_levels
         src = []
@@ -403,22 +402,21 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
         panoptic_query_embed = panoptic_query_embed.unsqueeze(1).repeat(1, bs, 1)
         
         # Initialize and append semantic queries
-        num_semantic_queries = semantic_text_embeddings.shape[-2] # T
-        if semantic_text_embeddings.dim() == 3:
+        num_semantic_queries = text_classifier.shape[-2] # T
+        if text_classifier.dim() == 3:
             # Batched input: (B, T, C)
-            semantic_query_feat = self.semantic_query_feat_proj(semantic_text_embeddings).permute(1, 0, 2)
-            semantic_query_embed = self.semantic_query_embed_proj(semantic_text_embeddings).permute(1, 0, 2)
+            semantic_query_feat = self.semantic_query_feat_proj(text_classifier).permute(1, 0, 2)
+            semantic_query_embed = self.semantic_query_embed_proj(text_classifier).permute(1, 0, 2)
         else:  
             # Unbatched input: (T, C), expand to batch size
-            semantic_query_feat = self.semantic_query_feat_proj(semantic_text_embeddings).unsqueeze(1).repeat(1, bs, 1)
-            semantic_query_embed = self.semantic_query_embed_proj(semantic_text_embeddings).unsqueeze(1).repeat(1, bs, 1)
+            semantic_query_feat = self.semantic_query_feat_proj(text_classifier).unsqueeze(1).repeat(1, bs, 1)
+            semantic_query_embed = self.semantic_query_embed_proj(text_classifier).unsqueeze(1).repeat(1, bs, 1)
         
         # Merge panoptic and semantic queries.
         output = torch.cat([panoptic_query_feat, semantic_query_feat], dim=0)
         query_embed = torch.cat([panoptic_query_embed, semantic_query_embed], dim=0)
 
         # Initialize bounding boxes for panoptic queries
-        query_bbox_unsigmoid = None
         if self._bbox_embed is not None:
             # Bbox for panoptic queries are learned
             panoptic_query_bbox_unsigmoid = self.query_bbox.weight.unsqueeze(1).repeat(1, bs, 1)
@@ -531,7 +529,7 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
                 mask_features=mask_features, 
                 mem_attn_logits=mem_attn_logits,
                 text_attn_logits=text_attn_logits,
-                query_bbox_unsigmoid=query_bbox_unsigmoid,
+                panoptic_query_bbox_unsigmoid=panoptic_query_bbox_unsigmoid,
                 attn_mask_size=size_list[i % self.num_feature_levels],
                 attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels],
                 text_classifier=text_classifier, 
@@ -603,6 +601,18 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
             )            
             outputs_semantic_mask = outputs_semantic_mask + mem_attn_logits
 
+        # Max ensembling of semantic map over templates
+        final_outputs_semantic_mask = []
+        cur_idx = 0
+        # Process each group of templates for non-void classes
+        for num_t in num_templates:
+            # Slice current template group and take max
+            group_logits = outputs_semantic_mask[:, cur_idx:cur_idx + num_t]
+            final_outputs_semantic_mask.append(group_logits.max(1).values)
+            cur_idx += num_t
+        # Stack along new class dimension
+        ensemble_semantic_mask = torch.stack(final_outputs_semantic_mask, dim=1)
+
         # Do box regression if provided with look forward twice
         if panoptic_query_bbox_unsigmoid != None:            
             outputs_bbox, query_bbox_unsigmoid_detached = self._bbox_embed(
@@ -639,7 +649,7 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
         attn_mask = (attn_mask.sigmoid().flatten(2).unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0, 1) < 0.5).bool()
         attn_mask = attn_mask.detach()
 
-        return outputs_class, outputs_panoptic_mask, outputs_semantic_mask, outputs_bbox, outputs_round, query_bbox_unsigmoid_detached, attn_mask
+        return outputs_class, outputs_panoptic_mask, ensemble_semantic_mask, outputs_bbox, outputs_round, query_bbox_unsigmoid_detached, attn_mask
 
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_panoptic_masks, outputs_semantic_masks, outputs_bboxes, outputs_round):
