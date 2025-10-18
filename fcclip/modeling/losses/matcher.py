@@ -15,8 +15,6 @@ from torch.cuda.amp import autocast
 
 from detectron2.projects.point_rend.point_features import point_sample
 
-from mask_loss.functions import hungarian_matching
-
 def batch_dice_loss(inputs: torch.Tensor, targets: torch.Tensor):
     """
     Compute the DICE loss, similar to generalized IOU for masks
@@ -83,6 +81,7 @@ class HungarianMatcher(nn.Module):
     def __init__(
         self, 
         cost_class: float = 1, 
+        cost_objectness: float = 1,
         cost_mask: float = 1, 
         cost_dice: float = 1, 
         num_points: int = 0,
@@ -99,6 +98,7 @@ class HungarianMatcher(nn.Module):
         """
         super().__init__()
         self.cost_class = cost_class
+        self.cost_objectness = cost_objectness
         self.cost_mask = cost_mask
         self.cost_dice = cost_dice
         self.use_nel_cost = use_nel_cost
@@ -112,28 +112,45 @@ class HungarianMatcher(nn.Module):
     @torch.no_grad()
     def memory_efficient_forward(self, outputs, targets):
         """More memory-friendly matching"""
-        bs, num_queries = outputs["pred_logits"].shape[:2]
+        bs, num_queries = outputs["pred_panoptic_masks"].shape[:2]
 
         one_to_one_indices = []
 
         # Iterate through batch size
         for b in range(bs):
             
-            if self.use_nel_cost:
+            # TODO we are missing something? What if we add the objectness to the cost?
+            # This way we basically reinforce queries that the model is more confident about 
+            # even if the masks were not that good.
+
+            if "pred_logits" in outputs and self.use_nel_cost:
                 out_prob = outputs["pred_logits"][b].sigmoid()  # [num_queries, num_classes]
-            else:
+            elif "pred_logits" in outputs:
                 out_prob = outputs["pred_logits"][b].softmax(-1)  # [num_queries, num_classes]
+            else:
+                out_prob = None
+
             tgt_ids = targets[b]["labels"]
 
             if tgt_ids.numel() > 0:                
                 # Compute the classification cost.
-                if self.use_nel_cost:
+                if "pred_logits" in outputs and self.use_nel_cost:
                     # focal loss
                     neg_cost_class = (1 - self.focal_alpha) * (out_prob ** self.focal_gamma) * (-(1 - out_prob + 1e-8).log())
                     pos_cost_class = self.focal_alpha * ((1 - out_prob) ** self.focal_gamma) * (-(out_prob + 1e-8).log())
                     cost_class = pos_cost_class[:, tgt_ids] - neg_cost_class[:, tgt_ids]
-                else:
+                elif "pred_logits" in outputs:
                     cost_class = -out_prob[:, tgt_ids]
+                else:
+                    cost_class = 0
+                
+                """
+                if "pred_objectness" in outputs:
+                    out_objectness = outputs["pred_objectness"][b].sigmoid()  # [num_queries, 1]
+                    cost_objectness = -out_objectness.repeat(1, len(tgt_ids))
+                else:
+                    cost_objectness = 0
+                """
 
                 out_mask = outputs["pred_panoptic_masks"][b]  # [num_queries, H_pred, W_pred]
                 tgt_mask = targets[b]["masks"].to(out_mask)
@@ -170,6 +187,7 @@ class HungarianMatcher(nn.Module):
                 C = (
                     self.cost_mask * cost_mask
                     + self.cost_class * cost_class
+                    #+ self.cost_objectness * cost_objectness
                     + self.cost_dice * cost_dice
                 )
             else:
@@ -177,7 +195,7 @@ class HungarianMatcher(nn.Module):
                 # We create an empty cost matrix. The shape [num_queries, 0] is
                 # important. linear_sum_assignment will correctly handle this
                 # by returning empty indices, which is the desired behavior.
-                C = torch.empty(num_queries, 0, device=out_prob.device)
+                C = torch.empty(num_queries, 0)
             C = C.reshape(num_queries, -1).cpu()
             # Make sure the matrix contains no NaN values, or scipy fails 
             C = torch.nan_to_num(C, nan=0.0, posinf=1e+5, neginf=-1e+5)

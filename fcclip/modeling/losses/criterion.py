@@ -19,9 +19,10 @@ from detectron2.projects.point_rend.point_features import (
     point_sample,
 )
 
-from ..utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list
-from .transformer_decoder.box_regression import generalized_box_iou, box_cxcywh_to_xyxy
-
+from ...utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list
+from ..transformer_decoder.box_regression import generalized_box_iou, box_cxcywh_to_xyxy
+from .mask_loss.functions.sigmoid_ce import SigmoidCELossFunction
+from .mask_loss.functions.dice import DiceLossFunction
 
 def dice_loss(
         inputs: torch.Tensor,
@@ -39,6 +40,7 @@ def dice_loss(
     """
     inputs = inputs.sigmoid()
     inputs = inputs.flatten(1)
+    targets = targets.flatten(1)
     numerator = 2 * (inputs * targets).sum(-1)
     denominator = inputs.sum(-1) + targets.sum(-1)
     loss = 1 - (numerator + 1) / (denominator + 1)
@@ -144,7 +146,7 @@ class SetCriterion(nn.Module):
         oversample_ratio,
         importance_sample_ratio,
         use_nel_loss: bool = False,
-        focal_alpha: float = 0.8,
+        focal_alpha: float = 0.25,
         focal_gamma: float = 2.0,
     ):
         """Create the criterion.
@@ -155,7 +157,6 @@ class SetCriterion(nn.Module):
             eos_coef: relative classification weight applied to the no-object category
             losses: list of all the losses to be applied. See get_loss for list of available losses.
             use_nel_loss: whether to use Non-mutually Exclusive Loss (NEL) instead of CE
-            nel_alpha / nel_beta / nel_gamma: weights and focal gamma for NEL
         """
         super().__init__()
         self.num_classes = num_classes
@@ -167,7 +168,7 @@ class SetCriterion(nn.Module):
         empty_weight[-1] = self.eos_coef
         self.register_buffer("empty_weight", empty_weight)
 
-        # NEL toggles / hyperparams
+        # loss toggles / hyperparams
         self.use_nel_loss = use_nel_loss
         self.focal_gamma = focal_gamma
         self.focal_alpha = focal_alpha
@@ -219,7 +220,29 @@ class SetCriterion(nn.Module):
         losses = {'loss_label_focal': loss_ce}
 
         return losses
-    
+
+    def loss_objectness(self, outputs, targets, indices, num_masks):
+        """Objectness loss (binary cross-entropy).
+        This loss encourages queries to predict 1 if they are matched to a target and 0 otherwise.
+        """
+        assert "pred_objectness" in outputs
+        src_logits = outputs["pred_objectness"]
+
+        B,Q = src_logits.shape[:2]
+        num_masks = float(B*Q)
+
+        idx = self._get_src_permutation_idx(indices)
+        
+        # Create a target tensor with 0s for background and 1s for matched objects
+        target_objectness = torch.zeros_like(src_logits, device=src_logits.device)
+        target_objectness[idx[0], idx[1], :] = 1.0
+        
+        # Compute binary cross-entropy loss
+        loss_obj = F.binary_cross_entropy_with_logits(src_logits, target_objectness, reduction="sum") / num_masks
+        
+        losses = {"loss_objectness": loss_obj}
+        return losses
+
     def loss_masks(self, outputs, targets, indices, num_masks):
         """Compute the losses related to the masks: the focal loss and the dice loss.
         targets dicts must contain the key "masks" containing a tensor of dim [nb_target_boxes, h, w]
@@ -283,10 +306,13 @@ class SetCriterion(nn.Module):
 
     def loss_semantic(self, outputs, targets, indices, num_masks):
         """
-        Compute pixel-wise sigmoid focal loss and dice loss for semantic segmentation.
+        Compute pixel-wise sigmoid cross-entropy and dice loss for semantic segmentation.
         """
         assert "pred_semantic_masks" in outputs
         src_logits = outputs["pred_semantic_masks"]
+        
+        B,C = src_logits.shape[:2]
+        num_masks = float(B*C)
 
         # Get the padded shape of the ground truth masks
         mask_shape = targets[0]["masks"].shape[-2:]
@@ -294,7 +320,7 @@ class SetCriterion(nn.Module):
         # Create a target tensor for semantic segmentation ground truth
         target_sem_idx = torch.full(
             (len(targets), *mask_shape),
-            self.num_classes,  # Use num_classes as the ignore_index for background
+            self.num_classes,
             dtype=torch.long,
             device=src_logits.device
         )
@@ -304,40 +330,12 @@ class SetCriterion(nn.Module):
             for mask, label in zip(T["masks"], T["labels"]):
                 target_sem_idx[i][mask] = label
 
-        # Upsample predictions to match the target size
-        src_logits = F.interpolate(
-            src_logits, size=target_sem_idx.shape[-2:], mode="bilinear", align_corners=False
-        )
-        
-        # Prepare one-hot target for Dice and Focal loss
-        # Shape: (B, C, H, W)
-        # The ignore index is handled correctly as it becomes a zero vector
-        target_sem_one_hot = F.one_hot(
-            target_sem_idx, num_classes=self.num_classes + 1
-        ).permute(0, 3, 1, 2)[:, :self.num_classes, :, :].to(src_logits.dtype)
-        
-        # Dice Loss
-        src_flat = src_logits.sigmoid().flatten(2)
-        target_flat = target_sem_one_hot.flatten(2)
-        loss_dice = dice_loss_jit(src_flat, target_flat, num_masks),
-
-        # Flatten and select only valid pixels (non-ignored)
-        valid_mask = (target_sem_idx != self.num_classes)
-        num_pixels = valid_mask.sum()
-
-        src_logits_flat = src_logits.permute(0, 2, 3, 1)[valid_mask]
-        target_sem_one_hot_flat = target_sem_one_hot.permute(0, 2, 3, 1)[valid_mask]
-
-        if num_pixels > 0:
-            loss_mask = sigmoid_focal_loss_jit(
-                src_logits_flat,
-                target_sem_one_hot_flat,
-                num_pixels,
-                alpha=self.focal_alpha,
-                gamma=self.focal_gamma
-            )
+        if num_masks > 0:
+            loss_mask = SigmoidCELossFunction.apply(src_logits, target_sem_idx, num_masks)
+            loss_dice = DiceLossFunction.apply(src_logits, target_sem_idx, 1.0, num_masks)
         else:
-            loss_mask = (src_logits_flat.sum() * 0.0)
+            loss_mask = (src_logits.sum() * 0.0)
+            loss_dice = (src_logits.sum() * 0.0)
 
         losses = {
             "loss_semantic_mask": loss_mask,
@@ -384,6 +382,7 @@ class SetCriterion(nn.Module):
     def get_loss(self, loss, outputs, targets, indices, num_masks):
         loss_map = {
             'labels': self.loss_labels_nel if self.use_nel_loss else self.loss_labels,
+            'objectness': self.loss_objectness,
             'masks': self.loss_masks,
             'boxes': self.loss_boxes,
             'semantic': self.loss_semantic,
@@ -418,6 +417,8 @@ class SetCriterion(nn.Module):
             # Skip losses for which the required predictions are not present
             if loss == 'semantic' and 'pred_semantic_masks' not in outputs:
                 continue
+            if loss == 'objectness' and 'pred_objectness' not in outputs:
+                continue
             losses.update(self.get_loss(loss, outputs, targets, indices, num_masks))
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
@@ -427,6 +428,8 @@ class SetCriterion(nn.Module):
                 for loss in self.losses:
                     # Skip losses for which the required predictions are not present in aux outputs
                     if loss == 'semantic' and 'pred_semantic_masks' not in aux_outputs:
+                        continue
+                    if loss == 'objectness' and 'pred_objectness' not in aux_outputs:
                         continue
                     if loss == 'boxes' and 'pred_boxes' not in aux_outputs:
                         continue

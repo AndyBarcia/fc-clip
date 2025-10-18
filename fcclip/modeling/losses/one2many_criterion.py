@@ -19,8 +19,8 @@ from detectron2.projects.point_rend.point_features import (
     point_sample,
 )
 
-from ..utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list
-from .transformer_decoder.box_regression import generalized_box_iou, box_cxcywh_to_xyxy
+from ...utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list
+from ..transformer_decoder.box_regression import generalized_box_iou, box_cxcywh_to_xyxy
 
 from .criterion import calculate_uncertainty
 

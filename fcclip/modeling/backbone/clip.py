@@ -156,11 +156,13 @@ class CLIP(Backbone):
         return out
 
     def visual_prediction_forward_convnext(self, x, masks):
-        batch, num_query, channel = x.shape
-        x = x.reshape(batch*num_query, channel, 1, 1) # fake 2D input
+        batch, channel, H, W = x.shape
+        x = x.view(batch, channel, H*W).permute(0, 2, 1) # (B,HW,C)
+        x = x.reshape(batch*H*W, channel, 1, 1) # fake 2D input
         x = self.clip_model.visual.trunk.head(x)
         x = self.clip_model.visual.head(x)
-        return x.view(batch, num_query, x.shape[-1]) # B x num_queries x 640
+        x = x.view(batch, H*W, -1).permute(0, 2, 1) # (B,C,HW)
+        return x.view(batch, -1, H, W) # B x num_queries x 640
 
     def visual_prediction_forward_resnet(self, x, masks):
         batch, channel, height, width = x.shape

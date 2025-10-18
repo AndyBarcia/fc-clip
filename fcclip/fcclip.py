@@ -20,10 +20,10 @@ from detectron2.modeling.postprocessing import sem_seg_postprocess
 from detectron2.structures import Boxes, ImageList, Instances, BitMasks
 from detectron2.utils.memory import retry_if_cuda_oom
 
-from .modeling.criterion import SetCriterion
-from .modeling.one2many_criterion import One2ManySetCriterion
-from .modeling.matcher import HungarianMatcher
-from .modeling.one2many_matcher import HungarianOne2ManyMatcher
+from .modeling.losses.criterion import SetCriterion
+from .modeling.losses.one2many_criterion import One2ManySetCriterion
+from .modeling.losses.matcher import HungarianMatcher
+from .modeling.losses.one2many_matcher import HungarianOne2ManyMatcher
 from .modeling.transformer_decoder.box_regression import box_xyxy_to_cxcywh, box_cxcywh_to_xyxy
 
 from .modeling.transformer_decoder.fcclip_transformer_decoder import MaskPooling, get_classification_logits
@@ -240,7 +240,9 @@ class FCCLIP(nn.Module):
         class_weight = cfg.MODEL.MASK_FORMER.CLASS_WEIGHT
         class_focal_weight = cfg.MODEL.MASK_FORMER.CLASS_FOCAL_WEIGHT
         dice_weight = cfg.MODEL.MASK_FORMER.DICE_WEIGHT
+        sem_dice_weight = cfg.MODEL.MASK_FORMER.SEM_DICE_WEIGHT
         mask_weight = cfg.MODEL.MASK_FORMER.MASK_WEIGHT
+        sem_mask_weight = cfg.MODEL.MASK_FORMER.SEM_MASK_WEIGHT
         bbox_weight = cfg.MODEL.MASK_FORMER.BBOX_WEIGHT
         giou_weight = cfg.MODEL.MASK_FORMER.GIOU_WEIGHT
         round_weight = cfg.MODEL.MASK_FORMER.ROUDN_WEIGHT
@@ -249,6 +251,7 @@ class FCCLIP(nn.Module):
         matcher_class = HungarianOne2ManyMatcher if use_one2many_head else HungarianMatcher
         matcher = matcher_class(
             cost_class=class_weight,
+            cost_objectness=class_weight,
             cost_mask=mask_weight,
             cost_dice=dice_weight,
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
@@ -259,11 +262,12 @@ class FCCLIP(nn.Module):
 
         weight_dict = {
             "loss_ce": class_weight, 
+            "loss_objectness": class_weight,
             "loss_label_focal": class_focal_weight,
             "loss_mask": mask_weight, 
-            "loss_semantic_mask": mask_weight*10.0,
+            "loss_semantic_mask": sem_mask_weight,
             "loss_dice": dice_weight,
-            "loss_semantic_dice": dice_weight*10.0,
+            "loss_semantic_dice": sem_dice_weight,
             "loss_round": round_weight,
             "loss_bbox": bbox_weight,
             "loss_giou": giou_weight
@@ -276,7 +280,7 @@ class FCCLIP(nn.Module):
                 aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
             weight_dict.update(aux_weight_dict)
 
-        losses = ["labels", "masks", "semantic", "boxes"]
+        losses = ["objectness", "masks", "semantic", "boxes"]
         if use_one2many_head:
             losses.append("rounds")
 
@@ -369,7 +373,7 @@ class FCCLIP(nn.Module):
         if self.training:
             # mask classification target
             if "instances" in batched_inputs[0]:
-                gt_instances = [x["instances"] for x in batched_inputs]
+                gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
                 targets = self.prepare_targets(gt_instances, images)
             else:
                 targets = None
@@ -385,79 +389,78 @@ class FCCLIP(nn.Module):
                     losses.pop(k)
             return losses
         else:
-            mask_cls_results = outputs["pred_logits"]
-            mask_pred_results = outputs["pred_panoptic_masks"]
+            mask_obj_results = outputs.get("pred_objectness")
+            mask_cls_results = outputs.get("pred_logits")
+            mask_pred_results = outputs.get("pred_panoptic_masks")
             mask_sem_results = outputs.get("pred_semantic_masks")
             mask_box_results = outputs.get("pred_boxes")
             mask_round_results = outputs.get("pred_round")
 
-            # We ensemble the pred logits of in-vocab and out-vocab
-            clip_feature = features["clip_vis_dense"]
-            mask_for_pooling = F.interpolate(mask_pred_results, size=clip_feature.shape[-2:],
-                                                mode='bilinear', align_corners=False)
-            if "convnext" in self.backbone.model_name.lower():
-                pooled_clip_feature = self.mask_pooling(clip_feature, mask_for_pooling)
-                pooled_clip_feature = self.backbone.visual_prediction_forward(pooled_clip_feature)
-            elif "rn" in self.backbone.model_name.lower():
-                pooled_clip_feature = self.backbone.visual_prediction_forward(clip_feature, mask_for_pooling)
-            elif "dinov3" in self.backbone.model_name.lower():
-                # DINOv3's final embedding is a concatenation of the processed [CLS] token
-                # and the mean-pooled processed patch tokens. Each part has half the dimension
-                # of the final embedding.
-                final_embed_dim = features["clip_embedding"].shape[-1]
-                part_dim = final_embed_dim // 2
-                class_token = features["clip_embedding"][:, :part_dim]
-                pooled_patch_tokens = self.mask_pooling(clip_feature, mask_for_pooling)
-                num_queries = pooled_patch_tokens.shape[1]
-                class_token_expanded = class_token.unsqueeze(1).expand(-1, num_queries, -1)                
-                pooled_clip_feature = torch.cat([class_token_expanded, pooled_patch_tokens], dim=-1)
-            else:
-                raise NotImplementedError
+            if False:
+                clip_feature = features["clip_vis_dense"]  # [B, D_clip_raw, Hc, Wc]
 
-            out_vocab_cls_results = get_classification_logits(
-                pooled_clip_feature, 
-                text_classifier, 
-                self.backbone.logit_scale, 
-                None, 
-                num_templates
-            )
-            in_vocab_cls_results = mask_cls_results[..., :-1] # remove void
-            out_vocab_cls_results = out_vocab_cls_results[..., :-1] # remove void
+                # Project dense features into CLIP embedding space (same head used for pooled features)
+                if "convnext" in self.backbone.model_name.lower():
+                    dense_proj = self.backbone.visual_prediction_forward(clip_feature)        # [B, D, Hc, Wc]
+                elif "rn" in self.backbone.model_name.lower():
+                    dense_proj = self.backbone.visual_prediction_forward(clip_feature)        # [B, D, Hc, Wc]
+                else:
+                    raise NotImplementedError
 
-            # Reference: https://github.com/NVlabs/ODISE/blob/main/odise/modeling/meta_arch/odise.py#L1506
-            out_vocab_cls_probs = out_vocab_cls_results.softmax(-1)
-            in_vocab_cls_results = in_vocab_cls_results.softmax(-1)
-            category_overlapping_mask = self.category_overlapping_mask.to(self.device)
+                # Normalize both sides for cosine-sim, then scale by CLIP logit_scale (like standard CLIP)
+                dense_proj = F.normalize(dense_proj, dim=1)                                   # [B, D, Hc, Wc]
+                text_cls   = F.normalize(text_classifier, dim=-1)                              # [C, D] (same order as mask_sem_results; last is void)
+                logit_scale = self.backbone.clip_model.logit_scale.exp()
 
-            if self.ensemble_on_valid_mask:
-                # Only include out_vocab cls results on masks with valid pixels
-                # We empirically find that this is important to obtain reasonable AP/mIOU score with ResNet CLIP models
-                valid_masking = (mask_for_pooling > 0).to(mask_for_pooling).sum(-1).sum(-1) > 0
-                valid_masking = valid_masking.to(in_vocab_cls_results.dtype).unsqueeze(-1)
-                alpha = torch.ones_like(in_vocab_cls_results) * self.geometric_ensemble_alpha
-                beta = torch.ones_like(in_vocab_cls_results) * self.geometric_ensemble_beta
-                alpha = alpha * valid_masking
-                beta = beta * valid_masking
-            else:
-                alpha = self.geometric_ensemble_alpha
-                beta = self.geometric_ensemble_beta
+                # Per-pixel class logits at CLIP stride, then upsample to semantic resolution
+                out_vocab_sem_results = logit_scale * torch.einsum("bdhw,kd->bkhw", dense_proj, text_cls)  # [B, C, Hc, Wc]
+                out_vocab_sem_results = F.interpolate(
+                    out_vocab_sem_results,
+                    size=mask_sem_results.shape[-2:], mode="bilinear", align_corners=False
+                )  # [B, C, H, W]
 
-            cls_logits_seen = (
-                (in_vocab_cls_results ** (1 - alpha) * out_vocab_cls_probs**alpha).log()
-                * category_overlapping_mask
-            )
-            cls_logits_unseen = (
-                (in_vocab_cls_results ** (1 - beta) * out_vocab_cls_probs**beta).log()
-                * (1 - category_overlapping_mask)
-            )
-            cls_results = cls_logits_seen + cls_logits_unseen
+                # Max ensembling over templates
+                final_pred_logits = []
+                cur_idx = 0
+                # Process each group of templates
+                for num_t in num_templates:
+                    # Slice current template group and take max
+                    group_logits = out_vocab_sem_results[:, cur_idx:cur_idx + num_t]
+                    final_pred_logits.append(group_logits.max(1).values)
+                    cur_idx += num_t
+                # Stack along new class dimension
+                out_vocab_sem_results = torch.stack(final_pred_logits, dim=1)
 
-            # This is used to filtering void predictions.
-            is_void_prob = F.softmax(mask_cls_results, dim=-1)[..., -1:]
-            mask_cls_probs = torch.cat([
-                cls_results.softmax(-1) * (1.0 - is_void_prob),
-                is_void_prob], dim=-1)
-            mask_cls_results = torch.log(mask_cls_probs + 1e-8)
+                # 2) Geometric ensemble with in-vocab per-pixel logits (mask_sem_results)
+                #    Follows your instance logic: seen uses alpha, unseen uses beta, and we carry through the in-vocab void prob.
+
+                # Convert to probabilities
+                in_probs_nv  = F.softmax(mask_sem_results,  dim=1).clamp_min(1e-8)
+                out_probs_nv = F.softmax(out_vocab_sem_results, dim=1).clamp_min(1e-8)
+
+                # Broadcastable seen/unseen mask over non-void classes
+                ov = self.category_overlapping_mask.to(self.device)
+                ov = ov.view(1, -1, 1, 1).to(in_probs_nv.dtype) if ov.dim() == 1 else ov.to(in_probs_nv.dtype)
+
+                # Optional valid-pixel gating (pixel-wise analogue of your instance valid-mask gating)
+                if self.ensemble_on_valid_mask:
+                    # Trust out-vocab only where the pixel isn't predicted as void by in-vocab argmax
+                    valid_masking = (mask_sem_results.argmax(dim=1, keepdim=True) != (mask_sem_results.shape[1] - 1)).to(in_probs_nv.dtype)
+                    alpha_map = torch.ones_like(in_probs_nv) * self.geometric_ensemble_alpha * valid_masking
+                    beta_map  = torch.ones_like(in_probs_nv) * self.geometric_ensemble_beta  * valid_masking
+                else:
+                    alpha_map = torch.ones_like(in_probs_nv) * self.geometric_ensemble_alpha
+                    beta_map  = torch.ones_like(in_probs_nv) * self.geometric_ensemble_beta
+
+                # Geometric mixing per pixel/class
+                seen_mix   = (in_probs_nv.pow(1.0 - alpha_map) * out_probs_nv.pow(alpha_map)).clamp_min(1e-8)
+                unseen_mix = (in_probs_nv.pow(1.0 - beta_map)  * out_probs_nv.pow(beta_map)).clamp_min(1e-8)
+
+                # Blend seen vs unseen, renormalize non-void, then reattach void like your original logic
+                cls_probs_nv = seen_mix * ov + unseen_mix * (1.0 - ov)                               # [B, C-1, H, W]
+                cls_probs_nv = cls_probs_nv / cls_probs_nv.sum(dim=1, keepdim=True).clamp_min(1e-8)  # safe normalize
+            
+                mask_sem_results = torch.log(cls_probs_nv.clamp_min(1e-8))  # final ensembled semantic logits
 
             # upsample masks
             mask_pred_results = F.interpolate(
@@ -483,25 +486,29 @@ class FCCLIP(nn.Module):
                 mask_round_results = [None] * len(batched_inputs)
             if mask_sem_results is None:
                 mask_sem_results = [None] * len(batched_inputs)
+            if mask_cls_results is None:
+                mask_cls_results = [None] * len(batched_inputs)
 
             processed_results = []
-            for mask_cls_result, mask_pred_result, mask_sem_result, mask_box_result, mask_round_result, input_per_image, image_size in zip(
-                mask_cls_results, mask_pred_results, mask_sem_results, mask_box_results, mask_round_results, batched_inputs, images.image_sizes
+            for mask_cls_result, mask_obj_result, mask_pred_result, mask_sem_result, mask_box_result, mask_round_result, input_per_image, image_size in zip(
+                mask_cls_results, mask_obj_results, mask_pred_results, mask_sem_results, mask_box_results, mask_round_results, batched_inputs, images.image_sizes
             ):
                 height = input_per_image.get("height", image_size[0])
                 width = input_per_image.get("width", image_size[1])
                 processed_results.append({})
 
                 if self.sem_seg_postprocess_before_inference:
+                    mask_sem_result = retry_if_cuda_oom(sem_seg_postprocess)(
+                        mask_sem_result, image_size, height, width
+                    ) if mask_sem_result is not None else None
                     mask_pred_result = retry_if_cuda_oom(sem_seg_postprocess)(
                         mask_pred_result, image_size, height, width
                     )
-                    mask_cls_result = mask_cls_result.to(mask_pred_result)
 
                 # semantic segmentation inference
                 if self.semantic_on:
                     if mask_sem_result is not None:
-                        r = retry_if_cuda_oom(self.semantic_inference)(mask_cls_result, mask_pred_result)
+                        r = retry_if_cuda_oom(self.semantic_inference)(mask_cls_result, mask_pred_result, mask_sem_result)
                     else:
                         r = mask_sem_result
                     if not self.sem_seg_postprocess_before_inference:
@@ -510,52 +517,68 @@ class FCCLIP(nn.Module):
 
                 # panoptic segmentation inference
                 if self.panoptic_on:
-                    panoptic_r = retry_if_cuda_oom(self.panoptic_inference)(mask_cls_result, mask_pred_result, mask_round_result)
+                    panoptic_r = retry_if_cuda_oom(self.panoptic_inference)(mask_cls_result, mask_pred_result, mask_sem_result, mask_obj_result)
                     processed_results[-1]["panoptic_seg"] = panoptic_r
                 
                 # instance segmentation inference
                 if self.instance_on:
-                    instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, mask_box_result)
+                    instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, mask_sem_result, mask_obj_result)
                     processed_results[-1]["instances"] = instance_r
 
             return processed_results
 
     def prepare_targets(self, targets, images):
-        return {
-            "pan_seg": torch.stack([x["pan_seg"] for x in targets], dim=0).to(self.device), # (B,H,W)
-            "sem_seg": torch.stack([x["sem_seg"] for x in targets], dim=0).to(self.device), # (B,H,W)
-            "labels": [x["labels"].to(self.device) for x in targets], # [(GT,)]
-            "boxes": [x["boxes"].to(self.device) for x in targets], # [(GT,)]
-        }
+        h_pad, w_pad = images.tensor.shape[-2:]
+        new_targets = []
+        for targets_per_image in targets:
+            # pad gt
+            gt_masks = targets_per_image.gt_masks
+            padded_masks = torch.zeros((gt_masks.shape[0], h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
+            padded_masks[:, : gt_masks.shape[1], : gt_masks.shape[2]] = gt_masks
+            attributes = {
+                "labels": targets_per_image.gt_classes,
+                "masks": padded_masks,
+            }
+            if targets_per_image.has("gt_boxes"):
+                h, w = targets_per_image.image_size
+                image_size_xyxy = torch.as_tensor([w, h, w, h], dtype=torch.float, device=self.device)
+                attributes["boxes"] = box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor)/image_size_xyxy
+            new_targets.append(attributes)
+        return new_targets
 
-    def semantic_inference(self, mask_cls, mask_pred):
+    def semantic_inference(self, mask_cls, mask_pred, mask_sem):
+        if mask_sem is not None:
+            return mask_sem.softmax(dim=0)
         mask_cls = F.softmax(mask_cls, dim=-1)[..., :-1]
         mask_pred = mask_pred.sigmoid()
         semseg = torch.einsum("qc,qhw->chw", mask_cls, mask_pred)
         return semseg
 
-    def panoptic_inference(self, mask_cls, mask_pred, mask_round_result):
-        if self.use_sigomid:
-            scores, labels = F.sigmoid(mask_cls).max(-1)
-        else:
-            scores, labels = F.softmax(mask_cls, dim=-1).max(-1)
+    def panoptic_inference(self, mask_cls, mask_pred, mask_sem, mask_obj):
+        # Obtain query class prediction based on semantic classification of
+        # the mask area.
+        if mask_cls is None:
+            mask = mask_pred.softmax(dim=0)
+            area = mask.sum(dim=(-1, -2), keepdim=True) + 1e-8 # (B,Q)
 
-        if self.use_one2many_head:
-            scores = mask_round_result.sigmoid().squeeze(-1)
-            object_mask_threshold = 0.5
-        else:
-            object_mask_threshold = self.object_mask_threshold
+            mask_cls = torch.einsum(
+                "chw,qhw->qc", 
+                mask_sem, 
+                mask / area
+            )
+
+        # Obtain classification scores and objectness scores.
+        cls_scores, labels = F.sigmoid(mask_cls).max(-1)
+        objectness = F.sigmoid(mask_obj).squeeze(-1) # (B,Q)
 
         mask_pred = mask_pred.sigmoid()
-        num_classes = len(self.test_metadata.stuff_classes)
-        keep = labels.ne(num_classes) & (scores > object_mask_threshold)
-        cur_scores = scores[keep]
+        keep = objectness > 0.0
+        cur_cls_scores = cls_scores[keep]
+        cur_objectness = objectness[keep]
         cur_classes = labels[keep]
         cur_masks = mask_pred[keep]
-        cur_mask_cls = mask_cls[keep]
-        cur_mask_cls = cur_mask_cls[:, :-1]
 
-        cur_prob_masks = cur_scores.view(-1, 1, 1) * cur_masks
+        cur_prob_masks = cur_masks * cur_objectness.unsqueeze(-1).unsqueeze(-1) * cur_cls_scores.unsqueeze(-1).unsqueeze(-1)
 
         h, w = cur_masks.shape[-2:]
         panoptic_seg = torch.zeros((h, w), dtype=torch.int32, device=cur_masks.device)
@@ -578,7 +601,7 @@ class FCCLIP(nn.Module):
                 mask = (cur_mask_ids == k) & (cur_masks[k] >= 0.5)
 
                 if mask_area > 0 and original_area > 0 and mask.sum().item() > 0:
-                    if mask_area / original_area < self.overlap_threshold:
+                    if mask_area / original_area < 0.5:
                         continue
 
                     # merge stuff regions
@@ -602,61 +625,102 @@ class FCCLIP(nn.Module):
 
             return panoptic_seg, segments_info
 
-    def instance_inference(self, mask_cls, mask_pred, mask_box):
-        # mask_pred is already processed to have the same shape as original input
-        image_size = mask_pred.shape[-2:]
+    def instance_inference(self, mask_cls, mask_pred, mask_sem, mask_obj):
+        device = mask_pred.device
+        image_size = mask_pred.shape[-2:]  # (H, W)
 
-        # [Q, K]
-        scores = F.softmax(mask_cls, dim=-1)[:, :-1]
-        # if this is panoptic segmentation
-        if self.panoptic_on:
-            num_classes = len(self.test_metadata.stuff_classes)
-        else:
-            num_classes = len(self.test_metadata.thing_classes)
-        labels = torch.arange(num_classes, device=self.device).unsqueeze(0).repeat(self.num_queries, 1).flatten(0, 1)
-        # scores_per_image, topk_indices = scores.flatten(0, 1).topk(self.num_queries, sorted=False)
-        scores_per_image, topk_indices = scores.flatten(0, 1).topk(self.test_topk_per_image, sorted=False)
-        labels_per_image = labels[topk_indices]
+        # Class prediction via semantic voting
+        if mask_cls is None:
+            mask = mask_pred.softmax(dim=0)
+            area = mask.sum(dim=(-1, -2), keepdim=True) + 1e-8 # (B,Q)
 
-        topk_indices = topk_indices // num_classes
-        # mask_pred = mask_pred.unsqueeze(1).repeat(1, self.sem_seg_head.num_classes, 1).flatten(0, 1)
-        mask_pred = mask_pred[topk_indices]
+            mask_cls = torch.einsum(
+                "chw,qhw->qc", 
+                mask_sem, 
+                mask / area
+            )
 
-        # if this is panoptic segmentation, we only keep the "thing" classes
-        if self.panoptic_on:
-            keep = torch.zeros_like(scores_per_image).bool()
-            for i, lab in enumerate(labels_per_image):
-                keep[i] = lab in self.test_metadata.thing_dataset_id_to_contiguous_id.values()
+        # --- 2) Objectness & labels like panoptic_inference ---
+        labels = torch.sigmoid(mask_cls).argmax(-1)  # [Q]
+        objectness = torch.sigmoid(mask_obj).view(-1)  # [Q]
+        masks_sig = torch.sigmoid(mask_pred)  # [Q,H,W]
 
-            scores_per_image = scores_per_image[keep]
-            labels_per_image = labels_per_image[keep]
-            mask_pred = mask_pred[keep]
+        # In panoptic_inference they compare against the number of *stuff* classes and drop "void"
+        # Keep this behavior for consistency, then later filter to 'thing' for instances.
+        keep = objectness > 0.0
+        cur_objectness = objectness[keep]
+        cur_classes = labels[keep]
+        cur_masks = masks_sig[keep]  # [Qk,H,W]
 
+        # Early exit if nothing survived
         result = Instances(image_size)
-        # mask (before sigmoid)
-        result.pred_masks = (mask_pred > 0).float()
-        
-        if mask_box is not None:
-            # Select the boxes corresponding to the top-k queries
-            pred_boxes = mask_box[topk_indices]
-            if self.panoptic_on:
-                # Filter boxes for "thing" classes if necessary
-                pred_boxes = pred_boxes[keep]
-            
-            # pred_boxes are in normalized cxcywh format, convert to unnormalized xyxy
-            boxes = box_cxcywh_to_xyxy(pred_boxes)
-            # and un-normalize
-            h, w = image_size
-            scale_fct = torch.tensor([w, h, w, h], device=boxes.device)
-            result.pred_boxes = Boxes(boxes * scale_fct)
-        else:
-            # Fallback if boxes are not provided
-            #result.pred_boxes = Boxes(torch.zeros(mask_pred.size(0), 4))
-            # Uncomment the following to get boxes from masks (this is slow)
-            result.pred_boxes = BitMasks(mask_pred > 0).get_bounding_boxes()
+        if cur_masks.numel() == 0:
+            # Empty Instances (all fields empty tensors)
+            result.scores = torch.empty(0, device=device)
+            result.pred_classes = torch.empty(0, dtype=torch.long, device=device)
+            result.pred_masks = torch.empty(0, *image_size, dtype=torch.bool, device=device)
+            result.pred_boxes = BitMasks(torch.empty(0, *image_size, dtype=torch.bool, device=device)).get_bounding_boxes()
+            return result
 
-        # calculate average mask prob
-        mask_scores_per_image = (mask_pred.sigmoid().flatten(1) * result.pred_masks.flatten(1)).sum(1) / (result.pred_masks.flatten(1).sum(1) + 1e-6)
-        result.scores = scores_per_image * mask_scores_per_image
-        result.pred_classes = labels_per_image
+        # --- 3) Argmax competition with objectness-weighted masks ---
+        # Same as panoptic: weight masks by objectness, then per-pixel argmax across queries
+        cur_prob_masks = cur_masks * cur_objectness.view(-1, 1, 1)  # [Qk,H,W]
+        winner_ids = cur_prob_masks.argmax(0)  # [H,W], index in [0..Qk-1]
+
+        # --- 4) Build per-instance outputs (thing-only) with area checks ---
+        thing_ids = set(self.test_metadata.thing_dataset_id_to_contiguous_id.values())
+
+        pred_masks_list = []
+        pred_classes_list = []
+        scores_list = []
+
+        for k in range(cur_classes.shape[0]):
+            pred_class = int(cur_classes[k].item())
+            is_thing = pred_class in thing_ids
+            if not is_thing:
+                continue  # Instances should only return things
+
+            # mask chosen by argmax, gated by the underlying query mask confidence (>= 0.5)
+            winner_mask = (winner_ids == k)
+            original_mask = (cur_masks[k] >= 0.5)
+
+            mask_area = int(winner_mask.sum().item())
+            original_area = int(original_mask.sum().item())
+            if mask_area == 0 or original_area == 0:
+                continue
+
+            # Same consistency check as panoptic_inference
+            if mask_area / max(original_area, 1) < 0.5:
+                continue
+
+            final_mask = winner_mask & original_mask
+            if final_mask.sum().item() == 0:
+                continue
+
+            # Score: combine objectness with average mask prob over the final region
+            avg_mask_prob = (cur_masks[k][final_mask].mean() if final_mask.any() else torch.tensor(0., device=device))
+            score = cur_objectness[k] * avg_mask_prob
+
+            pred_masks_list.append(final_mask)
+            pred_classes_list.append(pred_class)
+            scores_list.append(score)
+
+        if len(pred_masks_list) == 0:
+            # Return a valid empty Instances
+            result.scores = torch.empty(0, device=device)
+            result.pred_classes = torch.empty(0, dtype=torch.long, device=device)
+            result.pred_masks = torch.empty(0, *image_size, dtype=torch.bool, device=device)
+            result.pred_boxes = BitMasks(torch.empty(0, *image_size, dtype=torch.bool, device=device)).get_bounding_boxes()
+            return result
+
+        pred_masks = torch.stack(pred_masks_list, dim=0).to(torch.bool)  # [N,H,W]
+        pred_classes = torch.tensor(pred_classes_list, dtype=torch.long, device=device)
+        scores = torch.stack(scores_list).to(device)
+
+        # --- 5) Pack into Instances ---
+        result.pred_masks = pred_masks.float()  # keep float for compatibility with BitMasks/bboxes if needed
+        result.pred_boxes = BitMasks(pred_masks).get_bounding_boxes()
+        result.pred_classes = pred_classes
+        result.scores = scores
+
         return result

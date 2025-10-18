@@ -21,7 +21,6 @@ from detectron2.utils.registry import Registry
 from .position_encoding import PositionEmbeddingSine
 from .fcclip_transformer_decoder import (
     TRANSFORMER_DECODER_REGISTRY,
-    get_classification_logits,
     MaskPooling,
     SelfAttentionLayer,
     CrossAttentionLayer,
@@ -61,12 +60,10 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
         pre_norm: bool,
         mask_dim: int,
         mask_embed_type: str = "mlp",
-        class_embed_type: str = "mlp",
         box_reg_type: str = "none",
         cross_attn_type: str = "standard",
         self_attn_type: str = "standard",
         enforce_input_project: bool,
-        text_atnn_cls: bool,
         mem_attn_mask: bool,
         clip_embedding_dim: int,
         num_transformer_out_features: int,
@@ -124,7 +121,6 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
         self.transformer_self_attention_layers = nn.ModuleList()
         self.transformer_cross_attention_layers = nn.ModuleList()
         self.transformer_semantic_cross_attention_layers = nn.ModuleList()
-        self.transformer_text_cross_attention_layers = nn.ModuleList()
         self.transformer_ffn_layers = nn.ModuleList()
 
         for _ in range(self.num_layers):
@@ -291,7 +287,7 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
         self.mask_embed_type = mask_embed_type
         if self.mask_embed_type == "mlp":
             self.panoptic_mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
-            self.semantic_mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
+            #self.semantic_mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
         elif self.mask_embed_type == "linear":
             self.panoptic_mask_embed = nn.Linear(hidden_dim, mask_dim)
             weight_init.c2_xavier_fill(self.panoptic_mask_embed)
@@ -299,36 +295,17 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
             weight_init.c2_xavier_fill(self.semantic_mask_embed)
         else:
             raise ValueError(f"Unknown mask_embed_type: {self.mask_embed_type}")
-
-        # FC-CLIP
-        self.mask_pooling = MaskPooling()
-        self._mask_pooling_proj = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim))
         
-        self.class_embed_type = class_embed_type
-        if self.class_embed_type == "mlp":
-            self.class_embed = MLP(hidden_dim, hidden_dim, clip_embedding_dim, 3)
-        elif self.class_embed_type == "linear":
-            self.class_embed = nn.Linear(hidden_dim, clip_embedding_dim)
-            weight_init.c2_xavier_fill(self.class_embed)
-        else:
-            raise ValueError(f"Unknown class_embed_type: {self.class_embed_type}")
+        # Head for objectness score prediction
+        self.objectness_embed = MLP(hidden_dim, hidden_dim, 1, 3)
         
         self.use_one2many_head = use_one2many_head
         if self.use_one2many_head:
             self.round_pred_embed = MLP(hidden_dim, hidden_dim, 1, 3)
         else:
             self.round_pred_embed = None
-        
-        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
-        if use_nel_loss:
-            self.logit_bias = nn.Parameter(torch.ones([]) * -10.0) # Sig-LIP initialization
-        else:
-            self.logit_bias = None
 
         # ZEG-FC
-        self.text_atnn_cls = text_atnn_cls
         self.mem_attn_mask = mem_attn_mask
 
     @classmethod
@@ -353,12 +330,10 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
         ret["pre_norm"] = cfg.MODEL.MASK_FORMER.PRE_NORM
         ret["enforce_input_project"] = cfg.MODEL.MASK_FORMER.ENFORCE_INPUT_PROJ
         
-        ret["text_atnn_cls"] = cfg.MODEL.ZEG_FC.TEXT_ATTN_CLS
         ret["mem_attn_mask"] = cfg.MODEL.ZEG_FC.MEM_ATTN_MASK
         ret["mask_dim"] = cfg.MODEL.SEM_SEG_HEAD.MASK_DIM
         ret["clip_embedding_dim"] = cfg.MODEL.FC_CLIP.EMBED_DIM
         ret["mask_embed_type"] = cfg.MODEL.ZEG_FC.MASK_EMBED_TYPE
-        ret["class_embed_type"] = cfg.MODEL.ZEG_FC.CLASS_EMBED_TYPE
         ret["box_reg_type"] = cfg.MODEL.ZEG_FC.BOX_REGRESSION_TYPE
         ret["cross_attn_type"] = cfg.MODEL.ZEG_FC.CROSS_ATTN_TYPE
         ret["self_attn_type"] = cfg.MODEL.ZEG_FC.SELF_ATTN_TYPE
@@ -420,7 +395,9 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
         if self._bbox_embed is not None:
             # Bbox for panoptic queries are learned
             panoptic_query_bbox_unsigmoid = self.query_bbox.weight.unsqueeze(1).repeat(1, bs, 1)
-        
+        else:
+            panoptic_query_bbox_unsigmoid = None
+
         predictions_class = []
         predictions_panoptic_mask = []
         predictions_semantic_mask = []
@@ -440,11 +417,9 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
             output=output, 
             mask_features=mask_features, 
             mem_attn_logits=None,
-            text_attn_logits=None,
             panoptic_query_bbox_unsigmoid=panoptic_query_bbox_unsigmoid,
             attn_mask_size=size_list[0],
             attn_mask_target_size=size_list[0],
-            text_classifier=text_classifier, 
             num_templates=num_templates
         )
         predictions_class.append(outputs_class)
@@ -498,20 +473,13 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
             output = torch.cat([panoptic_output, semantic_output], dim=0)
             
             # Then, self-attention
-            output, self_attn_logits = self.transformer_self_attention_layers[i](
+            output, _ = self.transformer_self_attention_layers[i](
                 output.transpose(0,1), # (B,Q,C) 
                 pos_emb=query_embed.transpose(0,1), # # (B,Q,C) 
                 pos=None,
-                return_attn_logits=self.text_atnn_cls
+                return_attn_logits=False
             )
             output = output.transpose(0,1) # (Q,B,C)
-            
-            # The text attention logits come from the self-attention 
-            # between panoptic queries and semantic queries.
-            if self.text_atnn_cls:
-                text_attn_logits = self_attn_logits[:,:self.num_panoptic_queries, self.num_panoptic_queries:]
-            else:
-                text_attn_logits = None
 
             # FFN
             output = self.transformer_ffn_layers[i](output)
@@ -528,11 +496,9 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
                 output=output, 
                 mask_features=mask_features, 
                 mem_attn_logits=mem_attn_logits,
-                text_attn_logits=text_attn_logits,
                 panoptic_query_bbox_unsigmoid=panoptic_query_bbox_unsigmoid,
                 attn_mask_size=size_list[i % self.num_feature_levels],
                 attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels],
-                text_classifier=text_classifier, 
                 num_templates=num_templates
             )
             predictions_class.append(outputs_class)
@@ -544,7 +510,7 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
         assert len(predictions_class) == self.num_layers + 1
 
         out = {
-            'pred_logits': predictions_class[-1],
+            'pred_objectness': predictions_class[-1],
             'pred_panoptic_masks': predictions_panoptic_mask[-1],
             'pred_semantic_masks': predictions_semantic_mask[-1],
             'pred_boxes': predictions_bbox[-1],
@@ -565,11 +531,9 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
         output, 
         mask_features, 
         mem_attn_logits,
-        text_attn_logits,
         panoptic_query_bbox_unsigmoid,
         attn_mask_size,
-        attn_mask_target_size, 
-        text_classifier, 
+        attn_mask_target_size,
         num_templates
     ):
         decoder_output = self.decoder_norm(output)
@@ -579,8 +543,9 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
         semantic_output = decoder_output[:, self.num_panoptic_queries:]
 
         panoptic_mask_embed = self.panoptic_mask_embed(panoptic_output)
-        semantic_mask_embed = self.semantic_mask_embed(semantic_output)
-        
+        #semantic_mask_embed = self.semantic_mask_embed(semantic_output)
+        semantic_mask_embed = self.panoptic_mask_embed(semantic_output)
+
         if self.use_one2many_head:
             outputs_round = self.round_pred_embed(panoptic_output)
         else:
@@ -625,20 +590,9 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
             query_bbox_unsigmoid_detached = query_bbox_unsigmoid_detached.transpose(0,1)
         else:
             outputs_bbox, query_bbox_unsigmoid_detached = None, None
-
-        # fcclip head for panoptic queries
-        maskpool_embeddings = self.mask_pooling(x=mask_features, mask=outputs_panoptic_mask) # [B, Q, C]
-        maskpool_embeddings = self._mask_pooling_proj(maskpool_embeddings)
-        class_embed = self.class_embed(maskpool_embeddings + panoptic_output)
-                
-        outputs_class = get_classification_logits(
-            class_embed, 
-            text_classifier, 
-            self.logit_scale, 
-            self.logit_bias, 
-            num_templates, 
-            text_attn_logits
-        )
+        
+        # Calculate objectness score from combined features
+        outputs_class = self.objectness_embed(panoptic_output)
 
         # NOTE: prediction is of higher-resolution
         # [B, Q, H, W] -> [B, Q, H*W] -> [B, h, Q, H*W] -> [B*h, Q, HW]
@@ -658,7 +612,7 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
         # as a dict having both a Tensor and a list.
         if self.mask_classification:
             return [
-                {"pred_logits": a, "pred_panoptic_masks": b, "pred_semantic_masks": c, "pred_boxes": d, "pred_round": e}
+                {"pred_objectness": a, "pred_panoptic_masks": b, "pred_semantic_masks": c, "pred_boxes": d, "pred_round": e}
                 for a, b, c, d, e in zip(outputs_class[:-1], outputs_panoptic_masks[:-1], outputs_semantic_masks[:-1], outputs_bboxes[:-1], outputs_round[:-1])
             ]
         else:
