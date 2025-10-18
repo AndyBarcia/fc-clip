@@ -5,6 +5,7 @@ All Bytedance's Modifications are Copyright (year) Bytedance Ltd. and/or its aff
 Reference: https://github.com/facebookresearch/Mask2Former/blob/main/demo/predictor.py
 """
 
+import numpy as np
 import atexit
 import bisect
 import multiprocessing as mp
@@ -128,27 +129,36 @@ class VisualizationDemo(object):
             predictions (dict): the output of the model.
             vis_output (VisImage): the visualized image output.
         """
-        vis_output = None
         predictions = self.predictor(image)
-        # Convert image from OpenCV BGR format to Matplotlib RGB format.
-        image = image[:, :, ::-1]
-        visualizer = OpenVocabVisualizer(image, self.metadata, instance_mode=self.instance_mode)
+
+        # Convert BGR -> RGB (matplotlib)
+        rgb = image[:, :, ::-1]
         vis_output = {}
+
+        # Helper to ensure each render uses a clean canvas
+        def render(draw_fn):
+            viz = OpenVocabVisualizer(rgb.copy(), self.metadata, instance_mode=self.instance_mode)
+            vis = draw_fn(viz)  # returns a VisImage-like object from the visualizer
+            # Freeze pixels into your VisImage to avoid any future canvas state
+            return VisImage(vis.get_image().copy(), vis.scale)
+
         if "panoptic_seg" in predictions:
             panoptic_seg, segments_info = predictions["panoptic_seg"]
-            output = visualizer.draw_panoptic_seg(
-                panoptic_seg.to(self.cpu_device), segments_info
+            vis_output["panoptic_seg"] = render(
+                lambda viz: viz.draw_panoptic_seg(panoptic_seg.to(self.cpu_device), segments_info)
             )
-            vis_output["panoptic_seg"] = VisImage(output.get_image(), output.scale)
+
         if "sem_seg" in predictions:
-            output = visualizer.draw_sem_seg(
-                predictions["sem_seg"].argmax(dim=0).to(self.cpu_device)
+            sem = predictions["sem_seg"].argmax(dim=0).to(self.cpu_device)
+            vis_output["sem_seg"] = render(
+                lambda viz: viz.draw_sem_seg(sem)
             )
-            vis_output["sem_seg"] = VisImage(output.get_image(), output.scale)
+
         if "instances" in predictions:
             instances = predictions["instances"].to(self.cpu_device)
-            output = visualizer.draw_instance_predictions(predictions=instances)
-            vis_output["instances"] = VisImage(output.get_image(), output.scale)
+            vis_output["instances"] = render(
+                lambda viz: viz.draw_instance_predictions(predictions=instances)
+            )
 
         return predictions, vis_output
 

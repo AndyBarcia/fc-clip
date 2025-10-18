@@ -134,20 +134,22 @@ if __name__ == "__main__":
             )
 
             if args.output:
-                if os.path.isdir(args.output):
-                    assert os.path.isdir(args.output), args.output
-                    # Save each image in the dictionary to the output directory
-                    for key, image in visualized_output.items():
-                        base_name = os.path.splitext(os.path.basename(path))[0]
-                        out_filename = os.path.join(args.output, f"{base_name}_{key}.png")
-                        image.save(out_filename)
-                else:
-                    assert len(args.input) == 1, "Please specify a directory with args.output"
-                    # Save each image with the output filename as base and key as suffix
+                if len(args.input) == 1 and not os.path.isdir(args.output):
+                    # If it's a single image and the specified output
+                    # is not a directory, save to a file. Save each image 
+                    # with the output filename as base and key as suffix
                     base_name = os.path.splitext(args.output)[0]
                     ext = os.path.splitext(args.output)[1] or '.png'
                     for key, image in visualized_output.items():
                         out_filename = f"{base_name}_{key}{ext}"
+                        image.save(out_filename)
+                else:
+                    # Otherwise, it's a directory, so save to the directory
+                    os.makedirs(args.output, exist_ok=True)
+                    # Save each image in the dictionary to the output directory
+                    for key, image in visualized_output.items():
+                        base_name = os.path.splitext(os.path.basename(path))[0]
+                        out_filename = os.path.join(args.output, f"{base_name}_{key}.png")
                         image.save(out_filename)
             else:
                 # Display each image in the dictionary
