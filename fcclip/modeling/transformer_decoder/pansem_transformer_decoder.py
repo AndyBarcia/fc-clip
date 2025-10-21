@@ -287,7 +287,7 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
         self.mask_embed_type = mask_embed_type
         if self.mask_embed_type == "mlp":
             self.panoptic_mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
-            #self.semantic_mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
+            self.semantic_mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
         elif self.mask_embed_type == "linear":
             self.panoptic_mask_embed = nn.Linear(hidden_dim, mask_dim)
             weight_init.c2_xavier_fill(self.panoptic_mask_embed)
@@ -298,12 +298,6 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
         
         # Head for objectness score prediction
         self.objectness_embed = MLP(hidden_dim, hidden_dim, 1, 3)
-        
-        self.use_one2many_head = use_one2many_head
-        if self.use_one2many_head:
-            self.round_pred_embed = MLP(hidden_dim, hidden_dim, 1, 3)
-        else:
-            self.round_pred_embed = None
 
         # ZEG-FC
         self.mem_attn_mask = mem_attn_mask
@@ -402,7 +396,6 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
         predictions_panoptic_mask = []
         predictions_semantic_mask = []
         predictions_bbox = []
-        predictions_round = []
 
         # prediction heads on learnable query features
         (
@@ -410,7 +403,6 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
             outputs_panoptic_mask, 
             outputs_semantic_mask, 
             output_box, 
-            outputs_round, 
             panoptic_query_bbox_unsigmoid, 
             attn_mask
         ) = self.forward_prediction_heads(
@@ -426,7 +418,6 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
         predictions_panoptic_mask.append(outputs_panoptic_mask)
         predictions_semantic_mask.append(outputs_semantic_mask)
         predictions_bbox.append(output_box)
-        predictions_round.append(outputs_round)
         
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
@@ -489,7 +480,6 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
                 outputs_panoptic_mask, 
                 outputs_semantic_mask, 
                 output_box, 
-                outputs_round, 
                 panoptic_query_bbox_unsigmoid, 
                 attn_mask
             ) = self.forward_prediction_heads(
@@ -505,24 +495,16 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
             predictions_panoptic_mask.append(outputs_panoptic_mask)
             predictions_semantic_mask.append(outputs_semantic_mask)
             predictions_bbox.append(output_box)
-            predictions_round.append(outputs_round)
             
         assert len(predictions_class) == self.num_layers + 1
 
         out = {
-            'pred_objectness': predictions_class[-1],
-            'pred_panoptic_masks': predictions_panoptic_mask[-1],
-            'pred_semantic_masks': predictions_semantic_mask[-1],
-            'pred_boxes': predictions_bbox[-1],
-            'pred_round': predictions_round[-1],
-            'aux_outputs': self._set_aux_loss(
-                predictions_class if self.mask_classification else None, 
-                predictions_panoptic_mask,
-                predictions_semantic_mask,
-                predictions_bbox,
-                predictions_round
-            )
+            'pred_objectness': torch.stack(predictions_class, dim=0), # (L,B,Q,1)
+            'pred_panoptic_masks': torch.stack(predictions_panoptic_mask, dim=0), # (L,B,Q,H,W)
+            'pred_semantic_masks': torch.stack(predictions_semantic_mask, dim=0), # (L,B,C,H,W)
+            'pred_boxes': torch.stack(predictions_bbox, dim=0) if output_box is not None else None, # (L,B,Q,4)
         }
+
         return out
 
     @torch.compiler.disable(recursive=False)
@@ -543,13 +525,7 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
         semantic_output = decoder_output[:, self.num_panoptic_queries:]
 
         panoptic_mask_embed = self.panoptic_mask_embed(panoptic_output)
-        #semantic_mask_embed = self.semantic_mask_embed(semantic_output)
-        semantic_mask_embed = self.panoptic_mask_embed(semantic_output)
-
-        if self.use_one2many_head:
-            outputs_round = self.round_pred_embed(panoptic_output)
-        else:
-            outputs_round = None
+        semantic_mask_embed = self.semantic_mask_embed(semantic_output)
 
         # Panoptic and semantic masks
         outputs_panoptic_mask = torch.einsum("bqc,bchw->bqhw", panoptic_mask_embed, mask_features)
@@ -603,20 +579,4 @@ class PanopticAndSemanticTransformerDecoder(nn.Module):
         attn_mask = (attn_mask.sigmoid().flatten(2).unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0, 1) < 0.5).bool()
         attn_mask = attn_mask.detach()
 
-        return outputs_class, outputs_panoptic_mask, ensemble_semantic_mask, outputs_bbox, outputs_round, query_bbox_unsigmoid_detached, attn_mask
-
-    @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_panoptic_masks, outputs_semantic_masks, outputs_bboxes, outputs_round):
-        # this is a workaround to make torchscript happy, as torchscript
-        # doesn't support dictionary with non-homogeneous values, such
-        # as a dict having both a Tensor and a list.
-        if self.mask_classification:
-            return [
-                {"pred_objectness": a, "pred_panoptic_masks": b, "pred_semantic_masks": c, "pred_boxes": d, "pred_round": e}
-                for a, b, c, d, e in zip(outputs_class[:-1], outputs_panoptic_masks[:-1], outputs_semantic_masks[:-1], outputs_bboxes[:-1], outputs_round[:-1])
-            ]
-        else:
-            return [
-                {"pred_panoptic_masks": b, "pred_semantic_masks": c, "pred_boxes": d, "pred_round": e}
-                for b, c, d, e in zip(outputs_panoptic_masks[:-1], outputs_semantic_masks[:-1], outputs_bboxes[:-1], outputs_round[:-1])
-            ]
+        return outputs_class, outputs_panoptic_mask, ensemble_semantic_mask, outputs_bbox, query_bbox_unsigmoid_detached, attn_mask

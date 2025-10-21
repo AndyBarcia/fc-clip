@@ -4,6 +4,7 @@ All Bytedance's Modifications are Copyright (year) Bytedance Ltd. and/or its aff
 
 Reference: https://github.com/facebookresearch/Mask2Former/blob/main/mask2former/maskformer_model.py
 """
+import os
 from typing import Tuple
 
 import torch
@@ -21,9 +22,6 @@ from detectron2.structures import Boxes, ImageList, Instances, BitMasks
 from detectron2.utils.memory import retry_if_cuda_oom
 
 from .modeling.losses.criterion import SetCriterion
-from .modeling.losses.one2many_criterion import One2ManySetCriterion
-from .modeling.losses.matcher import HungarianMatcher
-from .modeling.losses.one2many_matcher import HungarianOne2ManyMatcher
 from .modeling.transformer_decoder.box_regression import box_xyxy_to_cxcywh, box_cxcywh_to_xyxy
 
 from .modeling.transformer_decoder.fcclip_transformer_decoder import MaskPooling, get_classification_logits
@@ -43,6 +41,83 @@ VILD_PROMPT = [
     "There is a medium {} in the scene.",
     "There is a large {} in the scene.",
 ]
+
+
+@torch.no_grad()
+def mask_uncertainty_scores(
+    pred_panoptic: torch.Tensor,      # (Q,H,W) logits
+    alpha: float = 0.25,              # p in [0.5-alpha, 0.5+alpha] is "uncertain"
+    ring_r: int = 3,                  # boundary ring half-width in pixels
+    normalize_entropy: bool = True,
+):
+    """
+    Returns dict with tensors of shape (Q,):
+      - global_uncertainty      : mean pixel entropy
+      - uncertain_area_fraction : fraction of pixels with |p-0.5| < alpha
+      - boundary_entropy        : mean entropy restricted to a ring around the mask boundary
+      - boundary_width          : average width (in pixels) of the uncertain band along the boundary
+    """
+    assert pred_panoptic.ndim == 3, "expected (Q,H,W)"
+    Q, H, W = pred_panoptic.shape
+    eps = 1e-8
+
+    # probabilities and entropy map U in [0, 1] (if normalize_entropy=True)
+    p = torch.sigmoid(pred_panoptic)                                     # (Q,H,W)
+    U = -(p.clamp(eps, 1-eps)*torch.log(p.clamp(eps, 1-eps))
+          + (1-p).clamp(eps, 1-eps)*torch.log((1-p).clamp(eps, 1-eps)))  # nat entropy
+
+    # 1) Global uncertainty
+    global_uncertainty = U.mean(dim=(1,2))                                # (Q,)
+    if normalize_entropy:
+        global_uncertainty /= torch.log(torch.tensor(2.0, device=U.device)) # bits -> [0,1] max at 1
+
+    # 2) Uncertain-area fraction (UAF)
+    uncertain = (p - 0.5).abs() < alpha                                   # boolean (Q,H,W)
+    uncertain_area_fraction = uncertain.float().mean(dim=(1,2))           # (Q,)
+
+    # binary masks for morphology (threshold at 0.5)
+    m = (p > 0.5).float().unsqueeze(1)                                    # (Q,1,H,W)
+
+    # Area (pixels)
+    area = m.sum(dim=(1,2,3))                                             # (Q,)
+
+    # helpers: dilation & erosion with window size (2r+1)
+    def dilate(x, r):
+        return F.max_pool2d(x, kernel_size=2*r+1, stride=1, padding=r)
+    def erode(x, r):
+        return 1.0 - F.max_pool2d(1.0 - x, kernel_size=2*r+1, stride=1, padding=r)
+
+    # ring around boundary (morphological gradient band of half-width ring_r)
+    dil = dilate(m, ring_r)
+    ero = erode(m, ring_r)
+    ring = (dil - ero) > 0                                                # (Q,1,H,W) boolean
+    ring = ring.squeeze(1)                                                # (Q,H,W)
+
+    ring_area = ring.float().sum(dim=(1,2)).clamp_min(1.0)                # to avoid division by zero
+
+    # 3) Boundary entropy: mean entropy inside the ring
+    boundary_entropy = (U * ring.float()).sum(dim=(1,2)) / ring_area      # (Q,)
+    if normalize_entropy:
+        boundary_entropy /= torch.log(torch.tensor(2.0, device=U.device)) # bits -> [0,1] max at 1
+
+    # perimeter: ~ one-pixel morphological boundary (for width normalization)
+    dil1 = dilate(m, 1)
+    ero1 = erode(m, 1)
+    boundary1 = (dil1 - ero1) > 0                                         # (Q,1,H,W)
+    perimeter = boundary1.float().sum(dim=(1,2,3)).clamp_min(1.0)         # pixels
+
+    # 4) Boundary width: average width (in pixels) of uncertain band along boundary
+    uncertain_in_ring = (uncertain & ring).float().sum(dim=(1,2))         # counts
+    boundary_width = (uncertain_in_ring / perimeter).clamp_max(ring_r)    # (Q,)
+
+    return {
+        "area": area,
+        "probs": p,  # expose for convenience (Q,H,W)
+        "global_uncertainty": global_uncertainty,            # higher = more uncertain
+        "uncertain_area_fraction": uncertain_area_fraction,  # in [0,1]
+        "boundary_entropy": boundary_entropy,                # in [0,1] if normalized
+        "boundary_width": boundary_width                     # pixels, ∈ [0, ring_r]
+    }
 
 
 @META_ARCH_REGISTRY.register()
@@ -247,19 +322,6 @@ class FCCLIP(nn.Module):
         giou_weight = cfg.MODEL.MASK_FORMER.GIOU_WEIGHT
         round_weight = cfg.MODEL.MASK_FORMER.ROUDN_WEIGHT
 
-        # building criterion
-        matcher_class = HungarianOne2ManyMatcher if use_one2many_head else HungarianMatcher
-        matcher = matcher_class(
-            cost_class=class_weight,
-            cost_objectness=class_weight,
-            cost_mask=mask_weight,
-            cost_dice=dice_weight,
-            num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
-            use_nel_cost=cfg.MODEL.FC_CLIP.USE_NEL_COST,
-            focal_alpha=cfg.MODEL.FC_CLIP.FOCAL_ALPHA,
-            focal_gamma=cfg.MODEL.FC_CLIP.FOCAL_GAMMA
-        )
-
         weight_dict = {
             "loss_ce": class_weight, 
             "loss_objectness": class_weight,
@@ -273,27 +335,11 @@ class FCCLIP(nn.Module):
             "loss_giou": giou_weight
         }
 
-        if deep_supervision:
-            dec_layers = cfg.MODEL.MASK_FORMER.DEC_LAYERS
-            aux_weight_dict = {}
-            for i in range(dec_layers - 1):
-                aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
-            weight_dict.update(aux_weight_dict)
+        losses = ["semantic", "panoptic"]
 
-        losses = ["objectness", "masks", "semantic", "boxes"]
-        if use_one2many_head:
-            losses.append("rounds")
-
-        criterion_class = One2ManySetCriterion if use_one2many_head else SetCriterion
-        criterion = criterion_class(
-            sem_seg_head.num_classes,
-            matcher=matcher,
+        criterion = SetCriterion(
             weight_dict=weight_dict,
-            eos_coef=no_object_weight,
             losses=losses,
-            num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
-            oversample_ratio=cfg.MODEL.MASK_FORMER.OVERSAMPLE_RATIO,
-            importance_sample_ratio=cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO,
             use_nel_loss=cfg.MODEL.FC_CLIP.USE_NEL_COST,
             focal_alpha=cfg.MODEL.FC_CLIP.FOCAL_ALPHA,
             focal_gamma=cfg.MODEL.FC_CLIP.FOCAL_GAMMA
@@ -371,30 +417,39 @@ class FCCLIP(nn.Module):
         outputs = self.sem_seg_head(features)
 
         if self.training:
-            # mask classification target
+            # Mask classification target
             if "instances" in batched_inputs[0]:
-                gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
+                gt_instances = [x["instances"] for x in batched_inputs]
                 targets = self.prepare_targets(gt_instances, images)
             else:
                 targets = None
 
-            # bipartite matching-based loss
+            # Bipartite matching-based loss
             losses = self.criterion(outputs, targets)
-
-            for k in list(losses.keys()):
-                if k in self.criterion.weight_dict:
-                    losses[k] *= self.criterion.weight_dict[k]
-                else:
-                    # remove this loss if not specified in `weight_dict`
-                    losses.pop(k)
             return losses
         else:
-            mask_obj_results = outputs.get("pred_objectness")
-            mask_cls_results = outputs.get("pred_logits")
-            mask_pred_results = outputs.get("pred_panoptic_masks")
-            mask_sem_results = outputs.get("pred_semantic_masks")
-            mask_box_results = outputs.get("pred_boxes")
-            mask_round_results = outputs.get("pred_round")
+            # Obtain the relevant outputs of the last layer.
+            mask_obj_results = outputs["pred_objectness"][-1] if outputs.get("pred_objectness") is not None else None
+            mask_cls_results = outputs["pred_logits"][-1] if outputs.get("pred_logits") is not None else None
+            mask_pred_results = outputs["pred_panoptic_masks"][-1] if outputs.get("pred_panoptic_masks") is not None else None
+            mask_sem_results = outputs["pred_semantic_masks"][-1] if outputs.get("pred_semantic_masks") is not None else None
+            mask_box_results = outputs["pred_boxes"][-1] if outputs.get("pred_boxes") is not None else None
+            mask_round_results = outputs["pred_round"][-1] if outputs.get("pred_round") is not None else None
+
+            # Save each tensor if it's not None
+            os.makedirs("outputs/tensors", exist_ok=True)
+            if mask_obj_results is not None:
+                torch.save(mask_obj_results, "outputs/tensors/pred_objectness.pt")
+            if mask_cls_results is not None:
+                torch.save(mask_cls_results, "outputs/tensors/pred_logits.pt")
+            if mask_pred_results is not None:
+                torch.save(mask_pred_results, "outputs/tensors/pred_panoptic_masks.pt")
+            if mask_sem_results is not None:
+                torch.save(mask_sem_results, "outputs/tensors/pred_semantic_masks.pt")
+            if mask_box_results is not None:
+                torch.save(mask_box_results, "outputs/tensors/pred_boxes.pt")
+            if mask_round_results is not None:
+                torch.save(mask_round_results, "outputs/tensors/pred_round.pt")
 
             if False:
                 clip_feature = features["clip_vis_dense"]  # [B, D_clip_raw, Hc, Wc]
@@ -527,24 +582,14 @@ class FCCLIP(nn.Module):
 
             return processed_results
 
+    @torch.no_grad()
     def prepare_targets(self, targets, images):
-        h_pad, w_pad = images.tensor.shape[-2:]
-        new_targets = []
-        for targets_per_image in targets:
-            # pad gt
-            gt_masks = targets_per_image.gt_masks
-            padded_masks = torch.zeros((gt_masks.shape[0], h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
-            padded_masks[:, : gt_masks.shape[1], : gt_masks.shape[2]] = gt_masks
-            attributes = {
-                "labels": targets_per_image.gt_classes,
-                "masks": padded_masks,
-            }
-            if targets_per_image.has("gt_boxes"):
-                h, w = targets_per_image.image_size
-                image_size_xyxy = torch.as_tensor([w, h, w, h], dtype=torch.float, device=self.device)
-                attributes["boxes"] = box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor)/image_size_xyxy
-            new_targets.append(attributes)
-        return new_targets
+        return {
+            "pan_seg": torch.stack([x["pan_seg"] for x in targets], dim=0).to(self.device).to(torch.long), # (B,H,W)
+            "sem_seg": torch.stack([x["sem_seg"] for x in targets], dim=0).to(self.device).to(torch.long), # (B,H,W)
+            "labels": [x["labels"].to(self.device) for x in targets], # [(GT,)]
+            "boxes": [x["boxes"].to(self.device) for x in targets] # [(GT,4)]
+        }
 
     def semantic_inference(self, mask_cls, mask_pred, mask_sem):
         if mask_sem is not None:

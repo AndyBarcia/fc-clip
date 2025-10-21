@@ -30,6 +30,100 @@ class DefaultPredictor(d2_defaultPredictor):
 
 
 class OpenVocabVisualizer(Visualizer):
+
+    def draw_instance_predictions(self, predictions):
+        """
+        Draw instance-level prediction results on an image.
+
+        Args:
+            predictions (Instances): the output of an instance detection/segmentation
+                model. Following fields will be used to draw:
+                "pred_boxes", "pred_classes", "scores", "pred_masks" (or "pred_masks_rle").
+
+        Returns:
+            output (VisImage): image object with visualizations.
+        """
+        boxes = predictions.pred_boxes if predictions.has("pred_boxes") else None
+        scores = predictions.scores if predictions.has("scores") else None
+        classes = predictions.pred_classes.tolist() if predictions.has("pred_classes") else None
+
+        stuff_classes = self.metadata.stuff_classes
+        stuff_classes = [x.split(',')[0] for x in stuff_classes]
+        labels = d2_visualizer._create_text_labels(classes, scores, stuff_classes)
+        keypoints = predictions.pred_keypoints if predictions.has("pred_keypoints") else None
+
+        if predictions.has("pred_masks"):
+            masks = np.asarray(predictions.pred_masks)
+            masks = [d2_visualizer.GenericMask(x, self.output.height, self.output.width) for x in masks]
+        else:
+            masks = None
+
+        if self._instance_mode == ColorMode.SEGMENTATION and self.metadata.get("thing_colors"):
+            colors = [
+                self._jitter([x / 255 for x in self.metadata.thing_colors[c]]) for c in classes
+            ]
+            alpha = 0.8
+        else:
+            colors = None
+            alpha = 0.5
+
+        if self._instance_mode == ColorMode.IMAGE_BW:
+            self.output.reset_image(
+                self._create_grayscale_image(
+                    (predictions.pred_masks.any(dim=0) > 0).numpy()
+                    if predictions.has("pred_masks")
+                    else None
+                )
+            )
+            alpha = 0.3
+
+        self.overlay_instances(
+            masks=masks,
+            boxes=boxes,
+            labels=labels,
+            keypoints=keypoints,
+            assigned_colors=colors,
+            alpha=alpha,
+        )
+        return self.output
+
+    def draw_sem_seg(self, sem_seg, area_threshold=None, alpha=0.8):
+        """
+        Draw semantic segmentation predictions/labels.
+
+        Args:
+            sem_seg (Tensor or ndarray): the segmentation of shape (H, W).
+                Each value is the integer label of the pixel.
+            area_threshold (int): segments with less than `area_threshold` are not drawn.
+            alpha (float): the larger it is, the more opaque the segmentations are.
+
+        Returns:
+            output (VisImage): image object with visualizations.
+        """
+        if isinstance(sem_seg, torch.Tensor):
+            sem_seg = sem_seg.numpy()
+        labels, areas = np.unique(sem_seg, return_counts=True)
+        sorted_idxs = np.argsort(-areas).tolist()
+        labels = labels[sorted_idxs]
+        for label in filter(lambda l: l < len(self.metadata.stuff_classes), labels):
+            try:
+                mask_color = [x / 255 for x in self.metadata.stuff_colors[label]]
+            except (AttributeError, IndexError):
+                mask_color = None
+
+            binary_mask = (sem_seg == label).astype(np.uint8)
+            text = self.metadata.stuff_classes[label]
+            text = text.split(',')[0]
+            self.draw_binary_mask(
+                binary_mask,
+                color=mask_color,
+                edge_color=d2_visualizer._OFF_WHITE,
+                text=text,
+                alpha=alpha,
+                area_threshold=area_threshold,
+            )
+        return self.output
+
     def draw_panoptic_seg(self, panoptic_seg, segments_info, area_threshold=None, alpha=0.7):
         """
         Draw panoptic prediction annotations or results.

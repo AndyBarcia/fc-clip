@@ -141,27 +141,43 @@ class COCOPanopticNewBaselineDatasetMapper:
 
             from panopticapi.utils import rgb2id
 
+            # Work in torch without allocating huge [max_id + 1] arrays.
             pan_seg_gt = rgb2id(pan_seg_gt)
+            pan_seg_gt = torch.from_numpy(pan_seg_gt.astype(np.int64))  # (H,W), long for torch.unique
 
-            # Find the maximum ID to size the lookup array
-            max_id = max(segment_info["id"] for segment_info in segments_info)
+            # Unique IDs actually present in the (possibly cropped/augmented) image
+            unique_ids, inv = torch.unique(pan_seg_gt, return_inverse=True)  # unique_ids: (K,), inv: (H*W,)
+            K = unique_ids.numel()
 
-            # Create a lookup array for vectorized mapping
-            seg_id_to_seq_id = torch.zeros((max_id + 1,), dtype=pan_seg_gt.dtype)
-            seg_id_to_class_id = torch.zeros((max_id + 1, ), dtype=pan_seg_gt.dtype)
+            # We'll map from the K unique IDs -> sequential IDs and class IDs.
+            # Default to 0 for anything not in segments_info (e.g., void/background).
+            seq_map = torch.zeros((K,), dtype=torch.int32)
+            cls_map = torch.zeros((K,), dtype=torch.int32)
+
+            # Fast lookup: unique ID value -> position in unique_ids
+            uid2pos = {int(uid.item()): i for i, uid in enumerate(unique_ids)}
+
+            # Keep class labels in the same order as segments_info (skipping crowd), like before
             classes = []
             for idx, segment_info in enumerate(segments_info):
                 if segment_info["iscrowd"]:
                     continue
-                    
-                classes.append(segment_info["category_id"])
-                seg_id_to_seq_id[segment_info["id"]] = idx + 1
-                seg_id_to_class_id[segment_info["id"]] = segment_info["category_id"]
+                classes.append(int(segment_info["category_id"]))
 
-            # Apply the mapping in one vectorized operation
-            pan_seg_gt_sequential = seg_id_to_seq_id[pan_seg_gt] # (H,W)
-            sem_seg_gt = seg_id_to_class_id[pan_seg_gt] # (H,W)
-            gt_labels = torch.tensor(classes, dtype=torch.int64) # (GT)
+            # Fill mapping tables using the SAME sequential convention (idx+1 over segments_info)
+            for idx, segment_info in enumerate(segments_info):
+                if segment_info["iscrowd"]:
+                    continue
+                sid = int(segment_info["id"])
+                pos = uid2pos.get(sid)
+                if pos is not None:  # segment might be fully cropped out
+                    seq_map[pos] = idx + 1
+                    cls_map[pos] = int(segment_info["category_id"])
+
+            # Apply the mapping back to image shape using the inverse index
+            pan_seg_gt_sequential = seq_map[inv].reshape(pan_seg_gt.shape)  # (H,W) int32
+            sem_seg_gt = cls_map[inv].reshape(pan_seg_gt.shape)             # (H,W) int32
+            gt_labels = torch.tensor(classes, dtype=torch.int64)            # (GT,)
             
             gt_boxes = [] # (GT,4)
             for idx, segment_info in enumerate(segments_info):
