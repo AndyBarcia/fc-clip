@@ -5,6 +5,7 @@ All Bytedance's Modifications are Copyright (year) Bytedance Ltd. and/or its aff
 Reference: https://github.com/facebookresearch/Mask2Former/blob/main/demo/predictor.py
 """
 
+import numpy as np
 import atexit
 import bisect
 import multiprocessing as mp
@@ -18,7 +19,7 @@ import itertools
 from detectron2.data import DatasetCatalog, MetadataCatalog
 from detectron2.engine.defaults import DefaultPredictor as d2_defaultPredictor
 from detectron2.utils.video_visualizer import VideoVisualizer
-from detectron2.utils.visualizer import ColorMode, Visualizer, random_color
+from detectron2.utils.visualizer import ColorMode, Visualizer, VisImage
 import detectron2.utils.visualizer as d2_visualizer
 
 
@@ -29,6 +30,100 @@ class DefaultPredictor(d2_defaultPredictor):
 
 
 class OpenVocabVisualizer(Visualizer):
+
+    def draw_instance_predictions(self, predictions):
+        """
+        Draw instance-level prediction results on an image.
+
+        Args:
+            predictions (Instances): the output of an instance detection/segmentation
+                model. Following fields will be used to draw:
+                "pred_boxes", "pred_classes", "scores", "pred_masks" (or "pred_masks_rle").
+
+        Returns:
+            output (VisImage): image object with visualizations.
+        """
+        boxes = predictions.pred_boxes if predictions.has("pred_boxes") else None
+        scores = predictions.scores if predictions.has("scores") else None
+        classes = predictions.pred_classes.tolist() if predictions.has("pred_classes") else None
+
+        stuff_classes = self.metadata.stuff_classes
+        stuff_classes = [x.split(',')[0] for x in stuff_classes]
+        labels = d2_visualizer._create_text_labels(classes, scores, stuff_classes)
+        keypoints = predictions.pred_keypoints if predictions.has("pred_keypoints") else None
+
+        if predictions.has("pred_masks"):
+            masks = np.asarray(predictions.pred_masks)
+            masks = [d2_visualizer.GenericMask(x, self.output.height, self.output.width) for x in masks]
+        else:
+            masks = None
+
+        if self._instance_mode == ColorMode.SEGMENTATION and self.metadata.get("thing_colors"):
+            colors = [
+                self._jitter([x / 255 for x in self.metadata.thing_colors[c]]) for c in classes
+            ]
+            alpha = 0.8
+        else:
+            colors = None
+            alpha = 0.5
+
+        if self._instance_mode == ColorMode.IMAGE_BW:
+            self.output.reset_image(
+                self._create_grayscale_image(
+                    (predictions.pred_masks.any(dim=0) > 0).numpy()
+                    if predictions.has("pred_masks")
+                    else None
+                )
+            )
+            alpha = 0.3
+
+        self.overlay_instances(
+            masks=masks,
+            boxes=boxes,
+            labels=labels,
+            keypoints=keypoints,
+            assigned_colors=colors,
+            alpha=alpha,
+        )
+        return self.output
+
+    def draw_sem_seg(self, sem_seg, area_threshold=None, alpha=0.8):
+        """
+        Draw semantic segmentation predictions/labels.
+
+        Args:
+            sem_seg (Tensor or ndarray): the segmentation of shape (H, W).
+                Each value is the integer label of the pixel.
+            area_threshold (int): segments with less than `area_threshold` are not drawn.
+            alpha (float): the larger it is, the more opaque the segmentations are.
+
+        Returns:
+            output (VisImage): image object with visualizations.
+        """
+        if isinstance(sem_seg, torch.Tensor):
+            sem_seg = sem_seg.numpy()
+        labels, areas = np.unique(sem_seg, return_counts=True)
+        sorted_idxs = np.argsort(-areas).tolist()
+        labels = labels[sorted_idxs]
+        for label in filter(lambda l: l < len(self.metadata.stuff_classes), labels):
+            try:
+                mask_color = [x / 255 for x in self.metadata.stuff_colors[label]]
+            except (AttributeError, IndexError):
+                mask_color = None
+
+            binary_mask = (sem_seg == label).astype(np.uint8)
+            text = self.metadata.stuff_classes[label]
+            text = text.split(',')[0]
+            self.draw_binary_mask(
+                binary_mask,
+                color=mask_color,
+                edge_color=d2_visualizer._OFF_WHITE,
+                text=text,
+                alpha=alpha,
+                area_threshold=area_threshold,
+            )
+        return self.output
+
     def draw_panoptic_seg(self, panoptic_seg, segments_info, area_threshold=None, alpha=0.7):
         """
         Draw panoptic prediction annotations or results.
@@ -104,40 +199,9 @@ class VisualizationDemo(object):
                 Useful since the visualization logic can be slow.
         """
 
-        coco_metadata = MetadataCatalog.get("openvocab_coco_2017_val_panoptic_with_sem_seg")
-        ade20k_metadata = MetadataCatalog.get("openvocab_ade20k_panoptic_val")
-        lvis_classes = open("./fcclip/data/datasets/lvis_1203_with_prompt_eng.txt", 'r').read().splitlines()
-        lvis_classes = [x[x.find(':')+1:] for x in lvis_classes]
-        lvis_colors = list(
-            itertools.islice(itertools.cycle(coco_metadata.stuff_colors), len(lvis_classes))
-        )
-        # rerrange to thing_classes, stuff_classes
-        coco_thing_classes = coco_metadata.thing_classes
-        coco_stuff_classes = [x for x in coco_metadata.stuff_classes if x not in coco_thing_classes]
-        coco_thing_colors = coco_metadata.thing_colors
-        coco_stuff_colors = [x for x in coco_metadata.stuff_colors if x not in coco_thing_colors]
-        ade20k_thing_classes = ade20k_metadata.thing_classes
-        ade20k_stuff_classes = [x for x in ade20k_metadata.stuff_classes if x not in ade20k_thing_classes]
-        ade20k_thing_colors = ade20k_metadata.thing_colors
-        ade20k_stuff_colors = [x for x in ade20k_metadata.stuff_colors if x not in ade20k_thing_colors]
+        dataset = cfg.DATASETS.TEST[0]
+        self.metadata = MetadataCatalog.get(dataset)
 
-        user_classes = []
-        user_colors = [random_color(rgb=True, maximum=1) for _ in range(len(user_classes))]
-
-        stuff_classes = coco_stuff_classes + ade20k_stuff_classes
-        stuff_colors = coco_stuff_colors + ade20k_stuff_colors
-        thing_classes = user_classes + coco_thing_classes + ade20k_thing_classes + lvis_classes
-        thing_colors = user_colors + coco_thing_colors + ade20k_thing_colors + lvis_colors
-
-        thing_dataset_id_to_contiguous_id = {x: x for x in range(len(thing_classes))}
-        DatasetCatalog.register(
-            "openvocab_dataset", lambda x: []
-        )
-        self.metadata = MetadataCatalog.get("openvocab_dataset").set(
-            stuff_classes=thing_classes+stuff_classes,
-            stuff_colors=thing_colors+stuff_colors,
-            thing_dataset_id_to_contiguous_id=thing_dataset_id_to_contiguous_id,
-        )
         #print("self.metadata:", self.metadata)
         self.cpu_device = torch.device("cpu")
         self.instance_mode = instance_mode
@@ -159,24 +223,36 @@ class VisualizationDemo(object):
             predictions (dict): the output of the model.
             vis_output (VisImage): the visualized image output.
         """
-        vis_output = None
         predictions = self.predictor(image)
-        # Convert image from OpenCV BGR format to Matplotlib RGB format.
-        image = image[:, :, ::-1]
-        visualizer = OpenVocabVisualizer(image, self.metadata, instance_mode=self.instance_mode)
+
+        # Convert BGR -> RGB (matplotlib)
+        rgb = image[:, :, ::-1]
+        vis_output = {}
+
+        # Helper to ensure each render uses a clean canvas
+        def render(draw_fn):
+            viz = OpenVocabVisualizer(rgb.copy(), self.metadata, instance_mode=self.instance_mode)
+            vis = draw_fn(viz)  # returns a VisImage-like object from the visualizer
+            # Freeze pixels into your VisImage to avoid any future canvas state
+            return VisImage(vis.get_image().copy(), vis.scale)
+
         if "panoptic_seg" in predictions:
             panoptic_seg, segments_info = predictions["panoptic_seg"]
-            vis_output = visualizer.draw_panoptic_seg(
-                panoptic_seg.to(self.cpu_device), segments_info
+            vis_output["panoptic_seg"] = render(
+                lambda viz: viz.draw_panoptic_seg(panoptic_seg.to(self.cpu_device), segments_info)
             )
-        else:
-            if "sem_seg" in predictions:
-                vis_output = visualizer.draw_sem_seg(
-                    predictions["sem_seg"].argmax(dim=0).to(self.cpu_device)
-                )
-            if "instances" in predictions:
-                instances = predictions["instances"].to(self.cpu_device)
-                vis_output = visualizer.draw_instance_predictions(predictions=instances)
+
+        if "sem_seg" in predictions:
+            sem = predictions["sem_seg"].argmax(dim=0).to(self.cpu_device)
+            vis_output["sem_seg"] = render(
+                lambda viz: viz.draw_sem_seg(sem)
+            )
+
+        if "instances" in predictions:
+            instances = predictions["instances"].to(self.cpu_device)
+            vis_output["instances"] = render(
+                lambda viz: viz.draw_instance_predictions(predictions=instances)
+            )
 
         return predictions, vis_output
 
