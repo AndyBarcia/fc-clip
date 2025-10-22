@@ -77,7 +77,7 @@ def get_classification_logits(x, text_classifier, logit_scale, num_templates=Non
         final_pred_logits.append(group_logits.max(-1).values)
         cur_idx += num_t
     # Append void class (last element)
-    final_pred_logits.append(pred_logits[..., -1])
+    #final_pred_logits.append(pred_logits[..., -1])
     # Stack along new class dimension
     final_pred_logits = torch.stack(final_pred_logits, dim=-1)
     

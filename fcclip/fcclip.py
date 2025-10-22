@@ -11,6 +11,7 @@ torch._dynamo.config.suppress_errors = True
 
 from torch import nn
 from torch.nn import functional as F
+from torch.nn.utils.rnn import pad_sequence
 
 from detectron2.config import configurable
 from detectron2.data import MetadataCatalog
@@ -21,7 +22,6 @@ from detectron2.structures import Boxes, ImageList, Instances, BitMasks
 from detectron2.utils.memory import retry_if_cuda_oom
 
 from .modeling.criterion import SetCriterion
-from .modeling.matcher import HungarianMatcher
 from .modeling.transformer_decoder.box_regression import box_xyxy_to_cxcywh, box_cxcywh_to_xyxy
 
 from .modeling.transformer_decoder.fcclip_transformer_decoder import MaskPooling, get_classification_logits
@@ -133,7 +133,7 @@ class FCCLIP(nn.Module):
 
         self.train_text_classifier = None
         self.test_text_classifier = None
-        self.void_embedding = nn.Embedding(1, backbone.dim_latent) # use this for void
+        #self.void_embedding = nn.Embedding(1, backbone.dim_latent) # use this for void
 
         _, self.train_num_templates, self.train_class_names = self.prepare_class_names_from_metadata(train_metadata, train_metadata)
         self.category_overlapping_mask, self.test_num_templates, self.test_class_names = self.prepare_class_names_from_metadata(test_metadata, train_metadata)
@@ -231,43 +231,18 @@ class FCCLIP(nn.Module):
         class_weight = cfg.MODEL.MASK_FORMER.CLASS_WEIGHT
         dice_weight = cfg.MODEL.MASK_FORMER.DICE_WEIGHT
         mask_weight = cfg.MODEL.MASK_FORMER.MASK_WEIGHT
-        bbox_weight = cfg.MODEL.MASK_FORMER.BBOX_WEIGHT
-        giou_weight = cfg.MODEL.MASK_FORMER.GIOU_WEIGHT
-
-        # building criterion
-        matcher = HungarianMatcher(
-            cost_class=class_weight,
-            cost_mask=mask_weight,
-            cost_dice=dice_weight,
-            num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
-        )
 
         weight_dict = {
             "loss_ce": class_weight, 
             "loss_mask": mask_weight, 
             "loss_dice": dice_weight,
-            "loss_bbox": bbox_weight,
-            "loss_giou": giou_weight
         }
 
-        if deep_supervision:
-            dec_layers = cfg.MODEL.MASK_FORMER.DEC_LAYERS
-            aux_weight_dict = {}
-            for i in range(dec_layers - 1):
-                aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
-            weight_dict.update(aux_weight_dict)
-
-        losses = ["labels", "masks", "boxes"]
+        losses = ["panoptic"]
 
         criterion = SetCriterion(
-            sem_seg_head.num_classes,
-            matcher=matcher,
             weight_dict=weight_dict,
-            eos_coef=no_object_weight,
             losses=losses,
-            num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
-            oversample_ratio=cfg.MODEL.MASK_FORMER.OVERSAMPLE_RATIO,
-            importance_sample_ratio=cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO,
         )
 
         return {
@@ -334,7 +309,7 @@ class FCCLIP(nn.Module):
         features = self.backbone(images.tensor)
         text_classifier, num_templates = self.get_text_classifier()
         # Append void class weight
-        text_classifier = torch.cat([text_classifier, F.normalize(self.void_embedding.weight, dim=-1)], dim=0)
+        #text_classifier = torch.cat([text_classifier, F.normalize(self.void_embedding.weight, dim=-1)], dim=0)
         features['text_classifier'] = text_classifier
         features['num_templates'] = num_templates
         outputs = self.sem_seg_head(features)
@@ -342,25 +317,18 @@ class FCCLIP(nn.Module):
         if self.training:
             # mask classification target
             if "instances" in batched_inputs[0]:
-                gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
+                gt_instances = [x["instances"] for x in batched_inputs]
                 targets = self.prepare_targets(gt_instances, images)
             else:
                 targets = None
 
             # bipartite matching-based loss
             losses = self.criterion(outputs, targets)
-
-            for k in list(losses.keys()):
-                if k in self.criterion.weight_dict:
-                    losses[k] *= self.criterion.weight_dict[k]
-                else:
-                    # remove this loss if not specified in `weight_dict`
-                    losses.pop(k)
             return losses
         else:
-            mask_cls_results = outputs["pred_logits"]
-            mask_pred_results = outputs["pred_masks"]
-            mask_box_results = outputs.get("pred_boxes")
+            mask_cls_results = outputs["pred_logits"][-1] # (B,Q,C)
+            mask_pred_results = outputs["pred_masks"][-1] # (B,Q,H,W)
+            mask_box_results = outputs.get("pred_boxes", [None])[-1] # (B,Q,4)
 
             # We ensemble the pred logits of in-vocab and out-vocab
             clip_feature = features["clip_vis_dense"]
@@ -375,8 +343,11 @@ class FCCLIP(nn.Module):
                 raise NotImplementedError
 
             out_vocab_cls_results = get_classification_logits(pooled_clip_feature, text_classifier, self.backbone.clip_model.logit_scale, num_templates)
-            in_vocab_cls_results = mask_cls_results[..., :-1] # remove void
-            out_vocab_cls_results = out_vocab_cls_results[..., :-1] # remove void
+            #in_vocab_cls_results = mask_cls_results[..., :-1] # remove void
+            #out_vocab_cls_results = out_vocab_cls_results[..., :-1] # remove void
+
+            in_vocab_cls_results = mask_cls_results
+            out_vocab_cls_results = out_vocab_cls_results
 
             # Reference: https://github.com/NVlabs/ODISE/blob/main/odise/modeling/meta_arch/odise.py#L1506
             out_vocab_cls_probs = out_vocab_cls_results.softmax(-1)
@@ -460,36 +431,31 @@ class FCCLIP(nn.Module):
 
             return processed_results
 
+    @torch.no_grad()
     def prepare_targets(self, targets, images):
-        h_pad, w_pad = images.tensor.shape[-2:]
-        new_targets = []
-        for targets_per_image in targets:
-            # pad gt
-            gt_masks = targets_per_image.gt_masks
-            padded_masks = torch.zeros((gt_masks.shape[0], h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
-            padded_masks[:, : gt_masks.shape[1], : gt_masks.shape[2]] = gt_masks
-            attributes = {
-                "labels": targets_per_image.gt_classes,
-                "masks": padded_masks,
-            }
-            if targets_per_image.has("gt_boxes"):
-                h, w = targets_per_image.image_size
-                image_size_xyxy = torch.as_tensor([w, h, w, h], dtype=torch.float, device=self.device)
-                attributes["boxes"] = box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor)/image_size_xyxy
-            new_targets.append(attributes)
-        return new_targets
+        return {
+            "pan_seg": torch.stack([
+                x["pan_seg"] for x in targets
+            ], dim=0).to(self.device).to(torch.long), # (B,H,W) int64 default 0
+            "sem_seg": torch.stack([
+                x["sem_seg"] for x in targets
+            ], dim=0).to(self.device).to(torch.long), # (B,H,W) int64 default -1
+            "labels": pad_sequence([
+                x["labels"].to(self.device) for x in targets
+            ], batch_first=True, padding_value=-1), # (B,GT_max) int64 default -1
+            "boxes": [x["boxes"].to(self.device) for x in targets] # [(GT,4)]
+        }
 
     def semantic_inference(self, mask_cls, mask_pred):
-        mask_cls = F.softmax(mask_cls, dim=-1)[..., :-1]
+        mask_cls = F.sigmoid(mask_cls)
         mask_pred = mask_pred.sigmoid()
         semseg = torch.einsum("qc,qhw->chw", mask_cls, mask_pred)
         return semseg
 
     def panoptic_inference(self, mask_cls, mask_pred):
-        scores, labels = F.softmax(mask_cls, dim=-1).max(-1)
+        scores, labels = F.sigmoid(mask_cls).max(-1)
         mask_pred = mask_pred.sigmoid()
-        num_classes = len(self.test_metadata.stuff_classes)
-        keep = labels.ne(num_classes) & (scores > self.object_mask_threshold)
+        keep = (scores > self.object_mask_threshold)
         cur_scores = scores[keep]
         cur_classes = labels[keep]
         cur_masks = mask_pred[keep]

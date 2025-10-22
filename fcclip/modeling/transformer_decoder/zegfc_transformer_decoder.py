@@ -575,15 +575,11 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
 
         assert len(predictions_class) == self.num_layers + 1
 
-        out = {
-            'pred_logits': predictions_class[-1],
-            'pred_masks': predictions_mask[-1],
-            'pred_boxes': predictions_bbox[-1],
-            'aux_outputs': self._set_aux_loss(
-                predictions_class if self.mask_classification else None, predictions_mask, predictions_bbox
-            )
+        return {
+            'pred_logits': torch.stack(predictions_class, dim=0), # (L,B,Q,C)
+            'pred_masks': torch.stack(predictions_mask, dim=0), # (L,B,Q,H,W)
+            'pred_boxes': torch.stack(predictions_bbox, dim=0) if output_box is not None else predictions_bbox # (L,B,Q,4)
         }
-        return out
 
     @torch.compiler.disable(recursive=False)
     def forward_prediction_heads(
@@ -663,19 +659,3 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         attn_mask = attn_mask.detach()
 
         return outputs_class, outputs_mask, outputs_bbox, query_bbox_unsigmoid_detached, attn_mask
-
-    @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_seg_masks, outputs_bboxes):
-        # this is a workaround to make torchscript happy, as torchscript
-        # doesn't support dictionary with non-homogeneous values, such
-        # as a dict having both a Tensor and a list.
-        if self.mask_classification:
-            return [
-                {"pred_logits": a, "pred_masks": b, "pred_boxes": c}
-                for a, b, c in zip(outputs_class[:-1], outputs_seg_masks[:-1], outputs_bboxes[:-1])
-            ]
-        else:
-            return [
-                {"pred_masks": b, "pred_boxes": c}
-                for b, c in zip(outputs_seg_masks[:-1], outputs_bboxes[:-1])
-            ]
