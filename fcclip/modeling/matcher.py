@@ -1,6 +1,6 @@
 """
 This file may have been modified by Bytedance Ltd. and/or its affiliates (“Bytedance's Modifications”).
-All Bytedance's Modifications are Copyright (year) Bytedance Ltd. and/or its affiliates. 
+All Bytedance's Modifications are Copyright (year) Bytedance Ltd. and/or its affiliates.
 
 Reference: https://github.com/facebookresearch/Mask2Former/blob/main/mask2former/modeling/matcher.py
 
@@ -8,67 +8,38 @@ Modules to compute the matching cost and solve the corresponding LSAP.
 """
 
 import torch
-import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 from torch import nn
 from torch.cuda.amp import autocast
 
-from detectron2.projects.point_rend.point_features import point_sample
+from .mask_utils import compute_mask_block_counts
 
 
-def batch_dice_loss(inputs: torch.Tensor, targets: torch.Tensor):
-    """
-    Compute the DICE loss, similar to generalized IOU for masks
-    Args:
-        inputs: A float tensor of arbitrary shape.
-                The predictions for each example.
-        targets: A float tensor with the same shape as inputs. Stores the binary
-                 classification label for each element in inputs
-                (0 for the negative class and 1 for the positive class).
-    """
-    inputs = inputs.sigmoid()
-    inputs = inputs.flatten(1)
-    numerator = 2 * torch.einsum("nc,mc->nm", inputs, targets)
-    denominator = inputs.sum(-1)[:, None] + targets.sum(-1)[None, :]
-    loss = 1 - (numerator + 1) / (denominator + 1)
+def batch_sigmoid_ce_loss(
+    logits: torch.Tensor,
+    target_counts: torch.Tensor,
+    block_area: int,
+    original_hw: int,
+) -> torch.Tensor:
+    abs_logits = logits.abs()
+    max_logits = torch.clamp(logits, min=0)
+    logexp = torch.log1p(torch.exp(-abs_logits))
+    sum_max = block_area * max_logits.sum(dim=1)
+    sum_logexp = block_area * logexp.sum(dim=1)
+    dot = torch.einsum("qc,mc->qm", logits, target_counts)
+    loss = sum_max[:, None] - dot + sum_logexp[:, None]
+    return loss / original_hw
+
+
+def batch_dice_loss(
+    logits: torch.Tensor, target_counts: torch.Tensor, block_area: int
+) -> torch.Tensor:
+    probs = torch.sigmoid(logits)
+    intersection = torch.einsum("qc,mc->qm", probs, target_counts)
+    pred_sum = block_area * probs.sum(dim=1)
+    target_sum = target_counts.sum(dim=1)
+    loss = 1 - (2 * intersection + 1) / (pred_sum[:, None] + target_sum[None, :] + 1)
     return loss
-
-
-batch_dice_loss_jit = torch.jit.script(
-    batch_dice_loss
-)  # type: torch.jit.ScriptModule
-
-
-def batch_sigmoid_ce_loss(inputs: torch.Tensor, targets: torch.Tensor):
-    """
-    Args:
-        inputs: A float tensor of arbitrary shape.
-                The predictions for each example.
-        targets: A float tensor with the same shape as inputs. Stores the binary
-                 classification label for each element in inputs
-                (0 for the negative class and 1 for the positive class).
-    Returns:
-        Loss tensor
-    """
-    hw = inputs.shape[1]
-
-    pos = F.binary_cross_entropy_with_logits(
-        inputs, torch.ones_like(inputs), reduction="none"
-    )
-    neg = F.binary_cross_entropy_with_logits(
-        inputs, torch.zeros_like(inputs), reduction="none"
-    )
-
-    loss = torch.einsum("nc,mc->nm", pos, targets) + torch.einsum(
-        "nc,mc->nm", neg, (1 - targets)
-    )
-
-    return loss / hw
-
-
-batch_sigmoid_ce_loss_jit = torch.jit.script(
-    batch_sigmoid_ce_loss
-)  # type: torch.jit.ScriptModule
 
 
 class HungarianMatcher(nn.Module):
@@ -109,41 +80,28 @@ class HungarianMatcher(nn.Module):
             out_prob = outputs["pred_logits"][b].softmax(-1)  # [num_queries, num_classes]
             tgt_ids = targets[b]["labels"]
 
-            if tgt_ids.numel() > 0:                
+            if tgt_ids.numel() > 0:
                 # Compute the classification cost.
                 cost_class = -out_prob[:, tgt_ids]
 
                 out_mask = outputs["pred_masks"][b]  # [num_queries, H_pred, W_pred]
                 tgt_mask = targets[b]["masks"].to(out_mask)
-
-                out_mask = out_mask[:, None]
-                tgt_mask = tgt_mask[:, None]
-                
-                # all masks share the same set of points for efficient matching!
-                point_coords = torch.rand(1, self.num_points, 2, device=out_mask.device)
-                
-                # Sample points from ground-truth masks
-                tgt_mask = point_sample(
-                    tgt_mask,
-                    point_coords.repeat(tgt_mask.shape[0], 1, 1),
-                    align_corners=False,
-                ).squeeze(1)
-
-                # Sample points from predicted masks
-                out_mask = point_sample(
-                    out_mask,
-                    point_coords.repeat(out_mask.shape[0], 1, 1),
-                    align_corners=False,
-                ).squeeze(1)
+                target_counts, block_area, H_t, W_t = compute_mask_block_counts(
+                    tgt_mask, out_mask.shape[-2:]
+                )
+                out_mask = out_mask.flatten(1)
+                target_counts = target_counts.to(device=out_mask.device, dtype=out_mask.dtype)
 
                 with autocast(enabled=False):
                     out_mask = out_mask.float()
-                    tgt_mask = tgt_mask.float()
+                    target_counts = target_counts.float()
                     # Compute the focal loss between masks
-                    cost_mask = batch_sigmoid_ce_loss_jit(out_mask, tgt_mask)
+                    cost_mask = batch_sigmoid_ce_loss(
+                        out_mask, target_counts, block_area, H_t * W_t
+                    )
                     # Compute the dice loss between masks
-                    cost_dice = batch_dice_loss_jit(out_mask, tgt_mask)
-                
+                    cost_dice = batch_dice_loss(out_mask, target_counts, block_area)
+
                 # Final cost matrix
                 C = (
                     self.cost_mask * cost_mask
