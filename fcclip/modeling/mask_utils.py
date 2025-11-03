@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 
+@torch.no_grad()
 def compute_mask_block_counts(
     targets: torch.Tensor, size: Tuple[int, int]
 ) -> Tuple[torch.Tensor, int, int, int]:
