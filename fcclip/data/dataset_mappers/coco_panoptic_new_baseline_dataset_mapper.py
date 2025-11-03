@@ -151,11 +151,21 @@ class COCOPanopticNewBaselineDatasetMapper:
             for segment_info in segments_info:
                 class_id = segment_info["category_id"]
                 if not segment_info["iscrowd"]:
-                    classes.append(class_id)
                     mask = pan_seg_gt == segment_info["id"]
+                    if not mask.any():
+                        continue
+                    classes.append(class_id)
                     masks.append(mask)
                     phi = np.where(mask, -1.0, 1.0).astype(np.float32)
-                    sdfs.append(skfmm.distance(phi, dx=1))
+                    sdf = skfmm.distance(phi, dx=1)
+                    if not np.isfinite(sdf).all():
+                        sdf = np.zeros_like(phi, dtype=np.float32)
+                    max_abs = np.abs(sdf).max()
+                    if max_abs > 0:
+                        sdf = np.clip(sdf / max_abs, -1.0, 1.0)
+                    else:
+                        sdf = np.zeros_like(sdf, dtype=np.float32)
+                    sdfs.append(sdf.astype(np.float32))
 
             classes = np.array(classes)
             instances.gt_classes = torch.tensor(classes, dtype=torch.int64)

@@ -466,8 +466,8 @@ class FCCLIP(nn.Module):
         for targets_per_image in targets:
             # pad gt
             gt_fields = targets_per_image.gt_masks
-            padded_fields = torch.zeros(
-                (gt_fields.shape[0], h_pad, w_pad), dtype=gt_fields.dtype, device=gt_fields.device
+            padded_fields = torch.full(
+                (gt_fields.shape[0], h_pad, w_pad), 1.0, dtype=gt_fields.dtype, device=gt_fields.device
             )
             padded_fields[:, : gt_fields.shape[1], : gt_fields.shape[2]] = gt_fields
             attributes = {
