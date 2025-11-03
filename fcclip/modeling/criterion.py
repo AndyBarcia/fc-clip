@@ -1,13 +1,11 @@
 """
 This file may have been modified by Bytedance Ltd. and/or its affiliates (“Bytedance's Modifications”).
-All Bytedance's Modifications are Copyright (year) Bytedance Ltd. and/or its affiliates. 
+All Bytedance's Modifications are Copyright (year) Bytedance Ltd. and/or its affiliates.
 
 Reference: https://github.com/facebookresearch/Mask2Former/blob/main/mask2former/modeling/criterion.py
 
 FC-CLIP criterion.
 """
-
-import logging
 
 import torch
 import torch.nn.functional as F
@@ -23,61 +21,9 @@ from ..utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tenso
 from .transformer_decoder.box_regression import generalized_box_iou, box_cxcywh_to_xyxy
 
 
-def dice_loss(
-        inputs: torch.Tensor,
-        targets: torch.Tensor,
-        num_masks: float,
-    ):
-    """
-    Compute the DICE loss, similar to generalized IOU for masks
-    Args:
-        inputs: A float tensor of arbitrary shape.
-                The predictions for each example.
-        targets: A float tensor with the same shape as inputs. Stores the binary
-                 classification label for each element in inputs
-                (0 for the negative class and 1 for the positive class).
-    """
-    inputs = inputs.sigmoid()
-    inputs = inputs.flatten(1)
-    numerator = 2 * (inputs * targets).sum(-1)
-    denominator = inputs.sum(-1) + targets.sum(-1)
-    loss = 1 - (numerator + 1) / (denominator + 1)
-    return loss.sum() / num_masks
-
-
-dice_loss_jit = torch.jit.script(
-    dice_loss
-)  # type: torch.jit.ScriptModule
-
-
-def sigmoid_ce_loss(
-        inputs: torch.Tensor,
-        targets: torch.Tensor,
-        num_masks: float,
-    ):
-    """
-    Args:
-        inputs: A float tensor of arbitrary shape.
-                The predictions for each example.
-        targets: A float tensor with the same shape as inputs. Stores the binary
-                 classification label for each element in inputs
-                (0 for the negative class and 1 for the positive class).
-    Returns:
-        Loss tensor
-    """
-    loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
-
-    return loss.mean(1).sum() / num_masks
-
-
-sigmoid_ce_loss_jit = torch.jit.script(
-    sigmoid_ce_loss
-)  # type: torch.jit.ScriptModule
-
-
 def calculate_uncertainty(logits):
     """
-    We estimate uncerainty as L1 distance between 0.0 and the logit prediction in 'logits' for the
+    We estimate uncerainty as L1 distance between 0.0 and the prediction in 'logits' for the
         foreground class in `classes`.
     Args:
         logits (Tensor): A tensor of shape (R, 1, ...) for class-specific or
@@ -143,7 +89,7 @@ class SetCriterion(nn.Module):
         return losses
     
     def loss_masks(self, outputs, targets, indices, num_masks):
-        """Compute the losses related to the masks: the focal loss and the dice loss.
+        """Compute the loss related to the signed distance fields.
         targets dicts must contain the key "masks" containing a tensor of dim [nb_target_boxes, h, w]
         """
         assert "pred_masks" in outputs
@@ -167,8 +113,7 @@ class SetCriterion(nn.Module):
         # use loss_mask.sum() * 0.0 to avoid angering the DDP gods.
         if src_masks.shape[0] == 0:
             losses = {
-                "loss_mask": outputs["pred_masks"].sum() * 0.0,
-                "loss_dice": outputs["pred_masks"].sum() * 0.0,
+                "loss_sdf": outputs["pred_masks"].sum() * 0.0,
             }
             return losses
 
@@ -195,8 +140,7 @@ class SetCriterion(nn.Module):
         ).squeeze(1)
 
         losses = {
-            "loss_mask": sigmoid_ce_loss_jit(point_logits, point_labels, num_masks),
-            "loss_dice": dice_loss_jit(point_logits, point_labels, num_masks),
+            "loss_sdf": F.l1_loss(point_logits, point_labels, reduction="none").mean(1).sum() / num_masks,
         }
 
         del src_masks

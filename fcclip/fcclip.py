@@ -231,6 +231,7 @@ class FCCLIP(nn.Module):
         class_weight = cfg.MODEL.MASK_FORMER.CLASS_WEIGHT
         dice_weight = cfg.MODEL.MASK_FORMER.DICE_WEIGHT
         mask_weight = cfg.MODEL.MASK_FORMER.MASK_WEIGHT
+        sdf_weight = mask_weight + dice_weight
         bbox_weight = cfg.MODEL.MASK_FORMER.BBOX_WEIGHT
         giou_weight = cfg.MODEL.MASK_FORMER.GIOU_WEIGHT
 
@@ -243,9 +244,8 @@ class FCCLIP(nn.Module):
         )
 
         weight_dict = {
-            "loss_ce": class_weight, 
-            "loss_mask": mask_weight, 
-            "loss_dice": dice_weight,
+            "loss_ce": class_weight,
+            "loss_sdf": sdf_weight,
             "loss_bbox": bbox_weight,
             "loss_giou": giou_weight
         }
@@ -465,12 +465,14 @@ class FCCLIP(nn.Module):
         new_targets = []
         for targets_per_image in targets:
             # pad gt
-            gt_masks = targets_per_image.gt_masks
-            padded_masks = torch.zeros((gt_masks.shape[0], h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
-            padded_masks[:, : gt_masks.shape[1], : gt_masks.shape[2]] = gt_masks
+            gt_fields = targets_per_image.gt_masks
+            padded_fields = torch.zeros(
+                (gt_fields.shape[0], h_pad, w_pad), dtype=gt_fields.dtype, device=gt_fields.device
+            )
+            padded_fields[:, : gt_fields.shape[1], : gt_fields.shape[2]] = gt_fields
             attributes = {
                 "labels": targets_per_image.gt_classes,
-                "masks": padded_masks,
+                "masks": padded_fields,
             }
             if targets_per_image.has("gt_boxes"):
                 h, w = targets_per_image.image_size
