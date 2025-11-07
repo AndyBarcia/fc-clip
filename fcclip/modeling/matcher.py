@@ -50,7 +50,8 @@ class HungarianMatcher(nn.Module):
     while the others are un-matched (and thus treated as non-objects).
     """
 
-    def __init__(self, cost_class: float = 1, cost_mask: float = 1, cost_dice: float = 1, num_points: int = 0):
+    def __init__(self, cost_class: float = 1, cost_mask: float = 1, cost_dice: float = 1,
+                 cost_area: float = 0, num_points: int = 0):
         """Creates the matcher
 
         Params:
@@ -62,8 +63,11 @@ class HungarianMatcher(nn.Module):
         self.cost_class = cost_class
         self.cost_mask = cost_mask
         self.cost_dice = cost_dice
+        self.cost_area = cost_area
 
-        assert cost_class != 0 or cost_mask != 0 or cost_dice != 0, "all costs cant be 0"
+        assert (
+            cost_class != 0 or cost_mask != 0 or cost_dice != 0 or cost_area != 0
+        ), "all costs cant be 0"
 
         self.num_points = num_points
 
@@ -102,11 +106,19 @@ class HungarianMatcher(nn.Module):
                     # Compute the dice loss between masks
                     cost_dice = batch_dice_loss(out_mask, target_counts, block_area)
 
+                if self.cost_area != 0 and "pred_areas" in outputs:
+                    pred_areas = outputs["pred_areas"][b].float()
+                    target_areas = tgt_mask.float().flatten(1).mean(dim=1)
+                    cost_area = (pred_areas[:, None] - target_areas[None, :]).abs()
+                else:
+                    cost_area = 0
+
                 # Final cost matrix
                 C = (
                     self.cost_mask * cost_mask
                     + self.cost_class * cost_class
                     + self.cost_dice * cost_dice
+                    + self.cost_area * cost_area
                 )
             else:
                 # This block runs if there are NO ground-truth objects.
@@ -154,6 +166,7 @@ class HungarianMatcher(nn.Module):
             "cost_class: {}".format(self.cost_class),
             "cost_mask: {}".format(self.cost_mask),
             "cost_dice: {}".format(self.cost_dice),
+            "cost_area: {}".format(self.cost_area),
         ]
         lines = [head] + [" " * _repr_indent + line for line in body]
         return "\n".join(lines)
