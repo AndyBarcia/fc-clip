@@ -233,21 +233,24 @@ class FCCLIP(nn.Module):
         mask_weight = cfg.MODEL.MASK_FORMER.MASK_WEIGHT
         bbox_weight = cfg.MODEL.MASK_FORMER.BBOX_WEIGHT
         giou_weight = cfg.MODEL.MASK_FORMER.GIOU_WEIGHT
+        area_weight = cfg.MODEL.MASK_FORMER.AREA_WEIGHT
 
         # building criterion
         matcher = HungarianMatcher(
             cost_class=class_weight,
             cost_mask=mask_weight,
             cost_dice=dice_weight,
+            cost_area=area_weight,
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
         )
 
         weight_dict = {
-            "loss_ce": class_weight, 
-            "loss_mask": mask_weight, 
+            "loss_ce": class_weight,
+            "loss_mask": mask_weight,
             "loss_dice": dice_weight,
             "loss_bbox": bbox_weight,
-            "loss_giou": giou_weight
+            "loss_giou": giou_weight,
+            "loss_area": area_weight,
         }
 
         if deep_supervision:
@@ -257,7 +260,7 @@ class FCCLIP(nn.Module):
                 aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
             weight_dict.update(aux_weight_dict)
 
-        losses = ["labels", "masks", "boxes"]
+        losses = ["labels", "masks", "boxes", "areas"]
 
         criterion = SetCriterion(
             sem_seg_head.num_classes,

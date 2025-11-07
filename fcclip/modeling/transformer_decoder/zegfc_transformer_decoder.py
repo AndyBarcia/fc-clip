@@ -367,7 +367,11 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         self._mask_pooling_proj = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim))
-        
+        self.area_embed = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, 1)
+        )
+
         self.class_embed_type = class_embed_type
         if self.class_embed_type == "mlp":
             self.class_embed = MLP(hidden_dim, hidden_dim, clip_embedding_dim, 3)
@@ -480,6 +484,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         predictions_class = []
         predictions_mask = []
         predictions_bbox = []
+        predictions_area = []
 
         # Optional starting cross-attention for text. 
         if self.text_atnn_cls:
@@ -506,20 +511,21 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             mem_attn_logits = None
 
         # prediction heads on learnable query features
-        outputs_class, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
-            output, 
+        outputs_class, outputs_mask, output_box, outputs_area, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
+            output,
             mask_features,
             mem_attn_logits,
             text_attn_logits,
             query_bbox_unsigmoid=query_bbox_unsigmoid,
             attn_mask_size=size_list[0],
             attn_mask_target_size=size_list[0],
-            text_classifier=text_classifier, 
+            text_classifier=text_classifier,
             num_templates=num_templates
         )
         predictions_class.append(outputs_class)
         predictions_mask.append(outputs_mask)
         predictions_bbox.append(output_box)
+        predictions_area.append(outputs_area)
 
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
@@ -558,20 +564,21 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                 output
             )
 
-            outputs_class, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
-                output, 
-                mask_features, 
+            outputs_class, outputs_mask, output_box, outputs_area, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
+                output,
+                mask_features,
                 mem_attn_logits,
                 text_attn_logits,
                 query_bbox_unsigmoid=query_bbox_unsigmoid,
                 attn_mask_size=size_list[i % self.num_feature_levels],
                 attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels],
-                text_classifier=text_classifier, 
+                text_classifier=text_classifier,
                 num_templates=num_templates
             )
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
             predictions_bbox.append(output_box)
+            predictions_area.append(outputs_area)
 
         assert len(predictions_class) == self.num_layers + 1
 
@@ -579,23 +586,24 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             'pred_logits': predictions_class[-1],
             'pred_masks': predictions_mask[-1],
             'pred_boxes': predictions_bbox[-1],
+            'pred_areas': predictions_area[-1],
             'aux_outputs': self._set_aux_loss(
-                predictions_class if self.mask_classification else None, predictions_mask, predictions_bbox
+                predictions_class if self.mask_classification else None, predictions_mask, predictions_bbox, predictions_area
             )
         }
         return out
 
     @torch.compiler.disable(recursive=False)
     def forward_prediction_heads(
-        self, 
-        output, 
-        mask_features, 
+        self,
+        output,
+        mask_features,
         mem_attn_logits,
-        text_attn_logits, 
+        text_attn_logits,
         query_bbox_unsigmoid,
         attn_mask_size,
-        attn_mask_target_size, 
-        text_classifier, 
+        attn_mask_target_size,
+        text_classifier,
         num_templates
     ):
         decoder_output = self.decoder_norm(output)
@@ -654,6 +662,9 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         class_embed = self.class_embed(maskpool_embeddings + decoder_output)
         outputs_class = get_classification_logits(class_embed, text_classifier, self.logit_scale, num_templates, text_attn_logits)
 
+        area_features = maskpool_embeddings + decoder_output
+        outputs_area = torch.sigmoid(self.area_embed(area_features).squeeze(-1))
+
         # NOTE: prediction is of higher-resolution
         # [B, Q, H, W] -> [B, Q, H*W] -> [B, h, Q, H*W] -> [B*h, Q, HW]
         attn_mask = F.interpolate(outputs_mask, size=attn_mask_target_size, mode="bilinear", align_corners=False)
@@ -662,20 +673,20 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         attn_mask = (attn_mask.sigmoid().flatten(2).unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0, 1) < 0.5).bool()
         attn_mask = attn_mask.detach()
 
-        return outputs_class, outputs_mask, outputs_bbox, query_bbox_unsigmoid_detached, attn_mask
+        return outputs_class, outputs_mask, outputs_bbox, outputs_area, query_bbox_unsigmoid_detached, attn_mask
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_seg_masks, outputs_bboxes):
+    def _set_aux_loss(self, outputs_class, outputs_seg_masks, outputs_bboxes, outputs_areas):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
         if self.mask_classification:
             return [
-                {"pred_logits": a, "pred_masks": b, "pred_boxes": c}
-                for a, b, c in zip(outputs_class[:-1], outputs_seg_masks[:-1], outputs_bboxes[:-1])
+                {"pred_logits": a, "pred_masks": b, "pred_boxes": c, "pred_areas": d}
+                for a, b, c, d in zip(outputs_class[:-1], outputs_seg_masks[:-1], outputs_bboxes[:-1], outputs_areas[:-1])
             ]
         else:
             return [
-                {"pred_masks": b, "pred_boxes": c}
-                for b, c in zip(outputs_seg_masks[:-1], outputs_bboxes[:-1])
+                {"pred_masks": b, "pred_boxes": c, "pred_areas": d}
+                for b, c, d in zip(outputs_seg_masks[:-1], outputs_bboxes[:-1], outputs_areas[:-1])
             ]

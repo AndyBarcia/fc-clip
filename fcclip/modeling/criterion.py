@@ -141,6 +141,28 @@ class SetCriterion(nn.Module):
 
         return losses
 
+    def loss_areas(self, outputs, targets, indices, num_masks):
+        if "pred_areas" not in outputs or outputs["pred_areas"] is None:
+            return {}
+
+        idx = self._get_src_permutation_idx(indices)
+        src_areas = outputs["pred_areas"][idx]
+
+        if src_areas.numel() == 0:
+            return {"loss_area": outputs["pred_areas"].sum() * 0.0}
+
+        masks = [t["masks"] for t in targets]
+        target_masks, _ = nested_tensor_from_tensor_list(masks).decompose()
+        target_masks = target_masks.to(src_areas)
+        tgt_idx = self._get_tgt_permutation_idx(indices)
+        target_masks = target_masks[tgt_idx]
+        target_areas = target_masks.flatten(1).to(dtype=src_areas.dtype).mean(dim=1)
+
+        loss_area = F.l1_loss(src_areas, target_areas, reduction="none")
+        losses = {"loss_area": loss_area.sum() / num_masks}
+
+        return losses
+
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -157,7 +179,8 @@ class SetCriterion(nn.Module):
         loss_map = {
             'labels': self.loss_labels,
             'masks': self.loss_masks,
-            'boxes': self.loss_boxes
+            'boxes': self.loss_boxes,
+            'areas': self.loss_areas
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_masks)
