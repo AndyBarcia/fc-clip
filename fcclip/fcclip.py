@@ -20,7 +20,7 @@ from detectron2.modeling.postprocessing import sem_seg_postprocess
 from detectron2.structures import Boxes, ImageList, Instances, BitMasks
 from detectron2.utils.memory import retry_if_cuda_oom
 
-from .modeling.criterion import SetCriterion
+from .modeling.criterion import SetCriterion, ShiftToMatchArea
 from .modeling.matcher import HungarianMatcher
 from .modeling.transformer_decoder.box_regression import box_xyxy_to_cxcywh, box_cxcywh_to_xyxy
 
@@ -363,7 +363,19 @@ class FCCLIP(nn.Module):
         else:
             mask_cls_results = outputs["pred_logits"]
             mask_pred_results = outputs["pred_masks"]
+            mask_area_results = outputs["pred_areas"]
             mask_box_results = outputs.get("pred_boxes")
+
+            # Shift the logits according to the predicted areas.
+            B, Q, Hm, Wm = mask_pred_results.shape
+            shifted = []
+            for b in range(B):
+                shifted.append(
+                    self.shift_logits_with_pred_area(
+                        mask_pred_results[b], mask_area_results[b]
+                    )
+                )
+            mask_pred_results = torch.stack(shifted, dim=0)
 
             # We ensemble the pred logits of in-vocab and out-vocab
             clip_feature = features["clip_vis_dense"]
@@ -481,6 +493,29 @@ class FCCLIP(nn.Module):
                 attributes["boxes"] = box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor)/image_size_xyxy
             new_targets.append(attributes)
         return new_targets
+
+    def shift_logits_with_pred_area(self, mask_logits: torch.Tensor, pred_area: torch.Tensor) -> torch.Tensor:
+        """
+        Enforce the predicted area fraction on per-query mask logits by a constant shift.
+        Args:
+            mask_logits: (Q, H, W) raw logits for one image.
+            pred_area:   (Q,) or (Q,1) predicted area fractions in [0, 1] (same queries).
+        Returns:
+            shifted logits with per-query constant shifts so that
+            sum(sigmoid(z_shifted)) == pred_area * (H*W) for each query.
+        """
+        Q, H, W = mask_logits.shape
+        z = mask_logits.reshape(Q, -1)                               # (Q, N)
+        N = z.shape[1]
+
+        a = pred_area
+        if a.dim() > 1:
+            a = a.squeeze(-1)
+        a = a.to(dtype=mask_logits.dtype).clamp(0.0, 1.0)            # (Q,)
+        K = (a * N).to(dtype=mask_logits.dtype)                      # target positive counts per query
+
+        z_shift, _ = ShiftToMatchArea.apply(z, K, 20, 1e-7)
+        return z_shift.view(Q, H, W)
 
     def semantic_inference(self, mask_cls, mask_pred):
         mask_cls = F.softmax(mask_cls, dim=-1)[..., :-1]

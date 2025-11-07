@@ -13,33 +13,72 @@ from torch import nn
 from torch.cuda.amp import autocast
 
 from .mask_utils import compute_mask_block_counts
+from .criterion import ShiftToMatchArea
 
 
-def batch_sigmoid_ce_loss(
-    logits: torch.Tensor,
-    target_counts: torch.Tensor,
+@torch.no_grad()
+def pairwise_area_conditioned_costs(
+    logits_qn: torch.Tensor,          # [Q, N] flattened mask logits for all queries
+    tgt_pos_counts_mn: torch.Tensor,  # [M, N] blockwise positive counts per target (0..block_area per cell)
     block_area: int,
-    original_hw: int,
-) -> torch.Tensor:
-    abs_logits = logits.abs()
-    max_logits = torch.clamp(logits, min=0)
-    logexp = torch.log1p(torch.exp(-abs_logits))
-    sum_max = block_area * max_logits.sum(dim=1)
-    sum_logexp = block_area * logexp.sum(dim=1)
-    dot = torch.einsum("qc,mc->qm", logits, target_counts)
-    loss = sum_max[:, None] - dot + sum_logexp[:, None]
-    return loss / original_hw
+    hw: int,                          # H_t * W_t (target resolution area)
+    chunk_size: int = 64,
+):
+    """
+    Returns:
+      cost_bce:  [Q, M] area-conditioned BCE cost (with shifted logits)
+      cost_dice: [Q, M] area-conditioned Dice cost (with shifted logits)
+    """
+    device = logits_qn.device
+    dtype = torch.float32
 
+    Q, N = logits_qn.shape
+    M = tgt_pos_counts_mn.shape[0]
+    if M == 0:
+        return torch.empty(Q, 0, device=device), torch.empty(Q, 0, device=device)
 
-def batch_dice_loss(
-    logits: torch.Tensor, target_counts: torch.Tensor, block_area: int
-) -> torch.Tensor:
-    probs = torch.sigmoid(logits)
-    intersection = torch.einsum("qc,mc->qm", probs, target_counts)
-    pred_sum = block_area * probs.sum(dim=1)
-    target_sum = target_counts.sum(dim=1)
-    loss = 1 - (2 * intersection + 1) / (pred_sum[:, None] + target_sum[None, :] + 1)
-    return loss
+    # numerics in float32
+    z_qn = logits_qn.to(dtype=dtype)
+    pos_mn = tgt_pos_counts_mn.to(device=device, dtype=dtype)
+
+    # High-res positives per target and low-res target counts for the shifter
+    K_high_m = pos_mn.sum(dim=1)                       # [M] (in pixels at target res)
+    K_low_m = (K_high_m / block_area).clamp_(0.0, float(N))  # [M] (in "logit units")
+
+    cost_bce  = torch.empty(Q, M, device=device, dtype=dtype)
+    cost_dice = torch.empty(Q, M, device=device, dtype=dtype)
+
+    for m0 in range(0, M, chunk_size):
+        m1 = min(M, m0 + chunk_size)
+        Mc = m1 - m0
+
+        # Shape to (Q, Mc, N) so we can shift per (q,m) pair with a single call
+        z = z_qn.unsqueeze(1).expand(Q, Mc, N)                        # [Q, Mc, N]
+        K = K_low_m[m0:m1].unsqueeze(0).expand(Q, Mc)                 # [Q, Mc]
+
+        # Area-conditioned shift (uniform replication): sum_j σ(z_{q,m,j} + λ_{q,m}) = K_low[m]
+        z_shift, _ = ShiftToMatchArea.apply(z, K, 5, 1e-7)           # [Q, Mc, N]
+
+        # ---- BCE with shifted logits (aggregate using scalar block_area) ----
+        abs_logits = z_shift.abs()
+        max_logits = torch.clamp(z_shift, min=0)
+        logexp = torch.log1p(torch.exp(-abs_logits))
+
+        pos = pos_mn[m0:m1].unsqueeze(0).expand(Q, Mc, N)             # [Q, Mc, N]
+        loss_block = block_area * max_logits - z_shift * pos + block_area * logexp
+        bce = loss_block.sum(dim=2) / float(hw)                       # [Q, Mc]
+
+        # ---- Dice with shifted logits (aggregate using scalar block_area) ----
+        probs = torch.sigmoid(z_shift)
+        intersection = (probs * pos).sum(dim=2)                       # [Q, Mc]
+        pred_sum = block_area * probs.sum(dim=2)                      # [Q, Mc]
+        target_sum = K_high_m[m0:m1].unsqueeze(0).expand(Q, Mc)       # [Q, Mc]
+        dice = 1.0 - (2.0 * intersection + 1.0) / (pred_sum + target_sum + 1.0)
+
+        cost_bce[:, m0:m1]  = bce
+        cost_dice[:, m0:m1] = dice
+
+    return cost_bce, cost_dice
 
 
 class HungarianMatcher(nn.Module):
@@ -100,11 +139,9 @@ class HungarianMatcher(nn.Module):
                     out_mask = out_mask.float()
                     target_counts = target_counts.float()
                     # Compute the focal loss between masks
-                    cost_mask = batch_sigmoid_ce_loss(
+                    cost_mask, cost_dice = pairwise_area_conditioned_costs(
                         out_mask, target_counts, block_area, H_t * W_t
                     )
-                    # Compute the dice loss between masks
-                    cost_dice = batch_dice_loss(out_mask, target_counts, block_area)
 
                 if self.cost_area != 0 and "pred_areas" in outputs:
                     pred_areas = outputs["pred_areas"][b].float()

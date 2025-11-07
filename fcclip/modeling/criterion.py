@@ -10,6 +10,7 @@ FC-CLIP criterion.
 import logging
 
 import torch
+from torch import autograd
 import torch.nn.functional as F
 from torch import nn
 
@@ -18,6 +19,97 @@ from detectron2.utils.comm import get_world_size
 from ..utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list
 from .transformer_decoder.box_regression import generalized_box_iou, box_cxcywh_to_xyxy
 from .mask_utils import compute_mask_block_counts
+
+
+class ShiftToMatchArea(autograd.Function):
+    @staticmethod
+    def forward(ctx, z, K, max_iters: int = 20, tol: float = 1e-7):
+        """
+        z:  (B,Q,N) logits, any dtype
+        K:  (B,Q)   target counts
+        Returns z': (B,Q,N) with sum sigmoid(z') == K (safeguarded Newton).
+        """
+        B, Q, N = z.shape
+        # Work in float64 for the root solve
+        zd = z.double()
+        Kd = K.to(dtype=torch.float64, device=z.device).clamp_(0.0, float(N))
+
+        # Brackets (guarantee feasibility): sigma(z + L) ~ 0, sigma(z + U) ~ 1
+        z_max = zd.max(dim=2, keepdim=True).values
+        z_min = zd.min(dim=2, keepdim=True).values
+        L = -20.0 - z_max           # (B,Q,1)
+        U =  20.0 - z_min           # (B,Q,1)
+
+        def _logit(x, eps=1e-6):
+            x = x.clamp(min=eps, max=1 - eps)
+            return torch.log(x) - torch.log1p(-x)
+
+        # Reasonable initializer via mean logit difference
+        p0_mean = torch.sigmoid(zd).mean(dim=2)      # (B,Q)
+        t_mean  = Kd / float(N)                      # (B,Q)
+        lam = (_logit(t_mean) - _logit(p0_mean)).unsqueeze(-1)  # (B,Q,1)
+        # Project init into bracket
+        lam = lam.clamp_min(L).clamp_max(U)
+
+        Kcol = Kd.unsqueeze(-1)
+
+        # Helper
+        def eval_fS(l):
+            p = torch.sigmoid(zd + l)
+            # TODO here sum or binary sum?
+            # f = (p>0.5).sum(dim=2, keepdim=True) - Kcol
+            f = p.sum(dim=2, keepdim=True) - Kcol
+            s = (p * (1 - p)).sum(dim=2, keepdim=True)
+            return f, s
+
+        f, S = eval_fS(lam)
+
+        for _ in range(max_iters):
+            done = f.abs() <= tol
+            if done.all():
+                break
+
+            # Newton proposal (guard S)
+            S_safe = S + 1e-18
+            newton_step = f / S_safe
+            lam_newton = lam - newton_step
+
+            # If Newton leaves bracket or doesn't improve |f|, use bisection
+            out_of_bracket = (lam_newton < L) | (lam_newton > U)
+
+            # Evaluate Newton where valid & not done
+            lam_try = torch.where(out_of_bracket | done, lam, lam_newton)
+            f_try, S_try = eval_fS(lam_try)
+
+            no_improve = (f_try.abs() > f.abs()) & (~out_of_bracket) & (~done)
+
+            # Bisection fallback where needed
+            mid = 0.5 * (L + U)
+            lam_next = torch.where(out_of_bracket | no_improve, mid, lam_try)
+
+            # Update brackets using sign at lam_next
+            f_next, S_next = eval_fS(lam_next)
+            go_upper = f_next > 0  # sum(sigmoid) > K => need smaller lambda (move U down)
+            U = torch.where(go_upper, lam_next, U)
+            L = torch.where(~go_upper, lam_next, L)
+
+            lam, f, S = lam_next, f_next, S_next
+
+        # Final clamp to bracket and compute shifted logits in original dtype
+        lam = lam.clamp_min(L).clamp_max(U).to(dtype=z.dtype)
+        z_shifted = z + lam
+        p_final = torch.sigmoid(z_shifted)
+        ctx.save_for_backward(p_final)
+        return z_shifted, lam
+
+    @staticmethod
+    def backward(ctx, grad_zprime, _):
+        (p,) = ctx.saved_tensors
+        s = p * (1 - p)
+        S = s.sum(dim=2, keepdim=True) + 1e-12
+        sum_g = grad_zprime.sum(dim=2, keepdim=True)
+        grad_z = grad_zprime - (s / S) * sum_g
+        return grad_z, None, None, None
 
 
 class SetCriterion(nn.Module):
@@ -71,52 +163,60 @@ class SetCriterion(nn.Module):
         return losses
     
     def loss_masks(self, outputs, targets, indices, num_masks):
-        """Compute the losses related to the masks using exact high-resolution targets."""
+        """Compute mask losses with area-conditioned (shifted) logits.
+        Keeps compute_mask_block_counts optimization. Uses the provided ShiftToMatchArea.
+        """
         assert "pred_masks" in outputs
 
         src_idx = self._get_src_permutation_idx(indices)
         tgt_idx = self._get_tgt_permutation_idx(indices)
-        src_masks = outputs["pred_masks"]
-        src_masks = src_masks[src_idx]
+
+        src_masks = outputs["pred_masks"][src_idx]              # (M, Hs, Ws)
         masks = [t["masks"] for t in targets]
-        # TODO use valid to mask invalid areas due to padding in loss
-        target_masks, valid = nested_tensor_from_tensor_list(masks).decompose()
-        target_masks = target_masks.to(src_masks)
-        target_masks = target_masks[tgt_idx]
+        target_masks, _ = nested_tensor_from_tensor_list(masks).decompose()
+        target_masks = target_masks.to(src_masks)[tgt_idx]      # (M, Ht, Wt)
 
         if src_masks.shape[0] == 0:
-            losses = {
-                "loss_mask": outputs["pred_masks"].sum() * 0.0,
-                "loss_dice": outputs["pred_masks"].sum() * 0.0,
-            }
-            return losses
+            zero = outputs["pred_masks"].sum() * 0.0
+            return {"loss_mask": zero, "loss_dice": zero}
 
-        logits = src_masks.reshape(src_masks.shape[0], -1)
-        pos_counts, block_area, H_t, W_t = compute_mask_block_counts(
+        # Flatten logits and get aggregated target counts per logit
+        logits = src_masks.reshape(src_masks.shape[0], -1)                      # (M, N)
+        pos_counts, block_area, H_t, W_t = compute_mask_block_counts(           # pos_counts: (M, N)
             target_masks, src_masks.shape[-2:]
         )
         pos_counts = pos_counts.to(device=logits.device, dtype=logits.dtype)
+        block_area = float(block_area)  # scalar (e.g., 16 for 4x4)
 
-        abs_logits = logits.abs()
-        max_logits = torch.clamp(logits, min=0)
+        # --- Area-conditioned shift (uniform replication): sum_j σ(z_j + λ) = K_low ---
+        # Convert high-res positive pixels to low-res target count
+        K_high = pos_counts.sum(dim=1)                             # (M,)
+        K_low  = (K_high / block_area).clamp_(0.0, float(logits.shape[1]))
+
+        # Use your original ShiftToMatchArea on shape (M,1,N) / (M,1)
+        z_in = logits.unsqueeze(1)                                  # (M, 1, N)
+        K_in = K_low.unsqueeze(1)                                   # (M, 1)
+        z_shift, _ = ShiftToMatchArea.apply(z_in, K_in, 20, 1e-7)   # returns (M,1,N)
+        z_shift = z_shift.squeeze(1)                                # (M, N)
+
+        # ---------- BCE with shifted logits (aggregated, numerically stable) ----------
+        abs_logits = z_shift.abs()
+        max_logits = torch.clamp(z_shift, min=0)
         logexp = torch.log1p(torch.exp(-abs_logits))
-        loss_block = block_area * max_logits - logits * pos_counts + block_area * logexp
-        loss_mask = loss_block.sum(dim=1) / (H_t * W_t)
-        loss_mask = loss_mask.sum() / num_masks
 
-        probs = torch.sigmoid(logits)
-        intersection = (probs * pos_counts).sum(dim=1)
-        pred_sum = probs.sum(dim=1) * block_area
-        target_sum = pos_counts.sum(dim=1)
+        # Each logit represents block_area micro-pixels; pos_counts_j positives among them
+        loss_block = block_area * max_logits - z_shift * pos_counts + block_area * logexp  # (M, N)
+        loss_mask = (loss_block.sum(dim=1) / (H_t * W_t)).sum() / num_masks
+
+        # ---------- Dice with shifted logits ----------
+        probs = torch.sigmoid(z_shift)
+        intersection = (probs * pos_counts).sum(dim=1)                 # (M,)
+        pred_sum = block_area * probs.sum(dim=1)                       # (M,)
+        target_sum = K_high                                            # (M,)
         loss_dice = 1 - (2 * intersection + 1) / (pred_sum + target_sum + 1)
         loss_dice = loss_dice.sum() / num_masks
 
-        losses = {
-            "loss_mask": loss_mask,
-            "loss_dice": loss_dice,
-        }
-
-        return losses
+        return {"loss_mask": loss_mask, "loss_dice": loss_dice}
     
     def loss_boxes(self, outputs, targets, indices, num_boxes):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
