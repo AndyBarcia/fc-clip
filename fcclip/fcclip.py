@@ -362,6 +362,20 @@ class FCCLIP(nn.Module):
             mask_pred_results = outputs["pred_masks"]
             mask_box_results = outputs.get("pred_boxes")
 
+            cpu_gt_instances = [x.get("instances") for x in batched_inputs]
+            pairwise_costs = None
+            if all(inst is not None for inst in cpu_gt_instances):
+                targets = self.prepare_targets(
+                    [inst.to(self.device) for inst in cpu_gt_instances],
+                    images,
+                )
+                matcher_inputs = {k: v for k, v in outputs.items() if k != "aux_outputs"}
+                _, pairwise_costs = self.criterion.matcher(
+                    matcher_inputs,
+                    targets,
+                    return_costs=True,
+                )
+
             # We ensemble the pred logits of in-vocab and out-vocab
             clip_feature = features["clip_vis_dense"]
             mask_for_pooling = F.interpolate(mask_pred_results, size=clip_feature.shape[-2:],
@@ -457,6 +471,30 @@ class FCCLIP(nn.Module):
                 if self.instance_on:
                     instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, mask_box_result)
                     processed_results[-1]["instances"] = instance_r
+
+                analysis = {}
+                gt_instance = input_per_image.get("instances")
+                if gt_instance is not None:
+                    analysis["gt_classes"] = gt_instance.gt_classes.to("cpu") if gt_instance.has("gt_classes") else None
+                    if gt_instance.has("gt_masks"):
+                        if isinstance(gt_instance.gt_masks, BitMasks):
+                            analysis["gt_masks"] = gt_instance.gt_masks.tensor.to("cpu")
+                        else:
+                            analysis["gt_masks"] = gt_instance.gt_masks.to("cpu")
+                    if gt_instance.has("gt_boxes"):
+                        analysis["gt_boxes"] = gt_instance.gt_boxes.tensor.to("cpu")
+                analysis["pred_logits"] = mask_cls_result.to("cpu")
+                analysis["pred_masks"] = mask_pred_result.to("cpu")
+                analysis["pairwise_costs"] = None
+                if pairwise_costs is not None:
+                    idx = len(processed_results) - 1
+                    analysis["pairwise_costs"] = {
+                        "class": pairwise_costs["class"][idx],
+                        "mask": pairwise_costs["mask"][idx],
+                        "dice": pairwise_costs["dice"][idx],
+                    }
+                analysis["image_id"] = input_per_image.get("image_id")
+                processed_results[-1]["analysis"] = analysis
 
             return processed_results
 

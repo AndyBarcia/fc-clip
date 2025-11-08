@@ -68,11 +68,14 @@ class HungarianMatcher(nn.Module):
         self.num_points = num_points
 
     @torch.no_grad()
-    def memory_efficient_forward(self, outputs, targets):
+    def memory_efficient_forward(self, outputs, targets, return_costs: bool = False):
         """More memory-friendly matching"""
         bs, num_queries = outputs["pred_logits"].shape[:2]
 
         indices = []
+        class_costs = []
+        mask_costs = []
+        dice_costs = []
 
         # Iterate through batch size
         for b in range(bs):
@@ -114,19 +117,36 @@ class HungarianMatcher(nn.Module):
                 # important. linear_sum_assignment will correctly handle this
                 # by returning empty indices, which is the desired behavior.
                 C = torch.empty(num_queries, 0, device=out_prob.device)
+                cost_class = C
+                cost_mask = C
+                cost_dice = C
             C = C.reshape(num_queries, -1).cpu()
-            # Make sure the matrix contains no NaN values, or scipy fails 
+            # Make sure the matrix contains no NaN values, or scipy fails
             C[C.isnan()] = 0.0
 
             indices.append(linear_sum_assignment(C))
 
-        return [
+            if return_costs:
+                class_costs.append(cost_class.detach().cpu())
+                mask_costs.append(cost_mask.detach().cpu())
+                dice_costs.append(cost_dice.detach().cpu())
+
+        match_indices = [
             (torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64))
             for i, j in indices
         ]
 
+        if return_costs:
+            return match_indices, {
+                "class": class_costs,
+                "mask": mask_costs,
+                "dice": dice_costs,
+            }
+
+        return match_indices
+
     @torch.no_grad()
-    def forward(self, outputs, targets):
+    def forward(self, outputs, targets, return_costs: bool = False):
         """Performs the matching
 
         Params:
@@ -146,7 +166,7 @@ class HungarianMatcher(nn.Module):
             For each batch element, it holds:
                 len(index_i) = len(index_j) = min(num_queries, num_target_boxes)
         """
-        return self.memory_efficient_forward(outputs, targets)
+        return self.memory_efficient_forward(outputs, targets, return_costs=return_costs)
 
     def __repr__(self, _repr_indent=4):
         head = "Matcher " + self.__class__.__name__

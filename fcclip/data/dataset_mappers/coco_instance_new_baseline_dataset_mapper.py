@@ -46,7 +46,22 @@ def build_transform_gen(cfg, is_train):
     Returns:
         list[Augmentation]
     """
-    assert is_train, "Only support training augmentation"
+    if not is_train:
+        min_size = cfg.INPUT.MIN_SIZE_TEST
+        max_size = cfg.INPUT.MAX_SIZE_TEST
+        if isinstance(min_size, (list, tuple)):
+            min_size = min_size[-1]
+        if isinstance(max_size, (list, tuple)):
+            max_size = max_size[-1]
+        if min_size <= 0:
+            return []
+        return [
+            T.ResizeShortestEdge(
+                min_size,
+                max_size,
+            )
+        ]
+
     image_size = cfg.INPUT.IMAGE_SIZE
     min_scale = cfg.INPUT.MIN_SCALE
     max_scale = cfg.INPUT.MAX_SCALE
@@ -152,23 +167,15 @@ class COCOInstanceNewBaselineDatasetMapper:
         dataset_dict["image"] = torch.as_tensor(np.ascontiguousarray(image.transpose(2, 0, 1)))
         dataset_dict["padding_mask"] = torch.as_tensor(np.ascontiguousarray(padding_mask))
 
-        if not self.is_train:
-            # USER: Modify this if you want to keep them for some reason.
-            dataset_dict.pop("annotations", None)
-            return dataset_dict
+        annotations = dataset_dict.pop("annotations", None)
 
-        if "annotations" in dataset_dict:
-            # USER: Modify this if you want to keep them for some reason.
-            for anno in dataset_dict["annotations"]:
-                # Let's always keep mask
-                # if not self.mask_on:
-                #     anno.pop("segmentation", None)
+        if annotations is not None:
+            for anno in annotations:
                 anno.pop("keypoints", None)
 
-            # USER: Implement additional transformations if you have other types of data
             annos = [
                 utils.transform_instance_annotations(obj, transforms, image_shape)
-                for obj in dataset_dict.pop("annotations")
+                for obj in annotations
                 if obj.get("iscrowd", 0) == 0
             ]
             # NOTE: does not support BitMask due to augmentation

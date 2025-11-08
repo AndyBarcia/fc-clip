@@ -40,6 +40,7 @@ from .test_time_augmentation import SemanticSegmentorWithTTA
 from .evaluation.instance_evaluation import InstanceSegEvaluator
 from .evaluation.panoptic_evaluation import COCOPanopticEvaluator
 from .evaluation.zs_panoptic_evaluation import COCOZSPanopticEvaluator
+from .evaluation.mask_prediction_exporter import MaskPredictionExporter
 
 # utils
 from .utils.build_compiled import build_compiled_model
