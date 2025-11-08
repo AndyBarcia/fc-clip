@@ -21,15 +21,20 @@ def batch_sigmoid_ce_loss(
     block_area: int,
     original_hw: int,
 ) -> torch.Tensor:
-    abs_logits = logits.abs()
-    max_logits = torch.clamp(logits, min=0)
-    logexp = torch.log1p(torch.exp(-abs_logits))
-    sum_max = block_area * max_logits.sum(dim=1)
-    sum_logexp = block_area * logexp.sum(dim=1)
-    dot = torch.einsum("qc,mc->qm", logits, target_counts)
-    loss = sum_max[:, None] - dot + sum_logexp[:, None]
-    return loss / original_hw
+    # logsumexp over queries for each class/pixel c: shape [C]
+    lse_per_c = torch.logsumexp(logits, dim=0)
 
+    # pairwise dot of logits with counts: [Q, M]
+    # (sum over classes of logits[q, c] * target_counts[m, c])
+    dot = torch.einsum("qc,mc->qm", logits, target_counts)
+
+    # sum over classes of counts * lse term: [M]
+    pos_term = target_counts @ lse_per_c
+
+    # broadcast the [M] term over queries to get [Q, M]
+    loss = pos_term.unsqueeze(0) - dot
+
+    return loss / original_hw
 
 def batch_dice_loss(
     logits: torch.Tensor, target_counts: torch.Tensor, block_area: int

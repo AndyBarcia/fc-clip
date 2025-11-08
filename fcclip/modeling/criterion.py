@@ -73,50 +73,67 @@ class SetCriterion(nn.Module):
     def loss_masks(self, outputs, targets, indices, num_masks):
         """Compute the losses related to the masks using exact high-resolution targets."""
         assert "pred_masks" in outputs
+        pred_masks = outputs["pred_masks"]                     # [B, Q, H, W]
+        B, Q, H, W = pred_masks.shape
+        device, dtype = pred_masks.device, pred_masks.dtype
 
-        src_idx = self._get_src_permutation_idx(indices)
-        tgt_idx = self._get_tgt_permutation_idx(indices)
-        src_masks = outputs["pred_masks"]
-        src_masks = src_masks[src_idx]
+        # Match indices as in DETR
+        src_idx = self._get_src_permutation_idx(indices)       # tuple of (batch_idx, src_query_idx) length K
+        tgt_idx = self._get_tgt_permutation_idx(indices)       # tuple of (batch_idx, tgt_mask_idx)
+
+        # Gather matched predictions and targets
+        src_masks = pred_masks[src_idx]                        # [K, H, W]
         masks = [t["masks"] for t in targets]
-        # TODO use valid to mask invalid areas due to padding in loss
-        target_masks, valid = nested_tensor_from_tensor_list(masks).decompose()
+        target_masks, _ = nested_tensor_from_tensor_list(masks).decompose()  # [B, M_max, Ht, Wt]
         target_masks = target_masks.to(src_masks)
-        target_masks = target_masks[tgt_idx]
+        target_masks = target_masks[tgt_idx]                   # [K, Ht, Wt]
 
+        # No matched pairs -> zero losses on correct device/dtype
         if src_masks.shape[0] == 0:
-            losses = {
-                "loss_mask": outputs["pred_masks"].sum() * 0.0,
-                "loss_dice": outputs["pred_masks"].sum() * 0.0,
-            }
-            return losses
+            zero = pred_masks.sum() * 0.0
+            return {"loss_mask": zero, "loss_dice": zero}
 
-        logits = src_masks.reshape(src_masks.shape[0], -1)
+        K = src_masks.shape[0]
+        logits_sel = src_masks.reshape(K, -1)                  # [K, C], C = H*W
+
+        # Compute per-target counts in the prediction grid (same as your BCE path)
         pos_counts, block_area, H_t, W_t = compute_mask_block_counts(
             target_masks, src_masks.shape[-2:]
-        )
-        pos_counts = pos_counts.to(device=logits.device, dtype=logits.dtype)
+        )                                                     # pos_counts: [K, C]
+        pos_counts = pos_counts.to(device=device, dtype=dtype)
 
-        abs_logits = logits.abs()
-        max_logits = torch.clamp(logits, min=0)
-        logexp = torch.log1p(torch.exp(-abs_logits))
-        loss_block = block_area * max_logits - logits * pos_counts + block_area * logexp
-        loss_mask = loss_block.sum(dim=1) / (H_t * W_t)
-        loss_mask = loss_mask.sum() / num_masks
+        # ----- Softmax cross-entropy over queries (batched) -----
+        # Prepare all-image logits as [B, Q, C]
+        logits_all = pred_masks.reshape(B, Q, -1)             # [B, Q, C]
 
-        probs = torch.sigmoid(logits)
-        intersection = (probs * pos_counts).sum(dim=1)
-        pred_sum = probs.sum(dim=1) * block_area
+        # logsumexp over queries, per image & pixel: [B, C]
+        lse_all = torch.logsumexp(logits_all, dim=1)          # [B, C]
+
+        # Gather the lse row for each matched pair's image
+        lse_sel = lse_all[src_idx[0]]                         # [K, C]
+
+        # CE(q,m) = sum_c counts[m,c]*lse[c] - sum_c logits[q,c]*counts[m,c]
+        term_pos = (pos_counts * lse_sel).sum(dim=1)          # [K]
+        term_dot = (logits_sel * pos_counts).sum(dim=1)       # [K]
+        ce_per_pair = (term_pos - term_dot) / (H_t * W_t)     # [K]
+        loss_mask = ce_per_pair.sum() / num_masks
+
+        # ----- Dice computed from softmax probabilities (matched pairs) -----
+        # Softmax across queries per image/pixel: [B, Q, C]
+        #sprob_all = torch.softmax(logits_all, dim=1)
+
+        # Gather matched query probabilities for each pair: [K, C]
+        #p_sel = sprob_all[src_idx]
+        p_sel = torch.sigmoid(logits_all[src_idx])
+
+        # Standard (smoothed) Dice on block-weighted counts
+        intersection = (p_sel * pos_counts).sum(dim=1)
+        pred_sum = p_sel.sum(dim=1) * block_area
         target_sum = pos_counts.sum(dim=1)
         loss_dice = 1 - (2 * intersection + 1) / (pred_sum + target_sum + 1)
         loss_dice = loss_dice.sum() / num_masks
 
-        losses = {
-            "loss_mask": loss_mask,
-            "loss_dice": loss_dice,
-        }
-
-        return losses
+        return {"loss_mask": loss_mask, "loss_dice": loss_dice}
     
     def loss_boxes(self, outputs, targets, indices, num_boxes):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
