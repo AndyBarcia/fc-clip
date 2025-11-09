@@ -167,6 +167,9 @@ def _build_prediction_table(
     scores: torch.Tensor,
     labels: torch.Tensor,
     class_names: Optional[Sequence[str]],
+    assignments: Optional[torch.Tensor],
+    gt_classes: Optional[torch.Tensor],
+    gt_class_names: Optional[Sequence[str]],
 ) -> pd.DataFrame:
     rows: List[Dict[str, object]] = []
     for order, pred_idx in enumerate(prediction_indices.tolist()):
@@ -174,6 +177,23 @@ def _build_prediction_table(
         name = None
         if class_names is not None and class_id is not None and class_id < len(class_names):
             name = class_names[class_id]
+
+        matched_gt_index: Optional[int] = None
+        matched_gt_class_id: Optional[int] = None
+        matched_gt_class_name: Optional[str] = None
+        if assignments is not None and pred_idx < assignments.numel():
+            assigned_value = int(assignments[pred_idx].item())
+            if assigned_value >= 0:
+                matched_gt_index = assigned_value
+                if gt_classes is not None and matched_gt_index < gt_classes.numel():
+                    matched_gt_class_id = int(gt_classes[matched_gt_index].item())
+                    if (
+                        gt_class_names is not None
+                        and matched_gt_class_id is not None
+                        and matched_gt_class_id < len(gt_class_names)
+                    ):
+                        matched_gt_class_name = gt_class_names[matched_gt_class_id]
+
         rows.append(
             {
                 "rank": order + 1,
@@ -181,6 +201,9 @@ def _build_prediction_table(
                 "class_id": class_id,
                 "class_name": name,
                 "score": float(scores[order].item()),
+                "matched_gt_index": matched_gt_index,
+                "matched_gt_class_id": matched_gt_class_id,
+                "matched_gt_class_name": matched_gt_class_name,
             }
         )
     return pd.DataFrame(rows)
@@ -211,6 +234,38 @@ def _pairwise_cost_tables(
         index = [f"pred_{i}" for i in range(num_preds)]
         tables[name] = pd.DataFrame(array, index=index, columns=columns)
     return tables
+
+
+def _match_pairs_table(
+    match_indices: Optional[Dict[str, torch.Tensor]],
+    gt_classes: Optional[torch.Tensor],
+    class_names: Optional[Sequence[str]],
+) -> Optional[pd.DataFrame]:
+    if not match_indices:
+        return None
+
+    pred_tensor = match_indices.get("pred")
+    gt_tensor = match_indices.get("gt")
+    if not isinstance(pred_tensor, torch.Tensor) or not isinstance(gt_tensor, torch.Tensor):
+        return None
+
+    rows: List[Dict[str, object]] = []
+    for pred_idx, gt_idx in zip(pred_tensor.tolist(), gt_tensor.tolist()):
+        row: Dict[str, object] = {
+            "prediction_index": pred_idx,
+            "gt_index": gt_idx,
+        }
+        if gt_classes is not None and gt_idx < gt_classes.numel():
+            class_id = int(gt_classes[gt_idx].item())
+            row["gt_class_id"] = class_id
+            if class_names is not None and class_id < len(class_names):
+                row["gt_class_name"] = class_names[class_id]
+        rows.append(row)
+
+    if not rows:
+        return None
+
+    return pd.DataFrame(rows)
 
 
 st.set_page_config(page_title="FC-CLIP Mask Analysis", layout="wide")
@@ -273,19 +328,33 @@ if "pred_logits" not in record or "pred_masks" not in record:
 class_names = _get_class_names(dataset_name)
 
 prediction_indices, scores, labels = _prepare_predictions(record, score_threshold, max_predictions)
+gt_classes = record.get("gt_classes")
+matched_gt_assignments: Optional[torch.Tensor] = record.get("matched_gt_indices")
 
 if prediction_indices.numel() == 0:
     st.warning("No predictions passed the current score threshold.")
 else:
-    prediction_table = _build_prediction_table(prediction_indices, scores, labels, class_names)
+    prediction_table = _build_prediction_table(
+        prediction_indices,
+        scores,
+        labels,
+        class_names,
+        matched_gt_assignments,
+        gt_classes,
+        class_names,
+    )
     st.subheader("Top predictions")
     st.dataframe(prediction_table, use_container_width=True)
 
-gt_classes = record.get("gt_classes")
 gt_table = _build_gt_table(gt_classes, class_names)
 if gt_table is not None:
     st.subheader("Ground-truth instances")
     st.dataframe(gt_table, use_container_width=True)
+
+match_table = _match_pairs_table(record.get("matched_indices"), gt_classes, class_names)
+if match_table is not None:
+    st.subheader("Hungarian assignments")
+    st.dataframe(match_table, use_container_width=True)
 
 pairwise_tables = _pairwise_cost_tables(record.get("pairwise_costs"))
 if pairwise_tables:

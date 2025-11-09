@@ -363,6 +363,7 @@ class FCCLIP(nn.Module):
             mask_box_results = outputs.get("pred_boxes")
 
             cpu_gt_instances = [x.get("instances") for x in batched_inputs]
+            match_indices = None
             pairwise_costs = None
             if all(inst is not None for inst in cpu_gt_instances):
                 targets = self.prepare_targets(
@@ -370,7 +371,7 @@ class FCCLIP(nn.Module):
                     images,
                 )
                 matcher_inputs = {k: v for k, v in outputs.items() if k != "aux_outputs"}
-                _, pairwise_costs = self.criterion.matcher(
+                match_indices, pairwise_costs = self.criterion.matcher(
                     matcher_inputs,
                     targets,
                     return_costs=True,
@@ -486,13 +487,28 @@ class FCCLIP(nn.Module):
                 analysis["pred_logits"] = mask_cls_result.to("cpu")
                 analysis["pred_masks"] = mask_pred_result.to("cpu")
                 analysis["pairwise_costs"] = None
-                if pairwise_costs is not None:
+                analysis["matched_indices"] = None
+                analysis["matched_gt_indices"] = None
+                if pairwise_costs is not None and match_indices is not None:
                     idx = len(processed_results) - 1
                     analysis["pairwise_costs"] = {
                         "class": pairwise_costs["class"][idx],
                         "mask": pairwise_costs["mask"][idx],
                         "dice": pairwise_costs["dice"][idx],
                     }
+                    matched_pred_indices, matched_gt_indices = match_indices[idx]
+                    analysis["matched_indices"] = {
+                        "pred": matched_pred_indices,
+                        "gt": matched_gt_indices,
+                    }
+                    assignment = torch.full(
+                        (mask_cls_result.shape[0],),
+                        fill_value=-1,
+                        dtype=torch.int64,
+                    )
+                    if matched_pred_indices.numel() > 0:
+                        assignment[matched_pred_indices] = matched_gt_indices
+                    analysis["matched_gt_indices"] = assignment
                 analysis["image_id"] = input_per_image.get("image_id")
                 if "file_name" in input_per_image:
                     analysis["file_name"] = input_per_image["file_name"]

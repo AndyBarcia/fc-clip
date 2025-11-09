@@ -34,13 +34,15 @@ class MaskPredictionExporter(DatasetEvaluator):
                 "pred_logits": analysis.get("pred_logits"),
                 "pred_masks": analysis.get("pred_masks"),
                 "pairwise_costs": analysis.get("pairwise_costs"),
+                "matched_indices": analysis.get("matched_indices"),
+                "matched_gt_indices": analysis.get("matched_gt_indices"),
                 "gt_classes": analysis.get("gt_classes"),
                 "gt_masks": analysis.get("gt_masks"),
                 "gt_boxes": analysis.get("gt_boxes"),
             }
 
             # Ensure tensors are on CPU for serialization.
-            for key in ["pred_logits", "pred_masks", "gt_classes", "gt_masks", "gt_boxes"]:
+            for key in ["pred_logits", "pred_masks", "gt_classes", "gt_masks", "gt_boxes", "matched_gt_indices"]:
                 value = record.get(key)
                 if isinstance(value, torch.Tensor):
                     record[key] = value.cpu()
@@ -50,6 +52,13 @@ class MaskPredictionExporter(DatasetEvaluator):
                 record["pairwise_costs"] = {
                     cost_name: tensor.cpu() if isinstance(tensor, torch.Tensor) else tensor
                     for cost_name, tensor in pairwise_costs.items()
+                }
+
+            matched_indices = record.get("matched_indices")
+            if isinstance(matched_indices, dict):
+                record["matched_indices"] = {
+                    name: tensor.cpu() if isinstance(tensor, torch.Tensor) else tensor
+                    for name, tensor in matched_indices.items()
                 }
 
             self._records.append(record)
