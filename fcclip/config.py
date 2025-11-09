@@ -66,6 +66,10 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.TEST.OVERLAP_THRESHOLD = 0.0
     cfg.MODEL.MASK_FORMER.TEST.SEM_SEG_POSTPROCESSING_BEFORE_INFERENCE = False
 
+    # Limit evaluation to a fixed number of images when desired. A non-positive
+    # value keeps the default behaviour of evaluating on the full dataset.
+    cfg.TEST.MAX_EVAL_IMAGES = -1
+
     # Sometimes `backbone.size_divisibility` is set to 0 for some backbone (e.g. ResNet)
     # you can use this config to override
     cfg.MODEL.MASK_FORMER.SIZE_DIVISIBILITY = 32
