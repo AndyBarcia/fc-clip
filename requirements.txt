@@ -7,3 +7,4 @@ submitit
 scikit-image
 opencv-python-headless
 open_clip_torch
+streamlit

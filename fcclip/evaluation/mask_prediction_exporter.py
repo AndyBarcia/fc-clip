@@ -28,6 +28,9 @@ class MaskPredictionExporter(DatasetEvaluator):
 
             record: Dict[str, Any] = {
                 "image_id": analysis.get("image_id", input_dict.get("image_id")),
+                "file_name": analysis.get("file_name", input_dict.get("file_name")),
+                "input_height": analysis.get("input_height"),
+                "input_width": analysis.get("input_width"),
                 "pred_logits": analysis.get("pred_logits"),
                 "pred_masks": analysis.get("pred_masks"),
                 "pairwise_costs": analysis.get("pairwise_costs"),

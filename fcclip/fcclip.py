@@ -494,6 +494,10 @@ class FCCLIP(nn.Module):
                         "dice": pairwise_costs["dice"][idx],
                     }
                 analysis["image_id"] = input_per_image.get("image_id")
+                if "file_name" in input_per_image:
+                    analysis["file_name"] = input_per_image["file_name"]
+                analysis["input_height"] = height
+                analysis["input_width"] = width
                 processed_results[-1]["analysis"] = analysis
 
             return processed_results
