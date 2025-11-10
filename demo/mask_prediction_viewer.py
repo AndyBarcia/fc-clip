@@ -4,14 +4,38 @@ from __future__ import annotations
 
 import io
 from pathlib import Path
-from typing import Dict, Iterable, List, MutableMapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, MutableMapping, Optional, Sequence, Tuple, TypeVar
 
-import numpy as np
-import pandas as pd
 import streamlit as st
-import torch
-import torch.nn.functional as F
 from PIL import Image
+
+IMPORT_ERRORS: List[str] = []
+
+try:  # pragma: no cover - optional dependency during analysis
+    import numpy as np
+except ModuleNotFoundError as exc:  # pragma: no cover - UI feedback path
+    np = None  # type: ignore[assignment]
+    IMPORT_ERRORS.append(
+        "NumPy is required to visualize predictions. Install it with `pip install numpy`."
+    )
+
+try:  # pragma: no cover - optional dependency during analysis
+    import pandas as pd
+except ModuleNotFoundError as exc:  # pragma: no cover - UI feedback path
+    pd = None  # type: ignore[assignment]
+    IMPORT_ERRORS.append(
+        "Pandas is required to render tables. Install it with `pip install pandas`."
+    )
+
+try:  # pragma: no cover - optional dependency during analysis
+    import torch
+    import torch.nn.functional as F
+except ModuleNotFoundError as exc:  # pragma: no cover - UI feedback path
+    torch = None  # type: ignore[assignment]
+    F = None  # type: ignore[assignment]
+    IMPORT_ERRORS.append(
+        "PyTorch is required to load FC-CLIP analysis exports. Install it with `pip install torch`."
+    )
 
 try:
     from detectron2.data import MetadataCatalog  # type: ignore
@@ -19,30 +43,58 @@ except Exception:  # pragma: no cover - optional dependency during analysis
     MetadataCatalog = None  # type: ignore
 
 
+T = TypeVar("T")
+
+
 ALPHA = 0.55
-COLOR_PALETTE = np.array(
-    [
-        [0.894, 0.102, 0.110],
-        [0.215, 0.494, 0.721],
-        [0.302, 0.686, 0.290],
-        [0.596, 0.306, 0.639],
-        [1.000, 0.498, 0.000],
-        [1.000, 1.000, 0.200],
-        [0.651, 0.337, 0.157],
-        [0.969, 0.506, 0.749],
-        [0.600, 0.600, 0.600],
-        [0.100, 0.100, 0.100],
-    ]
-)
+if np is not None:  # pragma: no branch - executed when numpy available
+    COLOR_PALETTE = np.array(
+        [
+            [0.894, 0.102, 0.110],
+            [0.215, 0.494, 0.721],
+            [0.302, 0.686, 0.290],
+            [0.596, 0.306, 0.639],
+            [1.000, 0.498, 0.000],
+            [1.000, 1.000, 0.200],
+            [0.651, 0.337, 0.157],
+            [0.969, 0.506, 0.749],
+            [0.600, 0.600, 0.600],
+            [0.100, 0.100, 0.100],
+        ]
+    )
+else:  # pragma: no cover - handled during runtime with error message
+    COLOR_PALETTE = None
 
 
-@st.cache_data(show_spinner=False)
+def _get_cache_decorator() -> Callable[..., Callable[[Callable[..., T]], Callable[..., T]]]:
+    """Return a cache decorator compatible with the installed Streamlit version."""
+
+    if hasattr(st, "cache_data"):
+        return st.cache_data
+
+    if hasattr(st, "experimental_memo"):
+        def _memo_wrapper(*args, **kwargs):  # type: ignore[override]
+            return st.experimental_memo(*args, **kwargs)
+
+        return _memo_wrapper
+
+    def _identity_decorator(*_args, **_kwargs):
+        def _identity(func: Callable[..., T]) -> Callable[..., T]:
+            return func
+
+        return _identity
+
+    return _identity_decorator
+cache_data = _get_cache_decorator()
+
+
+@cache_data(show_spinner=False)
 def _load_records_from_path(path: str) -> List[MutableMapping[str, torch.Tensor]]:
     records = torch.load(path, map_location="cpu")
     return _ensure_tensors(records)
 
 
-@st.cache_data(show_spinner=False)
+@cache_data(show_spinner=False)
 def _load_records_from_bytes(buffer: bytes) -> List[MutableMapping[str, torch.Tensor]]:
     stream = io.BytesIO(buffer)
     records = torch.load(stream, map_location="cpu")
@@ -117,6 +169,9 @@ def _colorize_masks(
     masks: Sequence[np.ndarray],
     mask_threshold: float,
 ) -> Image.Image:
+    if COLOR_PALETTE is None:
+        return image
+
     if not masks:
         return image
 
@@ -269,6 +324,12 @@ def _match_pairs_table(
 
 
 st.set_page_config(page_title="FC-CLIP Mask Analysis", layout="wide")
+
+if IMPORT_ERRORS:
+    st.title("FC-CLIP Mask Prediction Explorer")
+    for message in IMPORT_ERRORS:
+        st.error(message)
+    st.stop()
 
 st.title("FC-CLIP Mask Prediction Explorer")
 st.markdown(
