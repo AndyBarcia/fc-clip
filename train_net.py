@@ -22,7 +22,7 @@ import logging
 import os
 
 from collections import OrderedDict
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 import torch
 
@@ -324,7 +324,14 @@ class Trainer(DefaultTrainer):
         if output_folder is None:
             output_folder = os.path.join(cfg.OUTPUT_DIR, "inference")
         evaluator_list = []
-        evaluator_type = MetadataCatalog.get(dataset_name).evaluator_type
+        metadata = MetadataCatalog.get(dataset_name)
+        evaluator_type = metadata.evaluator_type
+        class_names: Optional[List[str]] = None
+        for attr in ("thing_classes", "stuff_classes", "class_names"):
+            names = getattr(metadata, attr, None)
+            if isinstance(names, Sequence):
+                class_names = list(names)
+                break
         # semantic segmentation
         if evaluator_type in ["sem_seg", "ade20k_panoptic_seg"]:
             evaluator_list.append(
@@ -393,9 +400,9 @@ class Trainer(DefaultTrainer):
         if evaluator_type == "lvis":
             return LVISEvaluator(dataset_name, output_dir=output_folder)
         if len(evaluator_list) == 0:
-            evaluator_list.append(MaskPredictionExporter(output_folder))
+            evaluator_list.append(MaskPredictionExporter(output_folder, class_names=class_names))
             return evaluator_list[0]
-        evaluator_list.append(MaskPredictionExporter(output_folder))
+        evaluator_list.append(MaskPredictionExporter(output_folder, class_names=class_names))
         if len(evaluator_list) == 1:
             return evaluator_list[0]
         return DatasetEvaluators(evaluator_list)

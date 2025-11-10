@@ -4,7 +4,7 @@ pairwise matching costs for further offline analysis.
 """
 
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 from detectron2.evaluation.evaluator import DatasetEvaluator
@@ -13,9 +13,14 @@ from detectron2.evaluation.evaluator import DatasetEvaluator
 class MaskPredictionExporter(DatasetEvaluator):
     """Collect predictions and ground-truth targets for offline inspection."""
 
-    def __init__(self, output_dir: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        output_dir: Optional[str] = None,
+        class_names: Optional[Sequence[str]] = None,
+    ) -> None:
         self._output_dir = output_dir
         self._records: List[Dict[str, Any]] = []
+        self._class_names: Optional[List[str]] = list(class_names) if class_names else None
 
     def reset(self) -> None:
         self._records = []
@@ -66,5 +71,9 @@ class MaskPredictionExporter(DatasetEvaluator):
     def evaluate(self) -> Dict[str, Any]:
         if self._output_dir and len(self._records) > 0:
             os.makedirs(self._output_dir, exist_ok=True)
-            torch.save(self._records, os.path.join(self._output_dir, "analysis_outputs.pth"))
+            payload = {
+                "records": self._records,
+                "class_names": self._class_names,
+            }
+            torch.save(payload, os.path.join(self._output_dir, "analysis_outputs.pth"))
         return {}

@@ -88,17 +88,44 @@ def _get_cache_decorator() -> Callable[..., Callable[[Callable[..., T]], Callabl
 cache_data = _get_cache_decorator()
 
 
-@cache_data(show_spinner=False)
-def _load_records_from_path(path: str) -> List[MutableMapping[str, torch.Tensor]]:
-    records = torch.load(path, map_location="cpu")
-    return _ensure_tensors(records)
+def _parse_analysis_payload(
+    payload: object,
+) -> Tuple[List[MutableMapping[str, torch.Tensor]], Optional[Sequence[str]]]:
+    class_names: Optional[Sequence[str]] = None
+    records_obj = payload
+    if isinstance(payload, MutableMapping):
+        records_obj = payload.get("records", [])
+        maybe_names = payload.get("class_names")
+        if isinstance(maybe_names, Sequence) and not isinstance(maybe_names, (str, bytes)):
+            class_names = list(maybe_names)
+
+    if isinstance(records_obj, list):
+        records_seq = records_obj
+    elif isinstance(records_obj, tuple):
+        records_seq = list(records_obj)
+    elif isinstance(records_obj, Iterable) and not isinstance(records_obj, (str, bytes)):
+        records_seq = list(records_obj)
+    else:
+        records_seq = []
+
+    return _ensure_tensors(records_seq), class_names
 
 
 @cache_data(show_spinner=False)
-def _load_records_from_bytes(buffer: bytes) -> List[MutableMapping[str, torch.Tensor]]:
+def _load_records_from_path(
+    path: str,
+) -> Tuple[List[MutableMapping[str, torch.Tensor]], Optional[Sequence[str]]]:
+    payload = torch.load(path, map_location="cpu")
+    return _parse_analysis_payload(payload)
+
+
+@cache_data(show_spinner=False)
+def _load_records_from_bytes(
+    buffer: bytes,
+) -> Tuple[List[MutableMapping[str, torch.Tensor]], Optional[Sequence[str]]]:
     stream = io.BytesIO(buffer)
-    records = torch.load(stream, map_location="cpu")
-    return _ensure_tensors(records)
+    payload = torch.load(stream, map_location="cpu")
+    return _parse_analysis_payload(payload)
 
 
 def _ensure_tensors(
@@ -347,10 +374,13 @@ uploaded_file = st.file_uploader("Upload analysis artifact", type=["pth", "pt"])
 path_input = st.text_input("or provide a path to analysis_outputs.pth", value="")
 
 records: Optional[List[MutableMapping[str, torch.Tensor]]] = None
+artifact_class_names: Optional[Sequence[str]] = None
 
 if uploaded_file is not None:
     try:
-        records = _load_records_from_bytes(uploaded_file.getvalue())
+        loaded_records, loaded_class_names = _load_records_from_bytes(uploaded_file.getvalue())
+        records = loaded_records
+        artifact_class_names = loaded_class_names
     except Exception as exc:  # pragma: no cover - UI feedback path
         st.error(f"Failed to load uploaded artifact: {exc}")
 elif path_input:
@@ -359,7 +389,9 @@ elif path_input:
         st.error(f"Provided path does not exist: {expanded_path}")
     else:
         try:
-            records = _load_records_from_path(expanded_path)
+            loaded_records, loaded_class_names = _load_records_from_path(expanded_path)
+            records = loaded_records
+            artifact_class_names = loaded_class_names
         except Exception as exc:  # pragma: no cover - UI feedback path
             st.error(f"Failed to load artifact from disk: {exc}")
 
@@ -386,7 +418,10 @@ if "pred_logits" not in record or "pred_masks" not in record:
     st.error("Selected record does not contain prediction logits or masks.")
     st.stop()
 
-class_names = _get_class_names(dataset_name)
+if artifact_class_names is not None:
+    class_names = artifact_class_names
+else:
+    class_names = _get_class_names(dataset_name)
 
 prediction_indices, scores, labels = _prepare_predictions(record, score_threshold, max_predictions)
 gt_classes = record.get("gt_classes")
