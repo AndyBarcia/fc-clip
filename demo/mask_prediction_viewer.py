@@ -304,17 +304,32 @@ def _build_gt_table(gt_classes: Optional[torch.Tensor], class_names: Optional[Se
 
 
 def _pairwise_cost_tables(
-    pairwise_costs: Optional[Dict[str, torch.Tensor]]
+    pairwise_costs: Optional[Dict[str, torch.Tensor]],
+    visible_predictions: torch.Tensor,
 ) -> Dict[str, pd.DataFrame]:
     if not pairwise_costs:
         return {}
+
+    if visible_predictions.numel() == 0:
+        return {}
+
+    visible_rows = [int(idx) for idx in visible_predictions.tolist()]
     tables: Dict[str, pd.DataFrame] = {}
     for name, matrix in pairwise_costs.items():
         array = matrix.detach().cpu().numpy()
-        num_preds, num_targets = array.shape if array.ndim == 2 else (0, 0)
+        if array.ndim != 2:
+            continue
+
+        num_preds, num_targets = array.shape
+        filtered_rows: List[int] = [idx for idx in visible_rows if 0 <= idx < num_preds]
+        if not filtered_rows:
+            continue
+
+        filtered_array = array[filtered_rows, :]
         columns = [f"gt_{i}" for i in range(num_targets)]
-        index = [f"pred_{i}" for i in range(num_preds)]
-        tables[name] = pd.DataFrame(array, index=index, columns=columns)
+        index = [f"pred_{i}" for i in filtered_rows]
+        tables[name] = pd.DataFrame(filtered_array, index=index, columns=columns)
+
     return tables
 
 
@@ -452,7 +467,7 @@ if match_table is not None:
     st.subheader("Hungarian assignments")
     st.dataframe(match_table, use_container_width=True)
 
-pairwise_tables = _pairwise_cost_tables(record.get("pairwise_costs"))
+pairwise_tables = _pairwise_cost_tables(record.get("pairwise_costs"), prediction_indices)
 if pairwise_tables:
     st.subheader("Pairwise Hungarian costs")
     for name, table in pairwise_tables.items():
