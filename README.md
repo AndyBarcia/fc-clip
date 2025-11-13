@@ -30,6 +30,22 @@ See [Getting Started with  FC-CLIP](GETTING_STARTED.md).
 
 We also support FC-CLIP with [HuggingFace 🤗 Demo](https://huggingface.co/spaces/fun-research/FC-CLIP)
 
+### Mask prediction analysis app
+
+The evaluation pipeline can export detailed prediction summaries via the
+`MaskPredictionExporter`. To explore these artifacts interactively, run the
+Streamlit app:
+
+```bash
+streamlit run demo/mask_prediction_viewer.py
+```
+
+Use the sidebar controls to upload or reference the `analysis_outputs.pth`
+produced during evaluation, select individual records, and inspect prediction
+scores, masks, and Hungarian matching costs. If the serialized records include
+absolute file paths that are not valid on the current machine, provide a dataset
+root override so the viewer can locate the original images.
+
 ## Model Zoo
 
 <table>

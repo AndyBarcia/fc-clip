@@ -22,14 +22,19 @@ import logging
 import os
 
 from collections import OrderedDict
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 import torch
 
 import detectron2.utils.comm as comm
 from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.config import get_cfg
-from detectron2.data import MetadataCatalog, build_detection_train_loader
+from detectron2.data import (
+    DatasetCatalog,
+    MetadataCatalog,
+    build_detection_train_loader,
+    build_detection_test_loader,
+)
 from detectron2.engine import (
     DefaultTrainer,
     default_argument_parser,
@@ -52,6 +57,10 @@ from detectron2.evaluation import (
 from detectron2.projects.deeplab import add_deeplab_config, build_lr_scheduler
 from detectron2.solver.build import maybe_add_gradient_clipping
 from detectron2.utils.logger import setup_logger
+from detectron2.data.common import DatasetFromList, MapDataset
+from detectron2.data.dataset_mapper import DatasetMapper
+from detectron2.data.samplers import InferenceSampler
+from detectron2.data.build import build_batch_data_loader, trivial_batch_collator
 import weakref
 
 from fcclip import (
@@ -60,6 +69,7 @@ from fcclip import (
     InstanceSegEvaluator,
     COCOPanopticEvaluator,
     COCOZSPanopticEvaluator,
+    MaskPredictionExporter,
     MaskFormerInstanceDatasetMapper,
     MaskFormerPanopticDatasetMapper,
     MaskFormerSemanticDatasetMapper,
@@ -69,6 +79,56 @@ from fcclip import (
     add_zegfc_config,
     build_compiled_model
 )
+
+
+def build_limited_detection_test_loader(cfg, dataset_name, mapper, max_eval_images):
+    """Create an evaluation data loader that only iterates over a subset."""
+
+    logger = logging.getLogger(__name__)
+    dataset_dicts = DatasetCatalog.get(dataset_name)
+    total_images = len(dataset_dicts)
+
+    if total_images == 0:
+        logger.warning(
+            "Dataset '%s' is empty. Returning the standard test loader.",
+            dataset_name,
+        )
+        return build_detection_test_loader(cfg, dataset_name, mapper=mapper)
+
+    if max_eval_images < total_images and comm.is_main_process():
+        logger.info(
+            "Limiting evaluation on '%s' to %d images (out of %d).",
+            dataset_name,
+            max_eval_images,
+            total_images,
+        )
+
+    limited_dicts = list(dataset_dicts[:max_eval_images])
+
+    if len(limited_dicts) < max_eval_images and comm.is_main_process():
+        logger.warning(
+            "Requested %d evaluation images, but dataset '%s' only has %d. Using all available images.",
+            max_eval_images,
+            dataset_name,
+            len(limited_dicts),
+        )
+
+    dataset = DatasetFromList(limited_dicts, copy=False)
+
+    if mapper is None:
+        mapper = DatasetMapper(cfg, is_train=False)
+
+    dataset = MapDataset(dataset, mapper)
+
+    sampler = InferenceSampler(len(limited_dicts))
+
+    return build_batch_data_loader(
+        dataset,
+        sampler,
+        cfg.TEST.IMS_PER_BATCH,
+        cfg.DATALOADER.NUM_WORKERS,
+        collate_fn=trivial_batch_collator,
+    )
 
 
 class MemEfficientDetectionCheckpointer(DetectionCheckpointer):
@@ -264,7 +324,14 @@ class Trainer(DefaultTrainer):
         if output_folder is None:
             output_folder = os.path.join(cfg.OUTPUT_DIR, "inference")
         evaluator_list = []
-        evaluator_type = MetadataCatalog.get(dataset_name).evaluator_type
+        metadata = MetadataCatalog.get(dataset_name)
+        evaluator_type = metadata.evaluator_type
+        class_names: Optional[List[str]] = None
+        for attr in ("thing_classes", "stuff_classes", "class_names"):
+            names = getattr(metadata, attr, None)
+            if isinstance(names, Sequence):
+                class_names = list(names)
+                break
         # semantic segmentation
         if evaluator_type in ["sem_seg", "ade20k_panoptic_seg"]:
             evaluator_list.append(
@@ -333,12 +400,10 @@ class Trainer(DefaultTrainer):
         if evaluator_type == "lvis":
             return LVISEvaluator(dataset_name, output_dir=output_folder)
         if len(evaluator_list) == 0:
-            raise NotImplementedError(
-                "no Evaluator for the dataset {} with the type {}".format(
-                    dataset_name, evaluator_type
-                )
-            )
-        elif len(evaluator_list) == 1:
+            evaluator_list.append(MaskPredictionExporter(output_folder, class_names=class_names))
+            return evaluator_list[0]
+        evaluator_list.append(MaskPredictionExporter(output_folder, class_names=class_names))
+        if len(evaluator_list) == 1:
             return evaluator_list[0]
         return DatasetEvaluators(evaluator_list)
 
@@ -367,6 +432,20 @@ class Trainer(DefaultTrainer):
         else:
             mapper = None
             return build_detection_train_loader(cfg, mapper=mapper)
+
+    @classmethod
+    def build_test_loader(cls, cfg, dataset_name):
+        mapper = None
+        if cfg.INPUT.DATASET_MAPPER_NAME == "coco_instance_lsj":
+            mapper = COCOInstanceNewBaselineDatasetMapper(cfg, False)
+        elif cfg.INPUT.DATASET_MAPPER_NAME == "coco_panoptic_lsj":
+            mapper = COCOPanopticNewBaselineDatasetMapper(cfg, False)
+
+        max_eval_images = cfg.TEST.MAX_EVAL_IMAGES
+        if max_eval_images and max_eval_images > 0:
+            return build_limited_detection_test_loader(cfg, dataset_name, mapper, max_eval_images)
+
+        return build_detection_test_loader(cfg, dataset_name, mapper=mapper)
 
     @classmethod
     def build_lr_scheduler(cls, cfg, optimizer):
