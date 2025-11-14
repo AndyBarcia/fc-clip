@@ -413,21 +413,24 @@ def pq_compute_single_core(proc_id, annotation_set, gt_folder, pred_folder, cate
 
 def pq_compute_multi_core(matched_list, gt_folder, pred_folder, categories):
     cpu = multiprocessing.cpu_count()
-    splits = np.array_split(matched_list, cpu)
-    pool = multiprocessing.Pool(cpu)
+    # split, then drop empty chunks
+    raw_splits = np.array_split(matched_list, cpu)
+    splits = [s for s in raw_splits if len(s) > 0]
 
+    if not splits:  # nothing to do
+        return PQStat()
+
+    pool = multiprocessing.Pool(len(splits))
     procs = [
         pool.apply_async(pq_compute_single_core, (i, split, gt_folder, pred_folder, categories))
         for i, split in enumerate(splits)
     ]
-
     pool.close()
     pool.join()
 
     total = PQStat()
     for p in procs:
         total += p.get()
-
     return total
 
 
@@ -444,13 +447,37 @@ def pq_compute(gt_json, pred_json, gt_folder=None, pred_folder=None):
     pred_folder = pred_folder or pred_json.replace('.json', '')
 
     categories = {c['id']: c for c in gt['categories']}
+
+    # Build maps from image_id -> annotation record
+    gt_map = {a['image_id']: a for a in gt['annotations']}
     pred_map = {a['image_id']: a for a in pred['annotations']}
 
-    matched = []
-    for a in gt['annotations']:
-        if a['image_id'] not in pred_map:
-            raise Exception(f"No prediction for image {a['image_id']}")
-        matched.append((a, pred_map[a['image_id']]))
+    # Evaluate only on images that appear in BOTH sets
+    common_ids = set(gt_map.keys()) & set(pred_map.keys())
+
+    if len(common_ids) == 0:
+        raise Exception(
+            "No overlapping images between ground truth and predictions. "
+            "Nothing to evaluate."
+        )
+
+    missing_in_pred = set(gt_map.keys()) - common_ids
+    missing_in_gt = set(pred_map.keys()) - common_ids
+    if missing_in_pred:
+        logger.debug(
+            "Ignoring %d GT images with no prediction: %s",
+            len(missing_in_pred),
+            (list(missing_in_pred)[:10] + (["..."] if len(missing_in_pred) > 10 else []))
+        )
+    if missing_in_gt:
+        logger.debug(
+            "Ignoring %d predictions with no GT: %s",
+            len(missing_in_gt),
+            (list(missing_in_gt)[:10] + (["..."] if len(missing_in_gt) > 10 else []))
+        )
+
+    # Build matched pairs only for the intersection
+    matched = [(gt_map[iid], pred_map[iid]) for iid in common_ids]
 
     stats = pq_compute_multi_core(matched, gt_folder, pred_folder, categories)
 

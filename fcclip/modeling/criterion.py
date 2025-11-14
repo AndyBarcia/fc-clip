@@ -108,7 +108,8 @@ class SetCriterion(nn.Module):
         intersection = (probs * pos_counts).sum(dim=1)
         pred_sum = probs.sum(dim=1) * block_area
         target_sum = pos_counts.sum(dim=1)
-        loss_dice = 1 - (2 * intersection + 1) / (pred_sum + target_sum + 1)
+        #loss_dice = 1 - (2 * intersection + 1) / (pred_sum + target_sum + 1)
+        loss_dice = 1 - (2 * intersection) / (pred_sum + target_sum)
         loss_dice = loss_dice.sum() / num_masks
 
         losses = {

@@ -38,7 +38,8 @@ def batch_dice_loss(
     intersection = torch.einsum("qc,mc->qm", probs, target_counts)
     pred_sum = block_area * probs.sum(dim=1)
     target_sum = target_counts.sum(dim=1)
-    loss = 1 - (2 * intersection + 1) / (pred_sum[:, None] + target_sum[None, :] + 1)
+    #loss = 1 - (2 * intersection + 1) / (pred_sum[:, None] + target_sum[None, :] + 1)
+    loss = 1 - (2 * intersection) / (pred_sum[:, None] + target_sum[None, :])
     return loss
 
 

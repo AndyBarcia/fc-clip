@@ -414,7 +414,7 @@ class FCCLIP(nn.Module):
             mask_cls_results = torch.log(mask_cls_probs + 1e-8)
 
             # upsample masks
-            mask_pred_results = F.interpolate(
+            mask_up_pred_results = F.interpolate(
                 mask_pred_results,
                 size=(images.tensor.shape[-2], images.tensor.shape[-1]),
                 mode="bilinear",
@@ -428,34 +428,38 @@ class FCCLIP(nn.Module):
                 mask_box_results = [None] * len(batched_inputs)
 
             processed_results = []
-            for mask_cls_result, mask_pred_result, mask_box_result, input_per_image, image_size in zip(
-                mask_cls_results, mask_pred_results, mask_box_results, batched_inputs, images.image_sizes
+            for mask_cls_result, mask_up_pred_result, mask_pred_result, mask_box_result, input_per_image, image_size in zip(
+                mask_cls_results, mask_up_pred_results, mask_pred_results, mask_box_results, batched_inputs, images.image_sizes
             ):
                 height = input_per_image.get("height", image_size[0])
                 width = input_per_image.get("width", image_size[1])
                 processed_results.append({})
 
+                # Save raw results
+                processed_results[-1]["raw_seg"] = mask_pred_result
+                processed_results[-1]["raw_cls"] = mask_cls_result
+
                 if self.sem_seg_postprocess_before_inference:
-                    mask_pred_result = retry_if_cuda_oom(sem_seg_postprocess)(
-                        mask_pred_result, image_size, height, width
+                    mask_up_pred_result = retry_if_cuda_oom(sem_seg_postprocess)(
+                        mask_up_pred_result, image_size, height, width
                     )
-                    mask_cls_result = mask_cls_result.to(mask_pred_result)
+                    mask_cls_result = mask_cls_result.to(mask_up_pred_result)
 
                 # semantic segmentation inference
                 if self.semantic_on:
-                    r = retry_if_cuda_oom(self.semantic_inference)(mask_cls_result, mask_pred_result)
+                    r = retry_if_cuda_oom(self.semantic_inference)(mask_cls_result, mask_up_pred_result)
                     if not self.sem_seg_postprocess_before_inference:
                         r = retry_if_cuda_oom(sem_seg_postprocess)(r, image_size, height, width)
                     processed_results[-1]["sem_seg"] = r
 
                 # panoptic segmentation inference
                 if self.panoptic_on:
-                    panoptic_r = retry_if_cuda_oom(self.panoptic_inference)(mask_cls_result, mask_pred_result)
+                    panoptic_r = retry_if_cuda_oom(self.panoptic_inference)(mask_cls_result, mask_up_pred_result)
                     processed_results[-1]["panoptic_seg"] = panoptic_r
                 
                 # instance segmentation inference
                 if self.instance_on:
-                    instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, mask_box_result)
+                    instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_up_pred_result, mask_box_result)
                     processed_results[-1]["instances"] = instance_r
 
             return processed_results
