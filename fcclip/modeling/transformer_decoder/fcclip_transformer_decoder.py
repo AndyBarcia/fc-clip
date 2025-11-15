@@ -576,17 +576,19 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
             attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
             # attention: cross-attention first
             output, _ = self.transformer_cross_attention_layers[i](
-                output, src[level_index],
-                memory_mask=attn_mask,
-                memory_key_padding_mask=None,  # here we do not apply masking on padded region
-                pos=pos[level_index], query_pos=query_embed
+                output.transpose(0,1), 
+                src[level_index].transpose(0,1).view(bs, size_list[level_index][0], size_list[level_index][1], -1), # (B,H,W,C)
+                attn_mask=attn_mask.view(bs, self.num_heads, self.num_queries, size_list[level_index][0], size_list[level_index][1]), # (B, num_heads, Q, H,W)
+                memory_pos_emb=pos[level_index].transpose(0,1).view(bs, size_list[level_index][0], size_list[level_index][1], -1), # (B,H,W,C), 
+                query_pos_emb=query_embed.transpose(0,1), # (B,Q,C)
             )
+            output = output.transpose(0,1) # (Q,B,C)
 
             output, _ = self.transformer_self_attention_layers[i](
-                output, tgt_mask=None,
-                tgt_key_padding_mask=None,
-                query_pos=query_embed
+                output.transpose(0,1),
+                pos_emb=query_embed.transpose(0,1), # # (B,Q,C) 
             )
+            output = output.transpose(0,1) # (Q,B,C)
             
             # FFN
             output = self.transformer_ffn_layers[i](
