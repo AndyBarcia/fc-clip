@@ -9,6 +9,7 @@ import copy
 import logging
 
 import numpy as np
+import skfmm
 import torch
 
 from detectron2.config import configurable
@@ -146,11 +147,25 @@ class COCOPanopticNewBaselineDatasetMapper:
             instances = Instances(image_shape)
             classes = []
             masks = []
+            sdfs = []
             for segment_info in segments_info:
                 class_id = segment_info["category_id"]
                 if not segment_info["iscrowd"]:
+                    mask = pan_seg_gt == segment_info["id"]
+                    if not mask.any():
+                        continue
                     classes.append(class_id)
-                    masks.append(pan_seg_gt == segment_info["id"])
+                    masks.append(mask)
+                    phi = np.where(mask, -1.0, 1.0).astype(np.float32)
+                    sdf = skfmm.distance(phi, dx=1)
+                    if not np.isfinite(sdf).all():
+                        sdf = np.zeros_like(phi, dtype=np.float32)
+                    max_abs = np.abs(sdf).max()
+                    if max_abs > 0:
+                        sdf = np.clip(sdf / max_abs, -1.0, 1.0)
+                    else:
+                        sdf = np.zeros_like(sdf, dtype=np.float32)
+                    sdfs.append(sdf.astype(np.float32))
 
             classes = np.array(classes)
             instances.gt_classes = torch.tensor(classes, dtype=torch.int64)
@@ -159,11 +174,14 @@ class COCOPanopticNewBaselineDatasetMapper:
                 instances.gt_masks = torch.zeros((0, pan_seg_gt.shape[-2], pan_seg_gt.shape[-1]))
                 instances.gt_boxes = Boxes(torch.zeros((0, 4)))
             else:
-                masks = BitMasks(
+                bit_masks = BitMasks(
                     torch.stack([torch.from_numpy(np.ascontiguousarray(x.copy())) for x in masks])
                 )
-                instances.gt_masks = masks.tensor
-                instances.gt_boxes = masks.get_bounding_boxes()
+                instances.gt_boxes = bit_masks.get_bounding_boxes()
+                sdf_tensors = torch.stack(
+                    [torch.from_numpy(np.ascontiguousarray(sdf)).float() for sdf in sdfs]
+                )
+                instances.gt_masks = sdf_tensors
 
             dataset_dict["instances"] = instances
 
