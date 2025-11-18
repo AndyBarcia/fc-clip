@@ -10,6 +10,7 @@ import logging
 
 import numpy as np
 import torch
+import cv2
 
 from detectron2.config import configurable
 from detectron2.data import detection_utils as utils
@@ -158,11 +159,31 @@ class COCOPanopticNewBaselineDatasetMapper:
             masks = []
             for segment_info in segments_info:
                 class_id = segment_info["category_id"]
-                if not segment_info["iscrowd"]:
-                    mask = pan_seg_gt == segment_info["id"]
-                    if mask.any():
-                        classes.append(class_id)
-                        masks.append(mask)
+                if segment_info["iscrowd"]:
+                    continue
+
+                # Original mask for this panoptic segment id
+                mask = pan_seg_gt == segment_info["id"]
+                if not mask.any():
+                    continue
+
+                if segment_info["isthing"]:
+                    classes.append(class_id)
+                    masks.append(mask)
+                else:
+                    # Split into connected components so that disjoint masks
+                    # become separate instances
+                    # connectedComponents uses 0 as background, 1..N as components
+                    num_labels, labels = cv2.connectedComponents(
+                        mask.astype(np.uint8)
+                    )
+
+                    # For each connected component, create a separate mask
+                    for label_id in range(1, num_labels):
+                        component_mask = labels == label_id
+                        if component_mask.any():
+                            classes.append(class_id)
+                            masks.append(component_mask)
 
             classes = np.array(classes)
             instances.gt_classes = torch.tensor(classes, dtype=torch.int64)

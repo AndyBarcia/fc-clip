@@ -25,6 +25,7 @@ from .fcclip_transformer_decoder import (
     MaskPooling,
     SelfAttentionLayer,
     CrossAttentionLayer,
+    SlotCrossAttention,
     FFNLayer,
     MLP,
     _get_activation_fn
@@ -310,6 +311,14 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                     dropout=0.0,
                     normalize_before=pre_norm
                 )
+                if "rpb" in self.cross_attn_type else
+                SlotCrossAttention(
+                    dim=hidden_dim,
+                    n_heads=nheads,
+                    dropout=0.0,
+                    normalize_before=pre_norm,
+                )
+                if "slot"in self.cross_attn_type else None
             )
 
             if text_attn:
@@ -630,9 +639,9 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         # Do box regression if provided with look forward twice
         if query_bbox_unsigmoid != None:
             outputs_bbox, query_bbox_unsigmoid_detached = self._bbox_embed(
-                decoder_output, 
-                query_bbox_unsigmoid.transpose(0,1), 
-                outputs_mask, 
+                x=decoder_output, 
+                reference_points=query_bbox_unsigmoid.transpose(0,1), 
+                masks=outputs_mask, 
                 normalized_space=False
             )
             outputs_bbox = outputs_bbox.sigmoid()
