@@ -268,11 +268,12 @@ class FCCLIP(nn.Module):
         )
 
         weight_dict = {
-            "loss_ce": class_weight, 
-            "loss_mask": mask_weight, 
+            "loss_ce": class_weight,
+            "loss_mask": mask_weight,
             "loss_dice": dice_weight,
             "loss_bbox": bbox_weight,
-            "loss_giou": giou_weight
+            "loss_giou": giou_weight,
+            "loss_thing": class_weight,
         }
 
         if deep_supervision:
@@ -282,7 +283,7 @@ class FCCLIP(nn.Module):
                 aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
             weight_dict.update(aux_weight_dict)
 
-        losses = ["labels", "masks", "boxes"]
+        losses = ["labels", "masks", "boxes", "thing"]
 
         criterion = SetCriterion(
             sem_seg_head.num_classes,
@@ -576,6 +577,7 @@ class FCCLIP(nn.Module):
             attributes = {
                 "labels": new_labels,
                 "masks": padded_masks,
+                "is_thing": new_thing_mask.to(device=new_labels.device)[new_labels],
             }
 
             # Recompute boxes from final masks if boxes exist
