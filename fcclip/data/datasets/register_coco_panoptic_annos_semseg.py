@@ -50,11 +50,13 @@ def get_metadata():
     thing_colors = [k["color"] for k in COCO_CATEGORIES if k["isthing"] == 1]
     stuff_classes = [k["name"] for k in COCO_CATEGORIES]
     stuff_colors = [k["color"] for k in COCO_CATEGORIES]
+    thing_mask = [k["isthing"] == 1 for k in COCO_CATEGORIES]
 
     meta["thing_classes"] = thing_classes
     meta["thing_colors"] = thing_colors
     meta["stuff_classes"] = stuff_classes
     meta["stuff_colors"] = stuff_colors
+    meta["thing_mask"] = thing_mask
 
     # Convert category id for training:
     #   category id: like semantic segmentation, it is the class id for each

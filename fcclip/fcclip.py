@@ -9,6 +9,9 @@ from typing import Tuple
 import torch
 torch._dynamo.config.suppress_errors = True
 
+import cv2
+import numpy as np
+
 from torch import nn
 from torch.nn import functional as F
 
@@ -22,7 +25,7 @@ from detectron2.utils.memory import retry_if_cuda_oom
 
 from .modeling.criterion import SetCriterion
 from .modeling.matcher import HungarianMatcher
-from .modeling.transformer_decoder.box_regression import box_xyxy_to_cxcywh, box_cxcywh_to_xyxy
+from .modeling.transformer_decoder.box_regression import box_xyxy_to_cxcywh, box_cxcywh_to_xyxy, masks_to_boxes
 
 from .modeling.transformer_decoder.fcclip_transformer_decoder import MaskPooling, get_classification_logits
 VILD_PROMPT = [
@@ -41,7 +44,6 @@ VILD_PROMPT = [
     "There is a medium {} in the scene.",
     "There is a large {} in the scene.",
 ]
-
 
 @META_ARCH_REGISTRY.register()
 class FCCLIP(nn.Module):
@@ -74,6 +76,9 @@ class FCCLIP(nn.Module):
         geometric_ensemble_alpha: float,
         geometric_ensemble_beta: float,
         ensemble_on_valid_mask: bool,
+        # Zeg-FC
+        probability_swap_thing: float = 0.5,
+        probability_swap_stuff: float = 0.5,
     ):
         """
         Args:
@@ -135,8 +140,21 @@ class FCCLIP(nn.Module):
         self.test_text_classifier = None
         self.void_embedding = nn.Embedding(1, backbone.dim_latent) # use this for void
 
-        _, self.train_num_templates, self.train_class_names = self.prepare_class_names_from_metadata(train_metadata, train_metadata)
-        self.category_overlapping_mask, self.test_num_templates, self.test_class_names = self.prepare_class_names_from_metadata(test_metadata, train_metadata)
+        (   _, 
+            self.train_num_templates, 
+            self.train_class_names, 
+            self.train_thing_mask
+        ) = self.prepare_class_names_from_metadata(train_metadata, train_metadata)
+        (
+            self.category_overlapping_mask, 
+            self.test_num_templates, 
+            self.test_class_names,
+            self.test_thing_mask
+        ) = self.prepare_class_names_from_metadata(test_metadata, train_metadata)
+
+        # Zeg-FC args
+        self.probability_swap_thing = probability_swap_thing
+        self.probability_swap_stuff = probability_swap_stuff
 
     def prepare_class_names_from_metadata(self, metadata, train_metadata):
         def split_labels(x):
@@ -149,10 +167,12 @@ class FCCLIP(nn.Module):
         # get text classifier
         try:
             class_names = split_labels(metadata.stuff_classes) # it includes both thing and stuff
+            thing_mask = torch.tensor(metadata.thing_mask) # (C,) 1 if thing else 0 
             train_class_names = split_labels(train_metadata.stuff_classes)
         except:
             # this could be for insseg, where only thing_classes are available
             class_names = split_labels(metadata.thing_classes)
+            thing_mask = torch.tensor([True] * len(metadata.thing_classes)) # (C,) 1 if thing else 0
             train_class_names = split_labels(train_metadata.thing_classes)
         train_class_names = {l for label in train_class_names for l in label}
         category_overlapping_list = []
@@ -177,11 +197,16 @@ class FCCLIP(nn.Module):
             num_templates.append(templated_classes_num) # how many templates for current classes
         class_names = templated_class_names
         #print("text for classification:", class_names)
-        return category_overlapping_mask, num_templates, class_names
+        return category_overlapping_mask, num_templates, class_names, thing_mask
 
     def set_metadata(self, metadata):
         self.test_metadata = metadata
-        self.category_overlapping_mask, self.test_num_templates, self.test_class_names = self.prepare_class_names_from_metadata(metadata, self.train_metadata)
+        (
+            self.category_overlapping_mask, 
+            self.test_num_templates, 
+            self.test_class_names,
+            self.test_thing_mask
+        ) = self.prepare_class_names_from_metadata(metadata, self.train_metadata)
         self.test_text_classifier = None
         return
 
@@ -337,16 +362,19 @@ class FCCLIP(nn.Module):
         text_classifier = torch.cat([text_classifier, F.normalize(self.void_embedding.weight, dim=-1)], dim=0)
         features['text_classifier'] = text_classifier
         features['num_templates'] = num_templates
+
+        # In training, randomly swap thing and stuff classes
+        if self.training:
+            # mask classification target
+            gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
+            targets, thing_mask = self.prepare_targets(gt_instances, images)
+            features['thing_mask'] = thing_mask
+        else:
+            features['thing_mask'] = self.test_thing_mask
+
         outputs = self.sem_seg_head(features)
 
         if self.training:
-            # mask classification target
-            if "instances" in batched_inputs[0]:
-                gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
-                targets = self.prepare_targets(gt_instances, images)
-            else:
-                targets = None
-
             # bipartite matching-based loss
             losses = self.criterion(outputs, targets)
 
@@ -465,23 +493,104 @@ class FCCLIP(nn.Module):
             return processed_results
 
     def prepare_targets(self, targets, images):
+        # Decide to randomly swap thing and stuff classes
+        if self.probability_swap_thing != 0.0 and self.probability_swap_stuff != 0.0:
+            swap_probability = torch.where(
+                self.train_thing_mask,
+                torch.full_like(self.train_thing_mask, self.probability_swap_thing, dtype=torch.float),
+                torch.full_like(self.train_thing_mask, self.probability_swap_stuff, dtype=torch.float)
+            )
+            flip_mask = torch.bernoulli(swap_probability).bool()
+            new_thing_mask = torch.logical_xor(self.train_thing_mask, flip_mask)
+        else:
+            flip_mask = torch.zeros_like(self.train_thing_mask).bool()
+            new_thing_mask = self.train_thing_mask
+        
         h_pad, w_pad = images.tensor.shape[-2:]
         new_targets = []
+
         for targets_per_image in targets:
-            # pad gt
-            gt_masks = targets_per_image.gt_masks
-            padded_masks = torch.zeros((gt_masks.shape[0], h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
-            padded_masks[:, : gt_masks.shape[1], : gt_masks.shape[2]] = gt_masks
+            gt_masks = targets_per_image.gt_masks  # [N, H, W]
+            gt_classes = targets_per_image.gt_classes  # [N]
+            h, w = targets_per_image.image_size
+
+            new_masks_list = []
+            new_labels_list = []
+            if gt_masks.numel() > 0:
+                unique_classes = gt_classes.unique()
+
+                for cls in unique_classes:
+                    cls = int(cls.item())
+                    cls_inds = torch.nonzero(gt_classes == cls, as_tuple=True)[0]
+                    cls_masks = gt_masks[cls_inds]  # [K, H, W]
+
+                    was_flipped = bool(flip_mask[cls].item())
+                    is_thing_now = bool(new_thing_mask[cls].item())
+
+                    # Case 1: thing -> stuff (merge instances)
+                    if not is_thing_now and was_flipped:
+                        merged = cls_masks.any(dim=0)  # [H, W] union
+                        new_masks_list.append(merged.to(gt_masks.dtype))
+                        new_labels_list.append(cls)
+                    # Case 2: stuff -> thing (split via connected components)
+                    elif is_thing_now and was_flipped:
+                        merged = cls_masks.any(dim=0)  # [H, W] union of stuff region
+
+                        # connected components on CPU with OpenCV
+                        merged_np = merged.to(torch.uint8).cpu().numpy()
+                        num_cc, cc_labels = cv2.connectedComponents(merged_np)
+
+                        for cc_id in range(1, num_cc):  # 0 is background
+                            cc_mask_np = (cc_labels == cc_id).astype(np.uint8)
+                            cc_mask = torch.from_numpy(cc_mask_np).to(
+                                device=gt_masks.device, dtype=gt_masks.dtype
+                            )
+                            new_masks_list.append(cc_mask)
+                            new_labels_list.append(cls)
+                    # Case 3: unchanged thing->thing or stuff->stuff (keep instances)
+                    else:
+                        for idx in cls_inds:
+                            new_masks_list.append(gt_masks[idx])
+                            new_labels_list.append(cls)
+
+            if len(new_masks_list) > 0:
+                new_masks = torch.stack(new_masks_list, dim=0)  # [N', H, W]
+                new_labels = torch.tensor(
+                    new_labels_list,
+                    device=gt_classes.device,
+                    dtype=gt_classes.dtype,
+                )
+            else:
+                # No masks in this image
+                new_masks = gt_masks.new_zeros((0, h, w))
+                new_labels = gt_classes.new_zeros((0,))
+
+            # pad masks to (h_pad, w_pad)
+            padded_masks = torch.zeros(
+                (new_masks.shape[0], h_pad, w_pad),
+                dtype=new_masks.dtype,
+                device=new_masks.device,
+            )
+            padded_masks[:, : new_masks.shape[1], : new_masks.shape[2]] = new_masks
+
             attributes = {
-                "labels": targets_per_image.gt_classes,
+                "labels": new_labels,
                 "masks": padded_masks,
             }
-            if targets_per_image.has("gt_boxes"):
-                h, w = targets_per_image.image_size
-                image_size_xyxy = torch.as_tensor([w, h, w, h], dtype=torch.float, device=self.device)
-                attributes["boxes"] = box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor)/image_size_xyxy
+
+            # Recompute boxes from final masks if boxes exist
+            if targets_per_image.has("gt_boxes") and new_masks.shape[0] > 0:
+                image_size_xyxy = torch.as_tensor(
+                    [w, h, w, h], dtype=torch.float, device=self.device
+                )
+                boxes_xyxy = masks_to_boxes(new_masks)  # [N', 4]
+                attributes["boxes"] = (
+                    box_xyxy_to_cxcywh(boxes_xyxy) / image_size_xyxy
+                )
+
             new_targets.append(attributes)
-        return new_targets
+
+        return new_targets, new_thing_mask
 
     def semantic_inference(self, mask_cls, mask_pred):
         mask_cls = F.softmax(mask_cls, dim=-1)[..., :-1]

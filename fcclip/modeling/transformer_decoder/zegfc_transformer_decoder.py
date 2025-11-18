@@ -222,7 +222,6 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         attn_conv_kernel_size: Optional[int] = 3,
         text_attn: bool,
         text_atnn_cls: bool,
-        mem_attn_mask: bool,
         clip_embedding_dim: int
     ):
         """
@@ -399,14 +398,6 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                 dropout=0.0,
                 normalize_before=pre_norm,
             )
-        self.mem_attn_mask = mem_attn_mask
-        if self.mem_attn_mask:
-            self.intermediate_mem_cross_attention_layer = CrossAttentionLayer(
-                d_model=hidden_dim,
-                nhead=nheads,
-                dropout=0.0,
-                normalize_before=pre_norm,
-            )
         
         self.attn_conv_kernel_size = attn_conv_kernel_size
         if self.attn_conv_kernel_size:
@@ -448,7 +439,6 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         
         ret["text_attn"] = cfg.MODEL.ZEG_FC.TEXT_ATTN
         ret["text_atnn_cls"] = cfg.MODEL.ZEG_FC.TEXT_ATTN_CLS
-        ret["mem_attn_mask"] = cfg.MODEL.ZEG_FC.MEM_ATTN_MASK
         ret["mask_dim"] = cfg.MODEL.SEM_SEG_HEAD.MASK_DIM
         ret["clip_embedding_dim"] = cfg.MODEL.FC_CLIP.EMBED_DIM
         ret["mask_embed_type"] = cfg.MODEL.ZEG_FC.MASK_EMBED_TYPE
@@ -460,7 +450,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         ret["mask_pos_mlp_type"] = cfg.MODEL.ZEG_FC.MASK_POS_MLP_TYPE
         return ret
 
-    def forward(self, x, mask_features, mask = None, text_classifier=None, num_templates=None):
+    def forward(self, x, mask_features, mask = None, text_classifier=None, thing_mask=None, num_templates=None):
         # x is a list of multi-scale feature
         assert len(x) == self.num_feature_levels
         src = []
@@ -499,31 +489,17 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             )
         else:
             text_attn_logits = None
-        
-        # Optional starting cross-attention for memory attention mask.
-        if self.mem_attn_mask:
-            output, mem_attn_logits = self.intermediate_mem_cross_attention_layer(
-                output.transpose(0,1), # (B,Q,C)
-                src[0].transpose(0,1).view(bs, size_list[0][0], size_list[0][1], -1), # (B,H,W,C)
-                memory_pos_emb=pos[0].transpose(0,1).view(bs, size_list[0][0], size_list[0][1], -1), # (B,H,W,C), 
-                query_pos_emb=query_embed.transpose(0,1), # (B,Q,C)
-                pos=query_bbox_unsigmoid.sigmoid().transpose(0,1) if query_bbox_unsigmoid is not None else None, # (B,Q,[x,y,w,j])
-                return_attn_logits=self.mem_attn_mask,
-            )
-            output = output.transpose(0,1) # (Q,B,C)
-        else:
-            mem_attn_logits = None
 
         # prediction heads on learnable query features
         outputs_class, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
             output, 
             mask_features,
-            mem_attn_logits,
             text_attn_logits,
             query_bbox_unsigmoid=query_bbox_unsigmoid,
             attn_mask_size=size_list[0],
             attn_mask_target_size=size_list[0],
             text_classifier=text_classifier, 
+            thing_mask=thing_mask,
             num_templates=num_templates
         )
         predictions_class.append(outputs_class)
@@ -534,14 +510,13 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             level_index = i % self.num_feature_levels
             attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
             # attention: cross-attention first
-            output, mem_attn_logits = self.transformer_cross_attention_layers[i](
+            output, _ = self.transformer_cross_attention_layers[i](
                 output.transpose(0,1), # (B,Q,C)
                 src[level_index].transpose(0,1).view(bs, size_list[level_index][0], size_list[level_index][1], -1), # (B,H,W,C)
                 attn_mask=attn_mask.view(bs, self.num_heads, self.num_queries, size_list[level_index][0], size_list[level_index][1]), # (B, num_heads, Q, H,W)
                 memory_pos_emb=pos[level_index].transpose(0,1).view(bs, size_list[level_index][0], size_list[level_index][1], -1), # (B,H,W,C), 
                 query_pos_emb=query_embed.transpose(0,1), # (B,Q,C)
                 pos=query_bbox_unsigmoid.sigmoid().transpose(0,1) if query_bbox_unsigmoid is not None else None, # (B,Q,[x,y,w,j])
-                return_attn_logits=self.mem_attn_mask,
             )
             output = output.transpose(0,1) # (Q,B,C)
 
@@ -570,12 +545,12 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             outputs_class, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
                 output, 
                 mask_features, 
-                mem_attn_logits,
                 text_attn_logits,
                 query_bbox_unsigmoid=query_bbox_unsigmoid,
                 attn_mask_size=size_list[i % self.num_feature_levels],
                 attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels],
                 text_classifier=text_classifier, 
+                thing_mask=thing_mask,
                 num_templates=num_templates
             )
             predictions_class.append(outputs_class)
@@ -599,35 +574,19 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         self, 
         output, 
         mask_features, 
-        mem_attn_logits,
         text_attn_logits, 
         query_bbox_unsigmoid,
         attn_mask_size,
         attn_mask_target_size, 
         text_classifier, 
+        thing_mask,
         num_templates
     ):
         decoder_output = self.decoder_norm(output)
         decoder_output = decoder_output.transpose(0, 1)
-        mask_embed = self.mask_embed(decoder_output)
+        mask_embed = self.mask_embed(decoder_output) # (B,Q,2*C)
 
-        if self.mem_attn_mask:
-            # Get attention logits from memory attention to the propper size.
-
-            #import logging
-            #logger = logging.getLogger("detectron2")
-            #logger.info(f"{mem_attn_logits.shape=}, {attn_mask_size=}, {mask_features.shape=}")
-
-            mem_attn_logits = mem_attn_logits.unflatten(-1, attn_mask_size) # [B, Q, H, W]
-            mem_attn_logits = F.interpolate(
-                mem_attn_logits, 
-                size=mask_features.shape[-2:], 
-                mode="bilinear", 
-                align_corners=False
-            )
-            outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features) + mem_attn_logits
-        else:
-            outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
+        outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
 
         # Apply convolution MLP to the mask features.
         if self.attn_conv_kernel_size:

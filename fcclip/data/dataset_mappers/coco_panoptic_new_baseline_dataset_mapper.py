@@ -167,6 +167,10 @@ class COCOPanopticNewBaselineDatasetMapper:
                 if not mask.any():
                     continue
 
+                classes.append(class_id)
+                masks.append(mask)
+
+                """
                 if segment_info["isthing"]:
                     classes.append(class_id)
                     masks.append(mask)
@@ -184,6 +188,7 @@ class COCOPanopticNewBaselineDatasetMapper:
                         if component_mask.any():
                             classes.append(class_id)
                             masks.append(component_mask)
+                """
 
             classes = np.array(classes)
             instances.gt_classes = torch.tensor(classes, dtype=torch.int64)
