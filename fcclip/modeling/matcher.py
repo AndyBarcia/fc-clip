@@ -99,8 +99,11 @@ class HungarianMatcher(nn.Module):
                 if tgt_is_thing is not None and "pred_thing_logits" in outputs:
                     tgt_thing = tgt_is_thing.to(dtype=torch.float, device=out_prob.device)
                     pred_thing_logits = outputs["pred_thing_logits"][b].float()
+                    num_tgt = tgt_thing.shape[0]
+                    pred_thing_logits = pred_thing_logits[:, None].expand(-1, num_tgt)
+                    tgt_thing = tgt_thing[None, :].expand(num_queries, -1)
                     cost_thing = F.binary_cross_entropy_with_logits(
-                        pred_thing_logits[:, None], tgt_thing[None, :], reduction="none"
+                        pred_thing_logits, tgt_thing, reduction="none"
                     )
 
                 out_mask = outputs["pred_masks"][b]  # [num_queries, H_pred, W_pred]
