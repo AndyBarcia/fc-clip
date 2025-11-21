@@ -8,6 +8,7 @@ Modules to compute the matching cost and solve the corresponding LSAP.
 """
 
 import torch
+import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 from torch import nn
 from torch.cuda.amp import autocast
@@ -51,20 +52,27 @@ class HungarianMatcher(nn.Module):
     while the others are un-matched (and thus treated as non-objects).
     """
 
-    def __init__(self, cost_class: float = 1, cost_mask: float = 1, cost_dice: float = 1, num_points: int = 0):
+    def __init__(self, cost_class: float = 1, cost_mask: float = 1, cost_dice: float = 1, cost_thing: float = 0, num_points: int = 0):
         """Creates the matcher
 
         Params:
             cost_class: This is the relative weight of the classification error in the matching cost
             cost_mask: This is the relative weight of the focal loss of the binary mask in the matching cost
             cost_dice: This is the relative weight of the dice loss of the binary mask in the matching cost
+            cost_thing: This is the relative weight of the thing/stuff prediction error in the matching cost
         """
         super().__init__()
         self.cost_class = cost_class
         self.cost_mask = cost_mask
         self.cost_dice = cost_dice
+        self.cost_thing = cost_thing
 
-        assert cost_class != 0 or cost_mask != 0 or cost_dice != 0, "all costs cant be 0"
+        assert (
+            cost_class != 0
+            or cost_mask != 0
+            or cost_dice != 0
+            or cost_thing != 0
+        ), "all costs cant be 0"
 
         self.num_points = num_points
 
@@ -80,10 +88,23 @@ class HungarianMatcher(nn.Module):
 
             out_prob = outputs["pred_logits"][b].softmax(-1)  # [num_queries, num_classes]
             tgt_ids = targets[b]["labels"]
+            tgt_is_thing = targets[b].get("is_thing")
 
             if tgt_ids.numel() > 0:
                 # Compute the classification cost.
                 cost_class = -out_prob[:, tgt_ids]
+
+                # Compute the thing/stuff cost.
+                cost_thing = None
+                if tgt_is_thing is not None and "pred_thing_logits" in outputs:
+                    tgt_thing = tgt_is_thing.to(dtype=torch.float, device=out_prob.device)
+                    pred_thing_logits = outputs["pred_thing_logits"][b].float()
+                    num_tgt = tgt_thing.shape[0]
+                    pred_thing_logits = pred_thing_logits[:, None].expand(-1, num_tgt)
+                    tgt_thing = tgt_thing[None, :].expand(num_queries, -1)
+                    cost_thing = F.binary_cross_entropy_with_logits(
+                        pred_thing_logits, tgt_thing, reduction="none"
+                    )
 
                 out_mask = outputs["pred_masks"][b]  # [num_queries, H_pred, W_pred]
                 tgt_mask = targets[b]["masks"].to(out_mask)
@@ -109,6 +130,8 @@ class HungarianMatcher(nn.Module):
                     + self.cost_class * cost_class
                     + self.cost_dice * cost_dice
                 )
+                if cost_thing is not None:
+                    C = C + self.cost_thing * cost_thing
             else:
                 # This block runs if there are NO ground-truth objects.
                 # We create an empty cost matrix. The shape [num_queries, 0] is
@@ -155,6 +178,7 @@ class HungarianMatcher(nn.Module):
             "cost_class: {}".format(self.cost_class),
             "cost_mask: {}".format(self.cost_mask),
             "cost_dice: {}".format(self.cost_dice),
+            "cost_thing: {}".format(self.cost_thing),
         ]
         lines = [head] + [" " * _repr_indent + line for line in body]
         return "\n".join(lines)

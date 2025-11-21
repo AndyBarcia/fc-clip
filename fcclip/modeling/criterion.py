@@ -52,6 +52,25 @@ class SetCriterion(nn.Module):
         self.oversample_ratio = oversample_ratio
         self.importance_sample_ratio = importance_sample_ratio
 
+    def loss_thing_stuff(self, outputs, targets, indices, num_masks):
+        """Binary classification loss for thing/stuff prediction head."""
+        if "pred_thing_logits" not in outputs:
+            return {}
+
+        idx = self._get_src_permutation_idx(indices)
+        target_thing = torch.cat(
+            [t["is_thing"][J] for t, (_, J) in zip(targets, indices)]
+        ).float()
+
+        if target_thing.numel() == 0:
+            return {"loss_thing": outputs["pred_thing_logits"].sum() * 0.0}
+
+        pred_thing = outputs["pred_thing_logits"].float()[idx]
+        loss_thing = F.binary_cross_entropy_with_logits(pred_thing, target_thing, reduction="sum")
+        loss_thing = loss_thing / num_masks
+
+        return {"loss_thing": loss_thing}
+
     def loss_labels(self, outputs, targets, indices, num_masks):
         """Classification loss (NLL)
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
@@ -158,7 +177,8 @@ class SetCriterion(nn.Module):
         loss_map = {
             'labels': self.loss_labels,
             'masks': self.loss_masks,
-            'boxes': self.loss_boxes
+            'boxes': self.loss_boxes,
+            'thing': self.loss_thing_stuff
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_masks)
