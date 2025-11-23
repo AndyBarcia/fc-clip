@@ -562,6 +562,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         out = {
             'pred_logits': predictions_class[-1],
             'pred_masks': predictions_mask[-1],
+            'mask_features': mask_features,
             'pred_boxes': predictions_bbox[-1],
             'aux_outputs': self._set_aux_loss(
                 predictions_class if self.mask_classification else None, predictions_mask, predictions_bbox
@@ -620,6 +621,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         maskpool_embeddings = self.mask_pooling(x=mask_features, mask=outputs_mask) # [B, Q, C]
         maskpool_embeddings = self._mask_pooling_proj(maskpool_embeddings)
         class_embed = self.class_embed(maskpool_embeddings + decoder_output)
+        # TODO use output_class as logit for attention mechanism. Though we will need to remove templates for this.
         outputs_class = get_classification_logits(class_embed, text_classifier, self.logit_scale, num_templates, text_attn_logits)
 
         # NOTE: prediction is of higher-resolution

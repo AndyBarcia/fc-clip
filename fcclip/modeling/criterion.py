@@ -51,7 +51,7 @@ class SetCriterion(nn.Module):
         self.num_points = num_points
         self.oversample_ratio = oversample_ratio
         self.importance_sample_ratio = importance_sample_ratio
-        self.pairwise_num_samples = num_points
+        self.pairwise_num_samples = 8
 
     def loss_labels(self, outputs, targets, indices, num_masks):
         """Classification loss (NLL)

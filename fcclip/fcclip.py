@@ -77,8 +77,8 @@ class FCCLIP(nn.Module):
         geometric_ensemble_beta: float,
         ensemble_on_valid_mask: bool,
         # Zeg-FC
-        probability_swap_thing: float = 0.5,
-        probability_swap_stuff: float = 0.5,
+        probability_swap_thing: float = 0.0,
+        probability_swap_stuff: float = 0.0,
     ):
         """
         Args:
