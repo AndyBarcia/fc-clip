@@ -47,6 +47,8 @@ class SetCriterion(nn.Module):
         empty_weight[-1] = self.eos_coef
         self.register_buffer("empty_weight", empty_weight)
 
+        self.tv_eps = 1e-6
+
         # pointwise mask loss parameters
         self.num_points = num_points
         self.oversample_ratio = oversample_ratio
@@ -142,6 +144,31 @@ class SetCriterion(nn.Module):
 
         return losses
 
+    def loss_tv(self, outputs, targets, indices, num_masks):
+        """Total variation regularization for all predicted masks."""
+
+        if "pred_masks" not in outputs:
+            return {}
+
+        pred_masks = outputs["pred_masks"]
+
+        if pred_masks.numel() == 0:
+            return {"loss_tv": pred_masks.sum() * 0.0}
+
+        probs = torch.sigmoid(pred_masks)
+        dx = probs[:, :, 1:, :] - probs[:, :, :-1, :]
+        dy = probs[:, :, :, 1:] - probs[:, :, :, :-1]
+
+        dx = F.pad(dx, (0, 0, 0, 1))
+        dy = F.pad(dy, (0, 1, 0, 0))
+
+        grad_mag = torch.sqrt(dx * dx + dy * dy + self.tv_eps)
+
+        tv_per_mask = grad_mag.sum(dim=[2, 3]) / (probs.shape[-2] * probs.shape[-1])
+        loss_tv = tv_per_mask.mean()
+
+        return {"loss_tv": loss_tv}
+
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -158,7 +185,8 @@ class SetCriterion(nn.Module):
         loss_map = {
             'labels': self.loss_labels,
             'masks': self.loss_masks,
-            'boxes': self.loss_boxes
+            'boxes': self.loss_boxes,
+            'tv': self.loss_tv
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_masks)

@@ -256,6 +256,7 @@ class FCCLIP(nn.Module):
         class_weight = cfg.MODEL.MASK_FORMER.CLASS_WEIGHT
         dice_weight = cfg.MODEL.MASK_FORMER.DICE_WEIGHT
         mask_weight = cfg.MODEL.MASK_FORMER.MASK_WEIGHT
+        tv_weight = cfg.MODEL.MASK_FORMER.TV_WEIGHT
         bbox_weight = cfg.MODEL.MASK_FORMER.BBOX_WEIGHT
         giou_weight = cfg.MODEL.MASK_FORMER.GIOU_WEIGHT
 
@@ -268,9 +269,10 @@ class FCCLIP(nn.Module):
         )
 
         weight_dict = {
-            "loss_ce": class_weight, 
-            "loss_mask": mask_weight, 
+            "loss_ce": class_weight,
+            "loss_mask": mask_weight,
             "loss_dice": dice_weight,
+            "loss_tv": tv_weight,
             "loss_bbox": bbox_weight,
             "loss_giou": giou_weight
         }
@@ -282,7 +284,7 @@ class FCCLIP(nn.Module):
                 aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
             weight_dict.update(aux_weight_dict)
 
-        losses = ["labels", "masks", "boxes"]
+        losses = ["labels", "masks", "boxes", "tv"]
 
         criterion = SetCriterion(
             sem_seg_head.num_classes,
