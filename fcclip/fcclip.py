@@ -579,14 +579,13 @@ class FCCLIP(nn.Module):
             }
 
             # Recompute boxes from final masks if boxes exist
-            if targets_per_image.has("gt_boxes") and new_masks.shape[0] > 0:
-                image_size_xyxy = torch.as_tensor(
-                    [w, h, w, h], dtype=torch.float, device=self.device
-                )
-                boxes_xyxy = masks_to_boxes(new_masks)  # [N', 4]
-                attributes["boxes"] = (
-                    box_xyxy_to_cxcywh(boxes_xyxy) / image_size_xyxy
-                )
+            image_size_xyxy = torch.as_tensor(
+                [w, h, w, h], dtype=torch.float, device=self.device
+            )
+            boxes_xyxy = masks_to_boxes(new_masks)  # [N', 4]
+            attributes["boxes"] = (
+                box_xyxy_to_cxcywh(boxes_xyxy) / image_size_xyxy
+            )
 
             new_targets.append(attributes)
 

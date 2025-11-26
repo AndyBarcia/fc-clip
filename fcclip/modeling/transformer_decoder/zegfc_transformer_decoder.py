@@ -253,16 +253,20 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         self.box_reg_type = box_reg_type
         if self.box_reg_type == "mlp":
             self._bbox_embed = BBoxMLPRegression(hidden_dim)
+            self.query_bbox = nn.Embedding(num_queries, 4) if self._bbox_embed != None else None
         elif self.box_reg_type in ['bitmask', 'mask2box']:
             self.mask2box_threshold = 0.0
             self._bbox_embed = BboxMaskInitialization(
-                fast_bbox = self.box_reg_type=="mask2box", 
+                fast_bbox = self.box_reg_type=="mask2box",
                 threshold=self.mask2box_threshold
             )
+            self.query_bbox = None
         elif self.box_reg_type == "stn":
             self._bbox_embed = BboxMaskSTN(pooling="mean", learn_format="cxcywh")
+            self.query_bbox = None
         else:
             self._bbox_embed = None
+            self.query_bbox = None
         
         # Attention type
         self.self_attn_type = self_attn_type
@@ -347,8 +351,6 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         self.query_feat = nn.Embedding(num_queries, hidden_dim)
         # learnable query p.e.
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
-        # optional fixed boxes
-        self.query_bbox = nn.Embedding(num_queries, 4) if self._bbox_embed != None else None
 
         # level embedding (we always use 3 scales)
         self.num_feature_levels = 3
@@ -363,9 +365,9 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
 
         self.mask_embed_type = mask_embed_type
         if self.mask_embed_type == "mlp":
-            self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
+            self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim*2, 3)
         elif self.mask_embed_type == "linear":
-            self.mask_embed = nn.Linear(hidden_dim, mask_dim)
+            self.mask_embed = nn.Linear(hidden_dim, mask_dim*2)
             weight_init.c2_xavier_fill(self.mask_embed)
         else:
             raise ValueError(f"Unknown mask_embed_type: {self.mask_embed_type}")
@@ -508,7 +510,17 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
 
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
-            attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
+            
+            # Un-mask queries that are not paying attention to any pixels (Row check)
+            query_sees_nothing = attn_mask.all(dim=2) # Shape: [B*Heads, Q]
+            attn_mask[query_sees_nothing.unsqueeze(2).expand_as(attn_mask)] = False
+
+            # When using SlotAttention, Un-mask pixels that are not being attended to 
+            # by any query (Column check)
+            if "slot" in self.cross_attn_type:
+                pixel_seen_by_no_one = attn_mask.all(dim=1) # Shape: [B*Heads, HW]            
+                attn_mask[pixel_seen_by_no_one.unsqueeze(1).expand_as(attn_mask)] = False
+
             # attention: cross-attention first
             output, _ = self.transformer_cross_attention_layers[i](
                 output.transpose(0,1), # (B,Q,C)
@@ -579,14 +591,24 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         attn_mask_size,
         attn_mask_target_size, 
         text_classifier, 
-        thing_mask,
+        thing_mask, # (T,)
         num_templates
     ):
         decoder_output = self.decoder_norm(output)
         decoder_output = decoder_output.transpose(0, 1)
         mask_embed = self.mask_embed(decoder_output) # (B,Q,2*C)
+        thing_mask_embed, stuff_mask_embed = mask_embed.chunk(2, dim=-1) # (B,Q,C), (B,Q,C)
 
-        outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
+        thing_mask = torch.cat([thing_mask, torch.tensor([0], device=thing_mask.device, dtype=thing_mask.dtype)], dim=0) # (T+1,)
+
+        class_embed = self.class_embed(decoder_output) # (B,Q,C)
+        outputs_class = F.softmax(get_classification_logits(class_embed, text_classifier, self.logit_scale, num_templates, text_attn_logits), dim=-1) # (B,Q,T)
+        output_thing_mask = torch.einsum("bqt,t->bq", outputs_class, thing_mask.to(outputs_class.dtype).to(outputs_class.device)).detach()  # (B,Q)
+
+        thing_mask = torch.einsum("bqc,bchw->bqhw", thing_mask_embed, mask_features)
+        stuff_mask = torch.einsum("bqc,bchw->bqhw", stuff_mask_embed, mask_features)
+
+        outputs_mask = torch.einsum("bqhw,bq->bqhw", thing_mask, output_thing_mask) + torch.einsum("bqhw,bq->bqhw", stuff_mask, 1-output_thing_mask)  # (B,Q,H,W)
 
         # Apply convolution MLP to the mask features.
         if self.attn_conv_kernel_size:
@@ -596,10 +618,10 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             outputs_mask = outputs_mask.squeeze(1).unflatten(0, (bs, -1))  # [B, Q, H, W]
 
         # Do box regression if provided with look forward twice
-        if query_bbox_unsigmoid != None:
+        if self._bbox_embed != None:
             outputs_bbox, query_bbox_unsigmoid_detached = self._bbox_embed(
                 x=decoder_output, 
-                reference_points=query_bbox_unsigmoid.transpose(0,1), 
+                reference_points=query_bbox_unsigmoid.transpose(0,1) if query_bbox_unsigmoid is not None else None, 
                 masks=outputs_mask, 
                 normalized_space=False
             )
