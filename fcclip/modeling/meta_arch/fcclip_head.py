@@ -110,6 +110,7 @@ class FCCLIPHead(nn.Module):
                 transformer_predictor_in_channels,
                 mask_classification=True,
             ),
+            "thing_stuff_adapter": cfg.MODEL.ZEG_FC.THING_STUFF_ADAPTER_TYPE,
         }
 
     def get_relationship_descriptor(

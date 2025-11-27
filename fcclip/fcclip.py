@@ -77,8 +77,8 @@ class FCCLIP(nn.Module):
         geometric_ensemble_beta: float,
         ensemble_on_valid_mask: bool,
         # Zeg-FC
-        probability_swap_thing: float = 0.5,
-        probability_swap_stuff: float = 0.5,
+        probability_swap_thing: float = 0.1,
+        probability_swap_stuff: float = 0.1,
     ):
         """
         Args:
@@ -321,7 +321,9 @@ class FCCLIP(nn.Module):
             "test_topk_per_image": cfg.TEST.DETECTIONS_PER_IMAGE,
             "geometric_ensemble_alpha": cfg.MODEL.FC_CLIP.GEOMETRIC_ENSEMBLE_ALPHA,
             "geometric_ensemble_beta": cfg.MODEL.FC_CLIP.GEOMETRIC_ENSEMBLE_BETA,
-            "ensemble_on_valid_mask": cfg.MODEL.FC_CLIP.ENSEMBLE_ON_VALID_MASK
+            "ensemble_on_valid_mask": cfg.MODEL.FC_CLIP.ENSEMBLE_ON_VALID_MASK,
+            "probability_swap_thing": cfg.MODEL.ZEG_FC.PROBABILITY_SWAP_THING,
+            "probability_swap_stuff": cfg.MODEL.ZEG_FC.PROBABILITY_SWAP_STUFF,
         }
 
     @property

@@ -222,7 +222,8 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         attn_conv_kernel_size: Optional[int] = 3,
         text_attn: bool,
         text_atnn_cls: bool,
-        clip_embedding_dim: int
+        clip_embedding_dim: int,
+        separate_thing_stuff_mask_embed: bool = False,
     ):
         """
         NOTE: this interface is experimental.
@@ -364,13 +365,17 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                 self.input_proj.append(nn.Sequential())
 
         self.mask_embed_type = mask_embed_type
+        self.separate_thing_stuff_mask_embed = separate_thing_stuff_mask_embed
         if self.mask_embed_type == "mlp":
-            self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim*2, 3)
+            self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim*2 if separate_thing_stuff_mask_embed else mask_dim, 3)
         elif self.mask_embed_type == "linear":
-            self.mask_embed = nn.Linear(hidden_dim, mask_dim*2)
+            self.mask_embed = nn.Linear(hidden_dim, mask_dim*2 if separate_thing_stuff_mask_embed else mask_dim)
             weight_init.c2_xavier_fill(self.mask_embed)
         else:
             raise ValueError(f"Unknown mask_embed_type: {self.mask_embed_type}")
+
+        if self.separate_thing_stuff_mask_embed:
+            self.thing_stuff_temperature = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
         # FC-CLIP
         self.mask_pooling = MaskPooling()
@@ -450,6 +455,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         ret["cross_attn_type"] = cfg.MODEL.ZEG_FC.CROSS_ATTN_TYPE
         ret["self_attn_type"] = cfg.MODEL.ZEG_FC.SELF_ATTN_TYPE
         ret["mask_pos_mlp_type"] = cfg.MODEL.ZEG_FC.MASK_POS_MLP_TYPE
+        ret["separate_thing_stuff_mask_embed"] = cfg.MODEL.ZEG_FC.SEPARATE_THING_STUFF_MASK_EMBED
         return ret
 
     def forward(self, x, mask_features, mask = None, text_classifier=None, thing_mask=None, num_templates=None):
@@ -597,18 +603,21 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         decoder_output = self.decoder_norm(output)
         decoder_output = decoder_output.transpose(0, 1)
         mask_embed = self.mask_embed(decoder_output) # (B,Q,2*C)
-        thing_mask_embed, stuff_mask_embed = mask_embed.chunk(2, dim=-1) # (B,Q,C), (B,Q,C)
 
-        thing_mask = torch.cat([thing_mask, torch.tensor([0], device=thing_mask.device, dtype=thing_mask.dtype)], dim=0) # (T+1,)
+        if self.separate_thing_stuff_mask_embed:
+            thing_mask_embed, stuff_mask_embed = mask_embed.chunk(2, dim=-1) # (B,Q,C), (B,Q,C)
 
-        class_embed = self.class_embed(decoder_output) # (B,Q,C)
-        outputs_class = F.softmax(get_classification_logits(class_embed, text_classifier, self.logit_scale, num_templates, text_attn_logits), dim=-1) # (B,Q,T)
-        output_thing_mask = torch.einsum("bqt,t->bq", outputs_class, thing_mask.to(outputs_class.dtype).to(outputs_class.device)).detach()  # (B,Q)
+            class_embed = self.class_embed(decoder_output) # (B,Q,C)
+            class_logits = get_classification_logits(class_embed, text_classifier, self.logit_scale, num_templates, text_attn_logits)[:,:,:-1].detach() # (B,Q,T)
+            temp = self.thing_stuff_temperature.exp()
+            outputs_class = F.softmax(class_logits / temp, dim=-1) # (B,Q,T)
+            output_thing_mask = torch.einsum("bqt,t->bq", outputs_class, thing_mask.to(outputs_class.dtype).to(outputs_class.device))  # (B,Q)
 
-        thing_mask = torch.einsum("bqc,bchw->bqhw", thing_mask_embed, mask_features)
-        stuff_mask = torch.einsum("bqc,bchw->bqhw", stuff_mask_embed, mask_features)
-
-        outputs_mask = torch.einsum("bqhw,bq->bqhw", thing_mask, output_thing_mask) + torch.einsum("bqhw,bq->bqhw", stuff_mask, 1-output_thing_mask)  # (B,Q,H,W)
+            thing_mask = torch.einsum("bqc,bchw->bqhw", thing_mask_embed, mask_features)
+            stuff_mask = torch.einsum("bqc,bchw->bqhw", stuff_mask_embed, mask_features)
+            outputs_mask = torch.einsum("bqhw,bq->bqhw", thing_mask, output_thing_mask) + torch.einsum("bqhw,bq->bqhw", stuff_mask, 1-output_thing_mask)  # (B,Q,H,W)
+        else:
+            outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)  # (B,Q,H,W)
 
         # Apply convolution MLP to the mask features.
         if self.attn_conv_kernel_size:

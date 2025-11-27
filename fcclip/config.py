@@ -40,7 +40,7 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.CLASS_WEIGHT = 1.0
     cfg.MODEL.MASK_FORMER.DICE_WEIGHT = 1.0
     cfg.MODEL.MASK_FORMER.MASK_WEIGHT = 20.0
-    cfg.MODEL.MASK_FORMER.TV_WEIGHT = 0.1
+    cfg.MODEL.MASK_FORMER.TV_WEIGHT = 0.0
     cfg.MODEL.MASK_FORMER.BBOX_WEIGHT = 1.0
     cfg.MODEL.MASK_FORMER.GIOU_WEIGHT = 1.0
 
@@ -157,3 +157,7 @@ def add_zegfc_config(cfg):
     cfg.MODEL.ZEG_FC.CROSS_ATTN_TYPE = "standard"  # Options: "standard", "pos_mlp_brpb", "pos_mlp_rpb"
     cfg.MODEL.ZEG_FC.SELF_ATTN_TYPE = "standard"  # Options: "standard", "pos_mlp_brpb", "pos_mlp_rpb"
     cfg.MODEL.ZEG_FC.MASK_POS_MLP_TYPE = "none"  # Options: "none", "brpb", "rpb"
+    cfg.MODEL.ZEG_FC.PROBABILITY_SWAP_THING = 0.0
+    cfg.MODEL.ZEG_FC.PROBABILITY_SWAP_STUFF = 0.0
+    cfg.MODEL.ZEG_FC.SEPARATE_THING_STUFF_MASK_EMBED = False
+    cfg.MODEL.ZEG_FC.THING_STUFF_ADAPTER_TYPE = "none"  # Options: "linear", "bias", "none"
