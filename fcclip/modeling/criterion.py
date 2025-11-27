@@ -51,6 +51,7 @@ class SetCriterion(nn.Module):
         self.num_points = num_points
         self.oversample_ratio = oversample_ratio
         self.importance_sample_ratio = importance_sample_ratio
+        self.pairwise_num_samples = 8
 
     def loss_labels(self, outputs, targets, indices, num_masks):
         """Classification loss (NLL)
@@ -142,6 +143,52 @@ class SetCriterion(nn.Module):
 
         return losses
 
+    def loss_pairwise(self, outputs, targets, indices, num_masks):
+        """Pairwise consistency loss on mask feature embeddings."""
+
+        mask_features = outputs.get("mask_features")
+        if mask_features is None:
+            return {"loss_pairwise": torch.tensor(0.0, device=next(iter(outputs.values())).device)}
+
+        B, C, H, W = mask_features.shape
+        total_loss = mask_features.sum() * 0.0
+        total_elements = 0
+
+        for batch_idx in range(B):
+            feature_map = mask_features[batch_idx]  # (C, H, W)
+            spatial_embeddings = feature_map.flatten(1).transpose(0, 1)  # (H*W, C)
+
+            gt_masks = targets[batch_idx]["masks"].to(mask_features)
+            mask_counts, block_area, _, _ = compute_mask_block_counts(gt_masks, (H, W))
+            mask_counts = mask_counts.to(device=mask_features.device, dtype=mask_features.dtype)
+
+            for mask_idx in range(mask_counts.shape[0]):
+                counts = mask_counts[mask_idx]
+                pos_weights = counts
+                if pos_weights.sum() == 0:
+                    continue
+
+                sample_indices = torch.multinomial(
+                    pos_weights, self.pairwise_num_samples, replacement=True
+                )
+
+                sampled_embeddings = spatial_embeddings[sample_indices]  # (K, C)
+
+                logits = torch.matmul(sampled_embeddings, spatial_embeddings.transpose(0, 1))
+                logits = logits.view(self.pairwise_num_samples, H, W)
+
+                target_mask = (counts / block_area).view(1, H, W)
+                target_mask = target_mask.expand(self.pairwise_num_samples, -1, -1)
+                pairwise_loss = F.binary_cross_entropy_with_logits(logits, target_mask, reduction="sum")
+
+                total_loss = total_loss + pairwise_loss
+                total_elements += target_mask.numel()
+
+        if total_elements == 0:
+            return {"loss_pairwise": total_loss}
+
+        return {"loss_pairwise": total_loss / total_elements}
+
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -158,7 +205,8 @@ class SetCriterion(nn.Module):
         loss_map = {
             'labels': self.loss_labels,
             'masks': self.loss_masks,
-            'boxes': self.loss_boxes
+            'boxes': self.loss_boxes,
+            'pairwise': self.loss_pairwise
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_masks)
@@ -194,6 +242,8 @@ class SetCriterion(nn.Module):
             for i, aux_outputs in enumerate(outputs["aux_outputs"]):
                 indices = self.matcher(aux_outputs, targets)
                 for loss in self.losses:
+                    if loss == 'pairwise':
+                        continue
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_masks)
                     l_dict = {k + f"_{i}": v for k, v in l_dict.items()}
                     losses.update(l_dict)
@@ -211,6 +261,7 @@ class SetCriterion(nn.Module):
             "num_points: {}".format(self.num_points),
             "oversample_ratio: {}".format(self.oversample_ratio),
             "importance_sample_ratio: {}".format(self.importance_sample_ratio),
+            "pairwise_num_samples: {}".format(self.pairwise_num_samples),
         ]
         _repr_indent = 4
         lines = [head] + [" " * _repr_indent + line for line in body]

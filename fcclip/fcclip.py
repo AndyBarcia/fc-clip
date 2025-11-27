@@ -77,8 +77,8 @@ class FCCLIP(nn.Module):
         geometric_ensemble_beta: float,
         ensemble_on_valid_mask: bool,
         # Zeg-FC
-        probability_swap_thing: float = 0.5,
-        probability_swap_stuff: float = 0.5,
+        probability_swap_thing: float = 0.0,
+        probability_swap_stuff: float = 0.0,
     ):
         """
         Args:
@@ -268,11 +268,12 @@ class FCCLIP(nn.Module):
         )
 
         weight_dict = {
-            "loss_ce": class_weight, 
-            "loss_mask": mask_weight, 
+            "loss_ce": class_weight,
+            "loss_mask": mask_weight,
             "loss_dice": dice_weight,
             "loss_bbox": bbox_weight,
-            "loss_giou": giou_weight
+            "loss_giou": giou_weight,
+            "loss_pairwise": mask_weight,
         }
 
         if deep_supervision:
@@ -282,7 +283,7 @@ class FCCLIP(nn.Module):
                 aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
             weight_dict.update(aux_weight_dict)
 
-        losses = ["labels", "masks", "boxes"]
+        losses = ["labels", "masks", "boxes", "pairwise"]
 
         criterion = SetCriterion(
             sem_seg_head.num_classes,

@@ -736,6 +736,7 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         out = {
             'pred_logits': predictions_class[-1],
             'pred_masks': predictions_mask[-1],
+            'mask_features': mask_features,
             'aux_outputs': self._set_aux_loss(
                 predictions_class if self.mask_classification else None, predictions_mask
             )
