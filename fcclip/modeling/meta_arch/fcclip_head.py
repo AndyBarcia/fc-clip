@@ -203,11 +203,11 @@ class FCCLIPHead(nn.Module):
         # FC-CLIP decoder.
         if self.transformer_in_feature == "multi_scale_pixel_decoder":
             predictions = self.predictor(
-                multi_scale_features, 
-                mask_features, 
+                multi_scale_features,
+                mask_features,
                 mask,
-                text_classifier=text_classifier, 
-                thing_mask=features['thing_mask'],
+                text_classifier=text_classifier,
+                thing_mask=features.get('branch_thing_masks', features['thing_mask']),
                 num_templates=features["num_templates"]
             )
         else:
