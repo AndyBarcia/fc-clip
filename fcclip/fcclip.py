@@ -284,6 +284,11 @@ class FCCLIP(nn.Module):
                 aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
             weight_dict.update(aux_weight_dict)
 
+        # Duplicate weights for thing/stuff dual decoding
+        weight_dict_base = weight_dict.copy()
+        weight_dict.update({f"{k}_thing": v for k, v in weight_dict_base.items()})
+        weight_dict.update({f"{k}_stuff": v for k, v in weight_dict_base.items()})
+
         losses = ["labels", "masks", "boxes", "tv"]
 
         criterion = SetCriterion(
@@ -367,20 +372,37 @@ class FCCLIP(nn.Module):
         features['text_classifier'] = text_classifier
         features['num_templates'] = num_templates
 
-        # In training, randomly swap thing and stuff classes
+        # In training, run two decoders: one for thing mode, one for stuff mode
         if self.training:
             # mask classification target
             gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
-            targets, thing_mask = self.prepare_targets(gt_instances, images)
-            features['thing_mask'] = thing_mask
-        else:
-            features['thing_mask'] = self.test_thing_mask
 
-        outputs = self.sem_seg_head(features)
+            thing_only_mask = torch.ones_like(self.train_thing_mask, dtype=torch.bool)
+            stuff_only_mask = torch.zeros_like(self.train_thing_mask, dtype=torch.bool)
 
-        if self.training:
-            # bipartite matching-based loss
-            losses = self.criterion(outputs, targets)
+            thing_targets, thing_mask = self.prepare_targets(
+                gt_instances, images, target_thing_mask=thing_only_mask
+            )
+            stuff_targets, stuff_mask = self.prepare_targets(
+                gt_instances, images, target_thing_mask=stuff_only_mask
+            )
+
+            thing_features = dict(features)
+            stuff_features = dict(features)
+            thing_features['thing_mask'] = thing_mask.to(self.device)
+            stuff_features['thing_mask'] = stuff_mask.to(self.device)
+
+            thing_outputs = self.sem_seg_head(thing_features)
+            stuff_outputs = self.sem_seg_head(stuff_features)
+
+            thing_losses = {
+                f"{name}_thing": loss for name, loss in self.criterion(thing_outputs, thing_targets).items()
+            }
+            stuff_losses = {
+                f"{name}_stuff": loss for name, loss in self.criterion(stuff_outputs, stuff_targets).items()
+            }
+
+            losses = {**thing_losses, **stuff_losses}
 
             for k in list(losses.keys()):
                 if k in self.criterion.weight_dict:
@@ -390,9 +412,13 @@ class FCCLIP(nn.Module):
                     losses.pop(k)
             return losses
         else:
-            mask_cls_results = outputs["pred_logits"]
-            mask_pred_results = outputs["pred_masks"]
-            mask_box_results = outputs.get("pred_boxes")
+            features['thing_mask'] = self.test_thing_mask.to(self.device)
+
+        outputs = self.sem_seg_head(features)
+
+        mask_cls_results = outputs["pred_logits"]
+        mask_pred_results = outputs["pred_masks"]
+        mask_box_results = outputs.get("pred_boxes")
 
             # We ensemble the pred logits of in-vocab and out-vocab
             clip_feature = features["clip_vis_dense"]
@@ -496,19 +522,13 @@ class FCCLIP(nn.Module):
 
             return processed_results
 
-    def prepare_targets(self, targets, images):
-        # Decide to randomly swap thing and stuff classes
-        if self.probability_swap_thing != 0.0 and self.probability_swap_stuff != 0.0:
-            swap_probability = torch.where(
-                self.train_thing_mask,
-                torch.full_like(self.train_thing_mask, self.probability_swap_thing, dtype=torch.float),
-                torch.full_like(self.train_thing_mask, self.probability_swap_stuff, dtype=torch.float)
-            )
-            flip_mask = torch.bernoulli(swap_probability).bool()
-            new_thing_mask = torch.logical_xor(self.train_thing_mask, flip_mask)
-        else:
-            flip_mask = torch.zeros_like(self.train_thing_mask).bool()
-            new_thing_mask = self.train_thing_mask
+    def prepare_targets(self, targets, images, target_thing_mask=None):
+        if target_thing_mask is None:
+            target_thing_mask = self.train_thing_mask
+
+        target_thing_mask = target_thing_mask.to(dtype=torch.bool, device=self.train_thing_mask.device)
+        flip_mask = torch.logical_xor(self.train_thing_mask, target_thing_mask)
+        new_thing_mask = target_thing_mask
         
         h_pad, w_pad = images.tensor.shape[-2:]
         new_targets = []
