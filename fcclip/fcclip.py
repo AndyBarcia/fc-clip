@@ -367,27 +367,45 @@ class FCCLIP(nn.Module):
         features['text_classifier'] = text_classifier
         features['num_templates'] = num_templates
 
-        # In training, randomly swap thing and stuff classes
+        # In training, we jointly learn thing/stuff decoders with disjoint query sets
         if self.training:
-            # mask classification target
             gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
-            targets, thing_mask = self.prepare_targets(gt_instances, images)
-            features['thing_mask'] = thing_mask
+            # Build dual supervision: treat every class as thing for the thing branch,
+            # and every class as stuff for the stuff branch.
+            thing_mask_actual = self.train_thing_mask.to(self.device)
+            all_thing_mask = torch.ones_like(thing_mask_actual)
+            all_stuff_mask = torch.zeros_like(thing_mask_actual)
+
+            targets_by_type = {
+                "thing": self.prepare_targets(gt_instances, images, all_thing_mask),
+                "stuff": self.prepare_targets(gt_instances, images, all_stuff_mask),
+            }
+
+            # Use the original thing/stuff distinction for relationship descriptors, but
+            # provide branch-specific masks to the decoder for attention masking.
+            features['thing_mask'] = thing_mask_actual
+            features['branch_thing_masks'] = {
+                "thing": all_thing_mask,
+                "stuff": all_stuff_mask,
+            }
         else:
-            features['thing_mask'] = self.test_thing_mask
+            features['thing_mask'] = self.test_thing_mask.to(self.device)
 
         outputs = self.sem_seg_head(features)
 
         if self.training:
-            # bipartite matching-based loss
-            losses = self.criterion(outputs, targets)
+            # Compute independent losses for thing/stuff branches
+            losses = {}
+            for branch in ("thing", "stuff"):
+                branch_outputs = outputs[branch]
+                branch_targets = targets_by_type[branch]
+                branch_losses = self.criterion(branch_outputs, branch_targets)
 
-            for k in list(losses.keys()):
-                if k in self.criterion.weight_dict:
-                    losses[k] *= self.criterion.weight_dict[k]
-                else:
-                    # remove this loss if not specified in `weight_dict`
-                    losses.pop(k)
+                for loss_name, loss_value in branch_losses.items():
+                    if loss_name in self.criterion.weight_dict:
+                        losses[f"{loss_name}_{branch}"] = (
+                            loss_value * self.criterion.weight_dict[loss_name]
+                        )
             return losses
         else:
             mask_cls_results = outputs["pred_logits"]
@@ -496,20 +514,19 @@ class FCCLIP(nn.Module):
 
             return processed_results
 
-    def prepare_targets(self, targets, images):
-        # Decide to randomly swap thing and stuff classes
-        if self.probability_swap_thing != 0.0 and self.probability_swap_stuff != 0.0:
-            swap_probability = torch.where(
-                self.train_thing_mask,
-                torch.full_like(self.train_thing_mask, self.probability_swap_thing, dtype=torch.float),
-                torch.full_like(self.train_thing_mask, self.probability_swap_stuff, dtype=torch.float)
-            )
-            flip_mask = torch.bernoulli(swap_probability).bool()
-            new_thing_mask = torch.logical_xor(self.train_thing_mask, flip_mask)
-        else:
-            flip_mask = torch.zeros_like(self.train_thing_mask).bool()
-            new_thing_mask = self.train_thing_mask
-        
+    def prepare_targets(self, targets, images, desired_thing_mask):
+        """
+        Convert targets so that every class behaves according to the provided
+        ``desired_thing_mask``.
+
+        Classes marked ``True`` are treated as thing (split connected
+        components into instances), and classes marked ``False`` are treated as
+        stuff (merge instances into a single region).
+        """
+
+        original_thing_mask = self.train_thing_mask.to(self.device)
+        desired_thing_mask = desired_thing_mask.to(self.device)
+
         h_pad, w_pad = images.tensor.shape[-2:]
         new_targets = []
 
@@ -528,16 +545,16 @@ class FCCLIP(nn.Module):
                     cls_inds = torch.nonzero(gt_classes == cls, as_tuple=True)[0]
                     cls_masks = gt_masks[cls_inds]  # [K, H, W]
 
-                    was_flipped = bool(flip_mask[cls].item())
-                    is_thing_now = bool(new_thing_mask[cls].item())
+                    originally_thing = bool(original_thing_mask[cls].item())
+                    target_is_thing = bool(desired_thing_mask[cls].item())
 
                     # Case 1: thing -> stuff (merge instances)
-                    if not is_thing_now and was_flipped:
+                    if not target_is_thing and originally_thing:
                         merged = cls_masks.any(dim=0)  # [H, W] union
                         new_masks_list.append(merged.to(gt_masks.dtype))
                         new_labels_list.append(cls)
                     # Case 2: stuff -> thing (split via connected components)
-                    elif is_thing_now and was_flipped:
+                    elif target_is_thing and not originally_thing:
                         merged = cls_masks.any(dim=0)  # [H, W] union of stuff region
 
                         # connected components on CPU with OpenCV
@@ -593,7 +610,7 @@ class FCCLIP(nn.Module):
 
             new_targets.append(attributes)
 
-        return new_targets, new_thing_mask
+        return new_targets
 
     def semantic_inference(self, mask_cls, mask_pred):
         mask_cls = F.softmax(mask_cls, dim=-1)[..., :-1]

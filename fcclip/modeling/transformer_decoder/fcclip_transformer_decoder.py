@@ -631,6 +631,85 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         self.class_embed = MLP(hidden_dim, hidden_dim, clip_embedding_dim, 3)
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
+    def _build_classification_map(self, text_classifier, thing_mask, num_templates):
+        """
+        Prepare per-branch text classifiers and template counts for thing/stuff queries.
+
+        If ``thing_mask`` is a dict, each branch receives the full classifier with
+        attention logits that block the opposite type. Otherwise, the classifier
+        is split according to the provided mask (used for inference).
+        """
+
+        device = text_classifier.device if isinstance(text_classifier, torch.Tensor) else text_classifier[0].device
+        num_templates_tensor = torch.as_tensor(num_templates, device=device)
+
+        def _template_mask(mask):
+            mask = mask.to(device).bool()
+            expanded = torch.repeat_interleave(mask, num_templates_tensor, dim=-1)
+            expanded = torch.cat(
+                [expanded, expanded.new_ones((*expanded.shape[:-1], 1), dtype=torch.bool)],
+                dim=-1,
+            )
+            return expanded
+
+        # Training path: branch-specific masks
+        if isinstance(thing_mask, dict):
+            classification_map = {}
+            total_queries = self.num_queries * 2
+            for branch, branch_mask in thing_mask.items():
+                template_level_mask = _template_mask(branch_mask)
+                if branch == "stuff":
+                    template_level_mask = ~template_level_mask
+                # Always allow the void token
+                template_level_mask[..., -1] = True
+
+                # text_attn_logits is broadcastable to [B, Q, num_templates_total]
+                attn_logits = torch.zeros(
+                    1, total_queries, template_level_mask.shape[-1], device=device
+                )
+                attn_logits[:, :, ~template_level_mask] = float("-inf")
+
+                classification_map[branch] = {
+                    "text_classifier": text_classifier,
+                    "num_templates": num_templates,
+                    "text_attn_logits": attn_logits,
+                }
+            return classification_map
+
+        # Inference path: preserve original split behavior
+        thing_mask = thing_mask.to(device).bool()
+        template_level_mask = _template_mask(thing_mask)
+        index_mask = template_level_mask[0] if template_level_mask.dim() > 1 else template_level_mask
+        void_index = text_classifier.shape[-2] - 1
+
+        thing_indices = torch.nonzero(index_mask, as_tuple=False).squeeze(-1)
+        thing_indices = torch.cat(
+            [thing_indices, torch.tensor([void_index], device=thing_indices.device, dtype=thing_indices.dtype)]
+        )
+        stuff_indices = torch.nonzero(~index_mask, as_tuple=False).squeeze(-1)
+
+        thing_num_templates = [
+            num_templates[i]
+            for i, is_thing in enumerate(thing_mask.tolist())
+            if is_thing
+        ]
+        stuff_num_templates = [
+            num_templates[i]
+            for i, is_thing in enumerate(thing_mask.tolist())
+            if not is_thing
+        ]
+
+        return {
+            "thing": {
+                "text_classifier": text_classifier[..., thing_indices, :],
+                "num_templates": thing_num_templates,
+            },
+            "stuff": {
+                "text_classifier": text_classifier[..., stuff_indices, :],
+                "num_templates": stuff_num_templates,
+            },
+        }
+
     @classmethod
     def from_config(cls, cfg, in_channels, mask_classification):
         ret = {}
@@ -658,7 +737,7 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         ret["clip_embedding_dim"] = cfg.MODEL.FC_CLIP.EMBED_DIM
         return ret
 
-    def forward(self, x, mask_features, mask = None, text_classifier=None, num_templates=None):
+    def forward(self, x, mask_features, mask = None, text_classifier=None, num_templates=None, thing_mask=None):
         # x is a list of multi-scale feature
         assert len(x) == self.num_feature_levels
         src = []
@@ -679,40 +758,71 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
 
         _, bs, _ = src[0].shape
 
-        # QxNxC
-        query_embed = self.query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
-        output = self.query_feat.weight.unsqueeze(1).repeat(1, bs, 1)
+        if self.training:
+            # Duplicate queries to form disjoint thing/stuff groups
+            assert thing_mask is not None, "thing_mask is required during training"
+            query_embed_weight = torch.cat([self.query_embed.weight, self.query_embed.weight], dim=0)
+            query_feat_weight = torch.cat([self.query_feat.weight, self.query_feat.weight], dim=0)
+            query_slices = {
+                "thing": slice(0, self.num_queries),
+                "stuff": slice(self.num_queries, self.num_queries * 2),
+            }
+            classification_map = self._build_classification_map(text_classifier, thing_mask, num_templates)
+            self_attention_mask = torch.zeros(
+                (self.num_queries * 2, self.num_queries * 2), device=query_embed_weight.device, dtype=torch.bool
+            )
+            self_attention_mask[query_slices["thing"], query_slices["stuff"]] = True
+            self_attention_mask[query_slices["stuff"], query_slices["thing"]] = True
+        else:
+            query_embed_weight = self.query_embed.weight
+            query_feat_weight = self.query_feat.weight
+            query_slices = None
+            classification_map = None
+            self_attention_mask = None
 
-        predictions_class = []
-        predictions_mask = []
+        total_queries = query_embed_weight.shape[0]
+        query_embed = query_embed_weight.unsqueeze(1).repeat(1, bs, 1)
+        output = query_feat_weight.unsqueeze(1).repeat(1, bs, 1)
+
+        predictions_class = {"thing": [], "stuff": []} if self.training else []
+        predictions_mask = {"thing": [], "stuff": []} if self.training else []
 
         # prediction heads on learnable query features
         outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(
-            output, 
-            mask_features, 
+            output,
+            mask_features,
             attn_mask_target_size=size_list[0],
-            text_classifier=text_classifier, 
-            num_templates=num_templates
+            text_classifier=text_classifier,
+            num_templates=num_templates,
+            classification_map=classification_map,
+            query_slices=query_slices,
         )
-        predictions_class.append(outputs_class)
-        predictions_mask.append(outputs_mask)
+        if self.training:
+            predictions_class["thing"].append(outputs_class["thing"])
+            predictions_mask["thing"].append(outputs_mask[:, query_slices["thing"]])
+            predictions_class["stuff"].append(outputs_class["stuff"])
+            predictions_mask["stuff"].append(outputs_mask[:, query_slices["stuff"]])
+        else:
+            predictions_class.append(outputs_class)
+            predictions_mask.append(outputs_mask)
 
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
             attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
             # attention: cross-attention first
             output, _ = self.transformer_cross_attention_layers[i](
-                output.transpose(0,1), 
+                output.transpose(0,1),
                 src[level_index].transpose(0,1).view(bs, size_list[level_index][0], size_list[level_index][1], -1), # (B,H,W,C)
-                attn_mask=attn_mask.view(bs, self.num_heads, self.num_queries, size_list[level_index][0], size_list[level_index][1]), # (B, num_heads, Q, H,W)
-                memory_pos_emb=pos[level_index].transpose(0,1).view(bs, size_list[level_index][0], size_list[level_index][1], -1), # (B,H,W,C), 
+                attn_mask=attn_mask.view(bs, self.num_heads, total_queries, size_list[level_index][0], size_list[level_index][1]), # (B, num_heads, Q, H,W)
+                memory_pos_emb=pos[level_index].transpose(0,1).view(bs, size_list[level_index][0], size_list[level_index][1], -1), # (B,H,W,C),
                 query_pos_emb=query_embed.transpose(0,1), # (B,Q,C)
             )
             output = output.transpose(0,1) # (Q,B,C)
 
             output, _ = self.transformer_self_attention_layers[i](
                 output.transpose(0,1),
-                pos_emb=query_embed.transpose(0,1), # # (B,Q,C) 
+                tgt_mask=self_attention_mask,
+                pos_emb=query_embed.transpose(0,1), # # (B,Q,C)
             )
             output = output.transpose(0,1) # (Q,B,C)
             
@@ -722,28 +832,63 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
             )
 
             outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(
-                output, 
-                mask_features, 
+                output,
+                mask_features,
                 attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels],
-                text_classifier=text_classifier, 
-                num_templates=num_templates
+                text_classifier=text_classifier,
+                num_templates=num_templates,
+                classification_map=classification_map,
+                query_slices=query_slices,
             )
-            predictions_class.append(outputs_class)
-            predictions_mask.append(outputs_mask)
+            if self.training:
+                predictions_class["thing"].append(outputs_class["thing"])
+                predictions_mask["thing"].append(outputs_mask[:, query_slices["thing"]])
+                predictions_class["stuff"].append(outputs_class["stuff"])
+                predictions_mask["stuff"].append(outputs_mask[:, query_slices["stuff"]])
+            else:
+                predictions_class.append(outputs_class)
+                predictions_mask.append(outputs_mask)
 
-        assert len(predictions_class) == self.num_layers + 1
+        assert (len(predictions_class["thing"]) if self.training else len(predictions_class)) == self.num_layers + 1
 
-        out = {
-            'pred_logits': predictions_class[-1],
-            'pred_masks': predictions_mask[-1],
-            'aux_outputs': self._set_aux_loss(
-                predictions_class if self.mask_classification else None, predictions_mask
-            )
-        }
+        if self.training:
+            out = {
+                'thing': {
+                    'pred_logits': predictions_class["thing"][-1],
+                    'pred_masks': predictions_mask["thing"][-1],
+                    'aux_outputs': self._set_aux_loss(
+                        predictions_class["thing"] if self.mask_classification else None, predictions_mask["thing"]
+                    )
+                },
+                'stuff': {
+                    'pred_logits': predictions_class["stuff"][-1],
+                    'pred_masks': predictions_mask["stuff"][-1],
+                    'aux_outputs': self._set_aux_loss(
+                        predictions_class["stuff"] if self.mask_classification else None, predictions_mask["stuff"]
+                    )
+                },
+            }
+        else:
+            out = {
+                'pred_logits': predictions_class[-1],
+                'pred_masks': predictions_mask[-1],
+                'aux_outputs': self._set_aux_loss(
+                    predictions_class if self.mask_classification else None, predictions_mask
+                )
+            }
         return out
 
     @torch.compiler.disable(recursive=False)
-    def forward_prediction_heads(self, output, mask_features, attn_mask_target_size, text_classifier, num_templates):
+    def forward_prediction_heads(
+        self,
+        output,
+        mask_features,
+        attn_mask_target_size,
+        text_classifier,
+        num_templates,
+        classification_map=None,
+        query_slices=None,
+    ):
         decoder_output = self.decoder_norm(output)
         decoder_output = decoder_output.transpose(0, 1)
         mask_embed = self.mask_embed(decoder_output)
@@ -754,9 +899,22 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         maskpool_embeddings = self._mask_pooling_proj(maskpool_embeddings)
         class_embed = self.class_embed(maskpool_embeddings + decoder_output)
 
-        # TODO here convert text_classifier to RD descriptors.
-
-        outputs_class = get_classification_logits(class_embed, text_classifier, self.logit_scale, num_templates)
+        # Support disjoint thing/stuff branches during training
+        if classification_map is None:
+            outputs_class = get_classification_logits(class_embed, text_classifier, self.logit_scale, num_templates)
+        else:
+            outputs_class = {}
+            for branch, branch_cfg in classification_map.items():
+                text_attn_logits = branch_cfg.get("text_attn_logits")
+                if text_attn_logits is not None:
+                    text_attn_logits = text_attn_logits[:, query_slices[branch], :]
+                outputs_class[branch] = get_classification_logits(
+                    class_embed[:, query_slices[branch]],
+                    branch_cfg["text_classifier"],
+                    self.logit_scale,
+                    branch_cfg["num_templates"],
+                    text_attn_logits,
+                )
 
         # NOTE: prediction is of higher-resolution
         # [B, Q, H, W] -> [B, Q, H*W] -> [B, h, Q, H*W] -> [B*h, Q, HW]
