@@ -673,8 +673,8 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             output, _ = self.transformer_cross_attention_layers[i](
                 output.transpose(0,1), # (B,Q,C)
                 src[level_index].transpose(0,1).view(bs, size_list[level_index][0], size_list[level_index][1], -1), # (B,H,W,C)
-                attn_mask=attn_mask.view(bs, self.num_heads, self.num_queries, size_list[level_index][0], size_list[level_index][1]), # (B, num_heads, Q, H,W)
-                memory_pos_emb=pos[level_index].transpose(0,1).view(bs, size_list[level_index][0], size_list[level_index][1], -1), # (B,H,W,C), 
+                attn_mask=attn_mask.view(bs, self.num_heads, attn_mask.shape[1], size_list[level_index][0], size_list[level_index][1]), # (B, num_heads, Q, H,W)
+                memory_pos_emb=pos[level_index].transpose(0,1).view(bs, size_list[level_index][0], size_list[level_index][1], -1), # (B,H,W,C),
                 query_pos_emb=query_embed.transpose(0,1), # (B,Q,C)
                 pos=query_bbox_unsigmoid.sigmoid().transpose(0,1) if query_bbox_unsigmoid is not None else None, # (B,Q,[x,y,w,j])
             )
