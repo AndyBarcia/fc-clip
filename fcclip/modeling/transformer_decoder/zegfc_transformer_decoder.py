@@ -487,6 +487,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         # Training path: branch-specific masks
         if isinstance(thing_mask, dict):
             classification_map = {}
+            total_queries = self.num_queries * 2
             for branch, branch_mask in thing_mask.items():
                 template_level_mask = _template_mask(branch_mask)
                 if branch == "stuff":
@@ -496,7 +497,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
 
                 # text_attn_logits is broadcastable to [B, Q, num_templates_total]
                 attn_logits = torch.zeros(
-                    1, self.num_queries, template_level_mask.shape[-1], device=device
+                    1, total_queries, template_level_mask.shape[-1], device=device
                 )
                 attn_logits[:, :, ~template_level_mask] = float("-inf")
 
