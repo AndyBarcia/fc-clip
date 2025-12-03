@@ -18,6 +18,8 @@ from detectron2.utils.comm import get_world_size
 from ..utils.misc import (
     append_fixed_background_logit,
     is_dist_avail_and_initialized,
+    mask_logits_with_fixed_background,
+    mask_probs_with_fixed_background,
     nested_tensor_from_tensor_list,
 )
 from .transformer_decoder.box_regression import generalized_box_iou, box_cxcywh_to_xyxy
@@ -99,23 +101,25 @@ class SetCriterion(nn.Module):
             return losses
 
         logits = src_masks.reshape(src_masks.shape[0], -1)
+        logits_with_background = mask_logits_with_fixed_background(logits)
+        log_probs = F.log_softmax(logits_with_background, dim=-1)
+
         pos_counts, block_area, H_t, W_t = compute_mask_block_counts(
             target_masks, src_masks.shape[-2:]
         )
         pos_counts = pos_counts.to(device=logits.device, dtype=logits.dtype)
+        neg_counts = block_area - pos_counts
+        log_probs_fg = log_probs[..., 0]
+        log_probs_bg = log_probs[..., 1]
 
-        abs_logits = logits.abs()
-        max_logits = torch.clamp(logits, min=0)
-        logexp = torch.log1p(torch.exp(-abs_logits))
-        loss_block = block_area * max_logits - logits * pos_counts + block_area * logexp
+        loss_block = -(pos_counts * log_probs_fg + neg_counts * log_probs_bg)
         loss_mask = loss_block.sum(dim=1) / (H_t * W_t)
         loss_mask = loss_mask.sum() / num_masks
 
-        probs = torch.sigmoid(logits)
+        probs = mask_probs_with_fixed_background(logits)
         intersection = (probs * pos_counts).sum(dim=1)
         pred_sum = probs.sum(dim=1) * block_area
         target_sum = pos_counts.sum(dim=1)
-        #loss_dice = 1 - (2 * intersection + 1) / (pred_sum + target_sum + 1)
         loss_dice = 1 - (2 * intersection) / (pred_sum + target_sum)
         loss_dice = loss_dice.sum() / num_masks
 

@@ -12,30 +12,34 @@ from scipy.optimize import linear_sum_assignment
 from torch import nn
 from torch.cuda.amp import autocast
 
-from ..utils.misc import softmax_with_fixed_background
+from ..utils.misc import (
+    mask_logits_with_fixed_background,
+    mask_probs_with_fixed_background,
+    softmax_with_fixed_background,
+)
 from .mask_utils import compute_mask_block_counts
 
 
-def batch_sigmoid_ce_loss(
+def batch_ce_loss(
     logits: torch.Tensor,
     target_counts: torch.Tensor,
     block_area: int,
     original_hw: int,
 ) -> torch.Tensor:
-    abs_logits = logits.abs()
-    max_logits = torch.clamp(logits, min=0)
-    logexp = torch.log1p(torch.exp(-abs_logits))
-    sum_max = block_area * max_logits.sum(dim=1)
-    sum_logexp = block_area * logexp.sum(dim=1)
-    dot = torch.einsum("qc,mc->qm", logits, target_counts)
-    loss = sum_max[:, None] - dot + sum_logexp[:, None]
+    logits_with_background = mask_logits_with_fixed_background(logits)
+    log_probs = torch.log_softmax(logits_with_background, dim=-1)
+    log_fg = log_probs[..., 0]
+    log_bg = log_probs[..., 1]
+
+    neg_counts = block_area - target_counts
+    loss = -(torch.einsum("qc,mc->qm", log_fg, target_counts) + torch.einsum("qc,mc->qm", log_bg, neg_counts))
     return loss / original_hw
 
 
 def batch_dice_loss(
     logits: torch.Tensor, target_counts: torch.Tensor, block_area: int
 ) -> torch.Tensor:
-    probs = torch.sigmoid(logits)
+    probs = mask_probs_with_fixed_background(logits)
     intersection = torch.einsum("qc,mc->qm", probs, target_counts)
     pred_sum = block_area * probs.sum(dim=1)
     target_sum = target_counts.sum(dim=1)
@@ -98,7 +102,7 @@ class HungarianMatcher(nn.Module):
                     out_mask = out_mask.float()
                     target_counts = target_counts.float()
                     # Compute the focal loss between masks
-                    cost_mask = batch_sigmoid_ce_loss(
+                    cost_mask = batch_ce_loss(
                         out_mask, target_counts, block_area, H_t * W_t
                     )
                     # Compute the dice loss between masks

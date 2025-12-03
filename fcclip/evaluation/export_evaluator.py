@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from torch.cuda.amp import autocast
 from scipy.optimize import linear_sum_assignment
 
-from ..modeling.matcher import batch_dice_loss, batch_sigmoid_ce_loss
+from ..modeling.matcher import batch_ce_loss, batch_dice_loss
 from ..modeling.mask_utils import compute_mask_block_counts
 
 logger = logging.getLogger(__name__)
@@ -177,7 +177,7 @@ class ExportEvaluator(DatasetEvaluator):
         with autocast(enabled=False):
             out_mask_float = out_mask_flat.float()
             target_counts_float = target_counts.float()
-            cost_mask = batch_sigmoid_ce_loss(
+            cost_mask = batch_ce_loss(
                 out_mask_float, target_counts_float, block_area, H_t * W_t
             )   # [Q, M]
             cost_dice = batch_dice_loss(

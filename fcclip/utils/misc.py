@@ -126,3 +126,22 @@ def softmax_with_fixed_background(logits: torch.Tensor) -> torch.Tensor:
     """Apply softmax after appending a fixed zero background logit."""
 
     return F.softmax(append_fixed_background_logit(logits), dim=-1)
+
+
+def mask_logits_with_fixed_background(logits: torch.Tensor) -> torch.Tensor:
+    """Reshape mask logits to include a fixed zero background logit.
+
+    The input ``logits`` is expected to contain a single logit per spatial
+    location. A trailing dimension is added to represent the background class
+    with a fixed logit of zero, returning a tensor that can be consumed by
+    ``softmax``/``log_softmax``.
+    """
+
+    return append_fixed_background_logit(logits.unsqueeze(-1))
+
+
+def mask_probs_with_fixed_background(logits: torch.Tensor) -> torch.Tensor:
+    """Compute per-pixel mask probabilities with a fixed background logit."""
+
+    probs = F.softmax(mask_logits_with_fixed_background(logits), dim=-1)
+    return probs[..., 0]

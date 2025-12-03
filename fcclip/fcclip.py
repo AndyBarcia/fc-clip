@@ -28,7 +28,7 @@ from .modeling.matcher import HungarianMatcher
 from .modeling.transformer_decoder.box_regression import box_xyxy_to_cxcywh, box_cxcywh_to_xyxy, masks_to_boxes
 
 from .modeling.transformer_decoder.fcclip_transformer_decoder import MaskPooling, get_classification_logits
-from .utils.misc import softmax_with_fixed_background
+from .utils.misc import mask_probs_with_fixed_background, softmax_with_fixed_background
 
 VILD_PROMPT = [
     "a photo of a {}.",
@@ -596,13 +596,13 @@ class FCCLIP(nn.Module):
 
     def semantic_inference(self, mask_cls, mask_pred):
         mask_cls = F.softmax(mask_cls, dim=-1)[..., :-1]
-        mask_pred = mask_pred.sigmoid()
+        mask_pred = mask_probs_with_fixed_background(mask_pred)
         semseg = torch.einsum("qc,qhw->chw", mask_cls, mask_pred)
         return semseg
 
     def panoptic_inference(self, mask_cls, mask_pred):
         scores, labels = F.softmax(mask_cls, dim=-1).max(-1)
-        mask_pred = mask_pred.sigmoid()
+        mask_pred = mask_probs_with_fixed_background(mask_pred)
         num_classes = len(self.test_metadata.stuff_classes)
         keep = labels.ne(num_classes) & (scores > self.object_mask_threshold)
         cur_scores = scores[keep]
@@ -677,6 +677,7 @@ class FCCLIP(nn.Module):
         topk_indices = topk_indices // num_classes
         # mask_pred = mask_pred.unsqueeze(1).repeat(1, self.sem_seg_head.num_classes, 1).flatten(0, 1)
         mask_pred = mask_pred[topk_indices]
+        mask_pred = mask_probs_with_fixed_background(mask_pred)
 
         # if this is panoptic segmentation, we only keep the "thing" classes
         if self.panoptic_on:
@@ -690,7 +691,7 @@ class FCCLIP(nn.Module):
 
         result = Instances(image_size)
         # mask (before sigmoid)
-        result.pred_masks = (mask_pred > 0).float()
+        result.pred_masks = (mask_pred >= 0.5).float()
         
         if mask_box is not None:
             # Select the boxes corresponding to the top-k queries
@@ -709,10 +710,10 @@ class FCCLIP(nn.Module):
             # Fallback if boxes are not provided
             #result.pred_boxes = Boxes(torch.zeros(mask_pred.size(0), 4))
             # Uncomment the following to get boxes from masks (this is slow)
-            result.pred_boxes = BitMasks(mask_pred > 0).get_bounding_boxes()
+            result.pred_boxes = BitMasks(mask_pred >= 0.5).get_bounding_boxes()
 
         # calculate average mask prob
-        mask_scores_per_image = (mask_pred.sigmoid().flatten(1) * result.pred_masks.flatten(1)).sum(1) / (result.pred_masks.flatten(1).sum(1) + 1e-6)
+        mask_scores_per_image = (mask_pred.flatten(1) * result.pred_masks.flatten(1)).sum(1) / (result.pred_masks.flatten(1).sum(1) + 1e-6)
         result.scores = scores_per_image * mask_scores_per_image
         result.pred_classes = labels_per_image
         return result
