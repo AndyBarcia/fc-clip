@@ -125,11 +125,6 @@ class FCCLIPHead(nn.Module):
         # Expand thing mask for templates.
         num_templates = torch.tensor(num_templates, dtype=torch.long)
         thing_mask = torch.repeat_interleave(thing_mask, num_templates, dim=-1) # (T) or (B,T)
-        # Append 0 for the final void class, which we'll consider as stuff.
-        if thing_mask.dim() == 1:
-            thing_mask = torch.cat([thing_mask, torch.tensor([0], dtype=thing_mask.dtype, device=thing_mask.device)], dim=0)  # (T)
-        else:
-            thing_mask = torch.cat([thing_mask, torch.zeros((B,1), dtype=thing_mask.dtype, device=thing_mask.device)], dim=1)  # (B,T)
         stuff_mask = ~thing_mask  # (T) or (B,T)
 
         # Add bias if needed

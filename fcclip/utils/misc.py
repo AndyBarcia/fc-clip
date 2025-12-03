@@ -14,6 +14,7 @@ import torch
 import torch.distributed as dist
 import torchvision
 from torch import Tensor
+from torch.nn import functional as F
 
 
 def _max_by_axis(the_list):
@@ -112,3 +113,16 @@ def is_dist_avail_and_initialized():
     if not dist.is_initialized():
         return False
     return True
+
+
+def append_fixed_background_logit(logits: torch.Tensor) -> torch.Tensor:
+    """Append a zero-valued logit representing the background class."""
+
+    background = logits.new_zeros(*logits.shape[:-1], 1)
+    return torch.cat([logits, background], dim=-1)
+
+
+def softmax_with_fixed_background(logits: torch.Tensor) -> torch.Tensor:
+    """Apply softmax after appending a fixed zero background logit."""
+
+    return F.softmax(append_fixed_background_logit(logits), dim=-1)

@@ -15,7 +15,11 @@ from torch import nn
 
 from detectron2.utils.comm import get_world_size
 
-from ..utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list
+from ..utils.misc import (
+    append_fixed_background_logit,
+    is_dist_avail_and_initialized,
+    nested_tensor_from_tensor_list,
+)
 from .transformer_decoder.box_regression import generalized_box_iou, box_cxcywh_to_xyxy
 from .mask_utils import compute_mask_block_counts
 
@@ -68,7 +72,8 @@ class SetCriterion(nn.Module):
         )
         target_classes[idx] = target_classes_o
 
-        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
+        logits_with_background = append_fixed_background_logit(src_logits)
+        loss_ce = F.cross_entropy(logits_with_background.transpose(1, 2), target_classes, self.empty_weight)
         losses = {"loss_ce": loss_ce}
         return losses
     
