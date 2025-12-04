@@ -123,7 +123,7 @@ class FCCLIPHead(nn.Module):
         B = img.shape[0]
 
         # Expand thing mask for templates.
-        num_templates = torch.tensor(num_templates, dtype=torch.long)
+        num_templates = torch.tensor(num_templates, dtype=torch.long, device=thing_mask.device)  # (T',)
         thing_mask = torch.repeat_interleave(thing_mask, num_templates, dim=-1) # (T) or (B,T)
         # Append 0 for the final void class, which we'll consider as stuff.
         if thing_mask.dim() == 1:
