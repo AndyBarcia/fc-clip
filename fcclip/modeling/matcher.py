@@ -12,7 +12,7 @@ from scipy.optimize import linear_sum_assignment
 from torch import nn
 from torch.cuda.amp import autocast
 
-from .mask_utils import compute_mask_block_counts, softmax_with_fixed_background
+from .mask_utils import compute_mask_block_counts
 
 
 def batch_dice_loss(
@@ -27,21 +27,20 @@ def batch_dice_loss(
 
 
 def batch_multinomial_ce_loss(
-    mask_probs: torch.Tensor,
+    fg_probs: torch.Tensor,
+    bg_probs: torch.Tensor,
     target_counts: torch.Tensor,
     block_area: int,
     original_hw: int,
 ) -> torch.Tensor:
     """Cross-entropy cost for multinomial masks with a fixed background channel."""
 
-    fg_probs = mask_probs[:-1].flatten(1)
-    bg_probs = mask_probs[-1].flatten()
     target_probs = target_counts / block_area
 
     eps = 1e-6
     fg_term = torch.einsum("qc,mc->qm", -torch.log(fg_probs + eps), target_probs)
-    bg_term = torch.einsum("c,mc->m", -torch.log(bg_probs + eps), 1 - target_probs)
-    loss = (fg_term + bg_term[None, :]) * block_area / original_hw
+    bg_term = torch.einsum("qc,mc->qm", -torch.log(bg_probs + eps), 1 - target_probs)
+    loss = (fg_term + bg_term) * block_area / original_hw
     return loss
 
 
@@ -92,16 +91,17 @@ class HungarianMatcher(nn.Module):
                 target_counts, block_area, H_t, W_t = compute_mask_block_counts(
                     tgt_mask, out_mask.shape[-2:]
                 )
-                mask_probs = softmax_with_fixed_background(out_mask, dim=0)
-                fg_probs = mask_probs[:-1].flatten(1)
+                matched_probs = torch.sigmoid(out_mask)
+                fg_probs = matched_probs.flatten(1)
+                bg_probs = (1 - matched_probs).flatten(1)
                 target_counts = target_counts.to(device=out_mask.device, dtype=out_mask.dtype)
 
                 with autocast(enabled=False):
                     fg_probs = fg_probs.float()
-                    mask_probs = mask_probs.float()
+                    bg_probs = bg_probs.float()
                     target_counts = target_counts.float()
                     cost_mask = batch_multinomial_ce_loss(
-                        mask_probs, target_counts, block_area, H_t * W_t
+                        fg_probs, bg_probs, target_counts, block_area, H_t * W_t
                     )
                     cost_dice = batch_dice_loss(fg_probs, target_counts, block_area)
 

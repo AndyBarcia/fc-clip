@@ -28,7 +28,6 @@ from .modeling.matcher import HungarianMatcher
 from .modeling.transformer_decoder.box_regression import box_xyxy_to_cxcywh, box_cxcywh_to_xyxy, masks_to_boxes
 
 from .modeling.transformer_decoder.fcclip_transformer_decoder import MaskPooling, get_classification_logits
-from .modeling.mask_utils import softmax_with_fixed_background
 VILD_PROMPT = [
     "a photo of a {}.",
     "This is a photo of a {}",
@@ -598,9 +597,7 @@ class FCCLIP(nn.Module):
 
     @staticmethod
     def _query_mask_probs(mask_logits: torch.Tensor) -> torch.Tensor:
-        dim = 1 if mask_logits.dim() == 4 else 0
-        probs_with_bg = softmax_with_fixed_background(mask_logits, dim=dim)
-        return probs_with_bg.narrow(dim, 0, mask_logits.shape[dim])
+        return torch.sigmoid(mask_logits)
 
     def semantic_inference(self, mask_cls, mask_pred):
         mask_cls = F.softmax(mask_cls, dim=-1)[..., :-1]

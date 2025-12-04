@@ -17,7 +17,7 @@ from detectron2.utils.comm import get_world_size
 
 from ..utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list
 from .transformer_decoder.box_regression import generalized_box_iou, box_cxcywh_to_xyxy
-from .mask_utils import compute_mask_block_counts, softmax_with_fixed_background
+from .mask_utils import compute_mask_block_counts
 
 
 class SetCriterion(nn.Module):
@@ -92,8 +92,6 @@ class SetCriterion(nn.Module):
             }
             return losses
 
-        mask_probs = softmax_with_fixed_background(src_masks, dim=1)
-
         target_probs, block_area, H_t, W_t = compute_mask_block_counts(
             target_masks, src_masks.shape[-2:]
         )
@@ -101,8 +99,19 @@ class SetCriterion(nn.Module):
 
         src_batch_idx, src_query_idx = src_idx
         num_selected = src_batch_idx.shape[0]
-        fg_probs = mask_probs[src_batch_idx, src_query_idx].reshape(num_selected, -1)
-        bg_probs = mask_probs[src_batch_idx, -1].reshape(num_selected, -1)
+
+        fg_probs_list = []
+        bg_probs_list = []
+        for b, (matched_src, _) in enumerate(indices):
+            if matched_src.numel() == 0:
+                continue
+            matched_logits = src_masks[b, matched_src]
+            matched_fg = torch.sigmoid(matched_logits)
+            fg_probs_list.append(matched_fg)
+            bg_probs_list.append(1 - matched_fg)
+
+        fg_probs = torch.cat(fg_probs_list, dim=0).reshape(num_selected, -1)
+        bg_probs = torch.cat(bg_probs_list, dim=0).reshape(num_selected, -1)
         target_probs = target_probs.reshape(num_selected, -1)
 
         eps = 1e-6
@@ -157,7 +166,7 @@ class SetCriterion(nn.Module):
         if pred_masks.numel() == 0:
             return {"loss_tv": pred_masks.sum() * 0.0}
 
-        probs = softmax_with_fixed_background(pred_masks, dim=1)[:, :-1]
+        probs = torch.sigmoid(pred_masks)
         dx = probs[:, :, 1:, :] - probs[:, :, :-1, :]
         dy = probs[:, :, :, 1:] - probs[:, :, :, :-1]
 
