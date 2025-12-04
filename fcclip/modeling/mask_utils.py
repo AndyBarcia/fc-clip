@@ -55,3 +55,28 @@ def compute_mask_block_counts(
     pos_counts = unfolded.sum(dim=1)
 
     return pos_counts, block_area, H_t, W_t
+
+
+def softmax_with_fixed_background(mask_logits: torch.Tensor, dim: int) -> torch.Tensor:
+    """Apply a softmax over the query dimension with a fixed zero-logit background.
+
+    Args:
+        mask_logits: Tensor containing per-query mask logits.
+        dim: Dimension that corresponds to the query axis.
+
+    Returns:
+        Tensor with one additional channel for the background probability, where the
+        probabilities along ``dim`` sum to 1.
+    """
+
+    if dim < 0:
+        dim = mask_logits.dim() + dim
+
+    if dim < 0 or dim >= mask_logits.dim():
+        raise ValueError(f"Query dimension {dim} is out of bounds for shape {mask_logits.shape}")
+
+    bg_shape = list(mask_logits.shape)
+    bg_shape[dim] = 1
+    bg_logits = mask_logits.new_zeros(bg_shape)
+    logits_with_bg = torch.cat([mask_logits, bg_logits], dim=dim)
+    return F.softmax(logits_with_bg, dim=dim)

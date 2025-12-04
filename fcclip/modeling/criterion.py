@@ -17,7 +17,7 @@ from detectron2.utils.comm import get_world_size
 
 from ..utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list
 from .transformer_decoder.box_regression import generalized_box_iou, box_cxcywh_to_xyxy
-from .mask_utils import compute_mask_block_counts
+from .mask_utils import compute_mask_block_counts, softmax_with_fixed_background
 
 
 class SetCriterion(nn.Module):
@@ -79,39 +79,41 @@ class SetCriterion(nn.Module):
         src_idx = self._get_src_permutation_idx(indices)
         tgt_idx = self._get_tgt_permutation_idx(indices)
         src_masks = outputs["pred_masks"]
-        src_masks = src_masks[src_idx]
         masks = [t["masks"] for t in targets]
         # TODO use valid to mask invalid areas due to padding in loss
         target_masks, valid = nested_tensor_from_tensor_list(masks).decompose()
         target_masks = target_masks.to(src_masks)
         target_masks = target_masks[tgt_idx]
 
-        if src_masks.shape[0] == 0:
+        if src_idx[0].numel() == 0:
             losses = {
                 "loss_mask": outputs["pred_masks"].sum() * 0.0,
                 "loss_dice": outputs["pred_masks"].sum() * 0.0,
             }
             return losses
 
-        logits = src_masks.reshape(src_masks.shape[0], -1)
-        pos_counts, block_area, H_t, W_t = compute_mask_block_counts(
+        mask_probs = softmax_with_fixed_background(src_masks, dim=1)
+
+        target_probs, block_area, H_t, W_t = compute_mask_block_counts(
             target_masks, src_masks.shape[-2:]
         )
-        pos_counts = pos_counts.to(device=logits.device, dtype=logits.dtype)
+        target_probs = (target_probs / block_area).to(device=src_masks.device, dtype=src_masks.dtype)
 
-        abs_logits = logits.abs()
-        max_logits = torch.clamp(logits, min=0)
-        logexp = torch.log1p(torch.exp(-abs_logits))
-        loss_block = block_area * max_logits - logits * pos_counts + block_area * logexp
-        loss_mask = loss_block.sum(dim=1) / (H_t * W_t)
+        src_batch_idx, src_query_idx = src_idx
+        num_selected = src_batch_idx.shape[0]
+        fg_probs = mask_probs[src_batch_idx, src_query_idx].reshape(num_selected, -1)
+        bg_probs = mask_probs[src_batch_idx, -1].reshape(num_selected, -1)
+        target_probs = target_probs.reshape(num_selected, -1)
+
+        eps = 1e-6
+        ce_per_block = -(target_probs * torch.log(fg_probs + eps) + (1 - target_probs) * torch.log(bg_probs + eps))
+        loss_mask = (ce_per_block.sum(dim=1) * block_area) / (H_t * W_t)
         loss_mask = loss_mask.sum() / num_masks
 
-        probs = torch.sigmoid(logits)
-        intersection = (probs * pos_counts).sum(dim=1)
-        pred_sum = probs.sum(dim=1) * block_area
-        target_sum = pos_counts.sum(dim=1)
-        #loss_dice = 1 - (2 * intersection + 1) / (pred_sum + target_sum + 1)
-        loss_dice = 1 - (2 * intersection) / (pred_sum + target_sum)
+        intersection = (fg_probs * (target_probs * block_area)).sum(dim=1)
+        pred_sum = fg_probs.sum(dim=1) * block_area
+        target_sum = (target_probs * block_area).sum(dim=1)
+        loss_dice = 1 - (2 * intersection) / (pred_sum + target_sum + eps)
         loss_dice = loss_dice.sum() / num_masks
 
         losses = {
@@ -155,7 +157,7 @@ class SetCriterion(nn.Module):
         if pred_masks.numel() == 0:
             return {"loss_tv": pred_masks.sum() * 0.0}
 
-        probs = torch.sigmoid(pred_masks)
+        probs = softmax_with_fixed_background(pred_masks, dim=1)[:, :-1]
         dx = probs[:, :, 1:, :] - probs[:, :, :-1, :]
         dy = probs[:, :, :, 1:] - probs[:, :, :, :-1]
 
