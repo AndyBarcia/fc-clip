@@ -94,23 +94,44 @@ class SetCriterion(nn.Module):
             return losses
 
         logits = src_masks.reshape(src_masks.shape[0], -1)
+
+        # Get downsampled version of mask ground truths
         pos_counts, block_area, H_t, W_t = compute_mask_block_counts(
             target_masks, src_masks.shape[-2:]
         )
         pos_counts = pos_counts.to(device=logits.device, dtype=logits.dtype)
 
-        abs_logits = logits.abs()
-        max_logits = torch.clamp(logits, min=0)
-        logexp = torch.log1p(torch.exp(-abs_logits))
-        loss_block = block_area * max_logits - logits * pos_counts + block_area * logexp
-        loss_mask = loss_block.sum(dim=1) / (H_t * W_t)
-        loss_mask = loss_mask.sum() / num_masks
+        # Convert to [0,1] normalized target based on block area.
+        mean_targets = (pos_counts / block_area) # (N, H*W)
+
+        # Mask unmatched queries with -infinity
+        B,Q = outputs["pred_masks"].shape[0], outputs["pred_masks"].shape[1]
+        unmatched_mask = torch.ones(B, Q, dtype=torch.bool, device=outputs["pred_masks"].device)
+        unmatched_mask[src_idx] = False
+        logits_masked = torch.where(
+            unmatched_mask.view(B, Q, 1, 1).expand_as(outputs["pred_masks"]),
+            torch.full_like(outputs["pred_masks"], float('-inf')),
+            outputs["pred_masks"]
+        )
+
+        # Append fixed background logit
+        H,W = src_masks.shape[-2:]
+        logits_masked = torch.cat((logits_masked, torch.zeros(B,1,H,W, dtype=logits_masked.dtype, device=logits_masked.device)), dim=1) # (B,Q+1,H,W)
+        logits_flat = logits_masked.view(B, Q+1, H*W) # (B, Q+1, HW)
+
+        # Foreground GTs: for each GT j, use its assigned (batch_idx[j], pred_idx[j]) logits
+        # The background logit is ignored, as it's 0 and it wouldn't contribute anything.
+        assigned_logits = logits_flat[src_idx]   # (N, HW)
+        expected_fg_logit = (assigned_logits * mean_targets).sum() # scalar
+
+        # Compute cross-entropy
+        logZ = torch.logsumexp(logits_masked, dim=1) # (B,H,W) = log ∑_q exp(z_q)
+        loss_mask = (logZ.sum() - expected_fg_logit) / (num_masks*H*W)
 
         probs = torch.sigmoid(logits)
         intersection = (probs * pos_counts).sum(dim=1)
         pred_sum = probs.sum(dim=1) * block_area
         target_sum = pos_counts.sum(dim=1)
-        #loss_dice = 1 - (2 * intersection + 1) / (pred_sum + target_sum + 1)
         loss_dice = 1 - (2 * intersection) / (pred_sum + target_sum)
         loss_dice = loss_dice.sum() / num_masks
 
