@@ -78,14 +78,14 @@ class HungarianMatcher(nn.Module):
         # Iterate through batch size
         for b in range(bs):
 
-            out_prob = outputs["pred_logits"][b].softmax(-1)  # [num_queries, num_classes]
+            out_prob = outputs["pred_logits"][b,:-1].softmax(-1)  # [num_queries-1, num_classes]
             tgt_ids = targets[b]["labels"]
 
             if tgt_ids.numel() > 0:
                 # Compute the classification cost.
                 cost_class = -out_prob[:, tgt_ids]
 
-                out_mask = outputs["pred_masks"][b]  # [num_queries, H_pred, W_pred]
+                out_mask = outputs["pred_masks"][b,:-1]  # [num_queries-1, H_pred, W_pred]
                 tgt_mask = targets[b]["masks"].to(out_mask)
                 target_counts, block_area, H_t, W_t = compute_mask_block_counts(
                     tgt_mask, out_mask.shape[-2:]
@@ -114,8 +114,8 @@ class HungarianMatcher(nn.Module):
                 # We create an empty cost matrix. The shape [num_queries, 0] is
                 # important. linear_sum_assignment will correctly handle this
                 # by returning empty indices, which is the desired behavior.
-                C = torch.empty(num_queries, 0, device=out_prob.device)
-            C = C.reshape(num_queries, -1).cpu()
+                C = torch.empty(num_queries-1, 0, device=out_prob.device)
+            C = C.reshape(num_queries-1, -1).cpu()
             # Make sure the matrix contains no NaN values, or scipy fails 
             C[C.isnan()] = 0.0
 

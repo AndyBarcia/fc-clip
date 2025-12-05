@@ -59,7 +59,7 @@ class SetCriterion(nn.Module):
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
         """
         assert "pred_logits" in outputs
-        src_logits = outputs["pred_logits"].float()
+        src_logits = outputs["pred_logits"][:,:-1].float()
 
         idx = self._get_src_permutation_idx(indices)
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
@@ -78,13 +78,20 @@ class SetCriterion(nn.Module):
 
         src_idx = self._get_src_permutation_idx(indices)
         tgt_idx = self._get_tgt_permutation_idx(indices)
-        src_masks = outputs["pred_masks"]
-        src_masks = src_masks[src_idx]
+
+        pred_masks = outputs["pred_masks"]  # (B, Q, H, W)
+        B, Q_all, H, W = pred_masks.shape
+        Q_fg = Q_all - 1                    # last query is background
+
+        src_masks = pred_masks[src_idx]     # (N, H, W)
         masks = [t["masks"] for t in targets]
-        # TODO use valid to mask invalid areas due to padding in loss
-        target_masks, valid = nested_tensor_from_tensor_list(masks).decompose()
-        target_masks = target_masks.to(src_masks)
-        target_masks = target_masks[tgt_idx]
+
+        # Full GT tensor, including *all* masks per image (for the background union)
+        target_masks_full, valid = nested_tensor_from_tensor_list(masks).decompose()
+        target_masks_full = target_masks_full.to(src_masks)
+
+        # Matched GTs only (for foreground Dice and foreground softmax terms)
+        target_masks = target_masks_full[tgt_idx]  # (N, H_t, W_t)
 
         if src_masks.shape[0] == 0:
             losses = {
@@ -93,47 +100,99 @@ class SetCriterion(nn.Module):
             }
             return losses
 
-        logits = src_masks.reshape(src_masks.shape[0], -1)
+        # ------------------------------------------------------------------
+        # Foreground block stats and targets (per instance)
+        # ------------------------------------------------------------------
+        logits_fg = src_masks.reshape(src_masks.shape[0], -1)  # (N, H*W)
+        N = logits_fg.shape[0]
 
-        # Get downsampled version of mask ground truths
-        pos_counts, block_area, H_t, W_t = compute_mask_block_counts(
+        # Downsample foreground GTs to prediction resolution
+        pos_counts_fg, block_area, H_t, W_t = compute_mask_block_counts(
             target_masks, src_masks.shape[-2:]
+        )  # pos_counts_fg: (N, H*W)
+        pos_counts_fg = pos_counts_fg.to(device=logits_fg.device, dtype=logits_fg.dtype)
+
+        # [0,1] fractional foreground target per block
+        mean_targets_fg = pos_counts_fg / block_area          # (N, H*W)
+
+        # ------------------------------------------------------------------
+        # Background GT: complement of the union of all GT masks per image
+        # ------------------------------------------------------------------
+        # union of all FG masks in each image, at original resolution
+        union_fg = (target_masks_full > 0).any(dim=1)         # (B, H_t, W_t)
+        union_fg = union_fg.to(dtype=logits_fg.dtype)
+
+        # Downsample union to prediction resolution
+        pos_counts_union, block_area_bg, _, _ = compute_mask_block_counts(
+            union_fg, src_masks.shape[-2:]
+        )  # (B, H*W)
+        pos_counts_union = pos_counts_union.to(
+            device=logits_fg.device, dtype=logits_fg.dtype
         )
-        pos_counts = pos_counts.to(device=logits.device, dtype=logits.dtype)
 
-        # Convert to [0,1] normalized target based on block area.
-        mean_targets = (pos_counts / block_area) # (N, H*W)
+        # (they should match, but we won’t assert to avoid overhead)
+        # assert block_area_bg == block_area
 
-        # Mask unmatched queries with -infinity
-        B,Q = outputs["pred_masks"].shape[0], outputs["pred_masks"].shape[1]
-        unmatched_mask = torch.ones(B, Q, dtype=torch.bool, device=outputs["pred_masks"].device)
-        unmatched_mask[src_idx] = False
-        logits_masked = torch.where(
-            unmatched_mask.view(B, Q, 1, 1).expand_as(outputs["pred_masks"]),
-            torch.full_like(outputs["pred_masks"], float('-inf')),
-            outputs["pred_masks"]
+        # Background pixels = remaining pixels in each block
+        bg_pos_counts = block_area - pos_counts_union         # (B, H*W)
+        mean_targets_bg = bg_pos_counts / block_area          # (B, H*W)
+
+        # ------------------------------------------------------------------
+        # Softmax loss with learned background logit
+        # ------------------------------------------------------------------
+        # Split foreground and background logits
+        fg_logits_all = pred_masks[:, :Q_fg]                  # (B, Q_fg, H, W)
+        bg_logits_full = pred_masks[:, -1:]                   # (B, 1, H, W)
+
+        # Mask *unmatched* foreground queries with -inf (background always kept)
+        unmatched_mask = torch.ones(
+            B, Q_fg, dtype=torch.bool, device=pred_masks.device
+        )
+        unmatched_mask[src_idx] = False  # matched (batch, query) pairs are not masked
+
+        fg_logits_masked = torch.where(
+            unmatched_mask.view(B, Q_fg, 1, 1),
+            torch.full_like(fg_logits_all, float("-inf")),
+            fg_logits_all,
         )
 
-        # Append fixed background logit
-        H,W = src_masks.shape[-2:]
-        logits_masked = torch.cat((logits_masked, torch.zeros(B,1,H,W, dtype=logits_masked.dtype, device=logits_masked.device)), dim=1) # (B,Q+1,H,W)
-        logits_flat = logits_masked.view(B, Q+1, H*W) # (B, Q+1, HW)
+        # Concatenate background as last class
+        logits_masked = torch.cat([fg_logits_masked, bg_logits_full], dim=1)  # (B, Q_all, H, W)
+        logits_flat = logits_masked.view(B, Q_all, H * W)                     # (B, Q_all, HW)
 
-        # Foreground GTs: for each GT j, use its assigned (batch_idx[j], pred_idx[j]) logits
-        # The background logit is ignored, as it's 0 and it wouldn't contribute anything.
-        assigned_logits = logits_flat[src_idx]   # (N, HW)
-        expected_fg_logit = (assigned_logits * mean_targets).sum() # scalar
+        # Foreground expectation term (one row per matched instance)
+        assigned_logits = logits_flat[src_idx]             # (N, H*W)
+        expected_fg_logit = (assigned_logits * mean_targets_fg).sum()
 
-        # Compute cross-entropy
-        logZ = torch.logsumexp(logits_masked, dim=1) # (B,H,W) = log ∑_q exp(z_q)
-        loss_mask = (logZ.sum() - expected_fg_logit) / (num_masks*H*W)
+        # Background expectation term (one row per image)
+        bg_logits_flat = logits_masked[:, -1].view(B, H * W)   # (B, H*W)
+        expected_bg_logit = (bg_logits_flat * mean_targets_bg).sum()
 
-        probs = torch.sigmoid(logits)
-        intersection = (probs * pos_counts).sum(dim=1)
-        pred_sum = probs.sum(dim=1) * block_area
-        target_sum = pos_counts.sum(dim=1)
-        loss_dice = 1 - (2 * intersection) / (pred_sum + target_sum)
-        loss_dice = loss_dice.sum() / num_masks
+        expected_logit = expected_fg_logit + expected_bg_logit
+
+        # Partition function
+        logZ = torch.logsumexp(logits_masked, dim=1)  # (B, H, W)
+        loss_mask = (logZ.sum() - expected_logit) / (num_masks * H * W)
+
+        # ------------------------------------------------------------------
+        # Dice loss: foreground (per instance) + background (per image)
+        # ------------------------------------------------------------------
+        # Foreground Dice
+        probs_fg = torch.sigmoid(logits_fg)                      # (N, H*W)
+        intersection_fg = (probs_fg * pos_counts_fg).sum(dim=1)
+        pred_sum_fg = probs_fg.sum(dim=1) * block_area
+        target_sum_fg = pos_counts_fg.sum(dim=1)
+        dice_fg = 1 - (2 * intersection_fg) / (pred_sum_fg + target_sum_fg + 1e-6)
+
+        # Background Dice (one term per image)
+        probs_bg = torch.sigmoid(bg_logits_flat)                 # (B, H*W)
+        intersection_bg = (probs_bg * bg_pos_counts).sum(dim=1)
+        pred_sum_bg = probs_bg.sum(dim=1) * block_area
+        target_sum_bg = bg_pos_counts.sum(dim=1)
+        dice_bg = 1 - (2 * intersection_bg) / (pred_sum_bg + target_sum_bg + 1e-6)
+
+        # IMPORTANT: each foreground mask and each background mask gets the same weight
+        loss_dice = (dice_fg.sum() + dice_bg.sum()) / (num_masks + B)
 
         losses = {
             "loss_mask": loss_mask,
