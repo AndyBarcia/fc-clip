@@ -272,6 +272,7 @@ class FCCLIP(nn.Module):
             "loss_ce": class_weight,
             "loss_mask": mask_weight,
             "loss_dice": dice_weight,
+            "loss_panoptic": mask_weight,
             "loss_tv": tv_weight,
             "loss_bbox": bbox_weight,
             "loss_giou": giou_weight
@@ -627,14 +628,17 @@ class FCCLIP(nn.Module):
             # take argmax
             cur_mask_ids = cur_prob_masks.argmax(0)
             stuff_memory_list = {}
-            for k in range(cur_classes.shape[0]):
+            for k in range(cur_classes.shape[0]-1):
                 pred_class = cur_classes[k].item()
+                if pred_class >= num_classes:
+                    continue
+
                 isthing = pred_class in self.test_metadata.thing_dataset_id_to_contiguous_id.values()
                 mask_area = (cur_mask_ids == k).sum().item()
                 original_area = (cur_masks[k] >= 0.5).sum().item()
                 mask = (cur_mask_ids == k) & (cur_masks[k] >= 0.5)
 
-                if mask_area > 0 and original_area > 0 and mask.sum().item() > 0:
+                if mask_area > 0 and mask.sum().item() > 0:
                     if mask_area / original_area < self.overlap_threshold:
                         continue
 

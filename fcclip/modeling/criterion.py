@@ -79,24 +79,29 @@ class SetCriterion(nn.Module):
         src_idx = self._get_src_permutation_idx(indices)
         tgt_idx = self._get_tgt_permutation_idx(indices)
 
-        pred_masks = outputs["pred_masks"]  # (B, Q, H, W)
-        B, Q_all, H, W = pred_masks.shape
-        Q_fg = Q_all - 1                    # last query is background
+        # Classification logits -> per-query scores
+        src_logits = outputs["pred_logits"].float()  # (B, Q, C)
+        mask_scores = F.softmax(src_logits, dim=-1).max(-1).values  # (B, Q)
 
-        src_masks = pred_masks[src_idx]     # (N, H, W)
+        pred_masks = outputs["pred_masks"]  # (B, Q_all, H, W)
+        B, Q_all, H, W = pred_masks.shape
+        Q_fg = Q_all - 1  # last query is background
+
+        src_masks = pred_masks[src_idx]  # (N, H, W)
         masks = [t["masks"] for t in targets]
 
         # Full GT tensor, including *all* masks per image (for the background union)
         target_masks_full, valid = nested_tensor_from_tensor_list(masks).decompose()
         target_masks_full = target_masks_full.to(src_masks)
 
-        # Matched GTs only (for foreground Dice and foreground softmax terms)
+        # Matched GTs only (for foreground Dice and foreground terms)
         target_masks = target_masks_full[tgt_idx]  # (N, H_t, W_t)
 
         if src_masks.shape[0] == 0:
             losses = {
                 "loss_mask": outputs["pred_masks"].sum() * 0.0,
                 "loss_dice": outputs["pred_masks"].sum() * 0.0,
+                "loss_panoptic": outputs["pred_masks"].sum() * 0.0,
             }
             return losses
 
@@ -113,13 +118,13 @@ class SetCriterion(nn.Module):
         pos_counts_fg = pos_counts_fg.to(device=logits_fg.device, dtype=logits_fg.dtype)
 
         # [0,1] fractional foreground target per block
-        mean_targets_fg = pos_counts_fg / block_area          # (N, H*W)
+        mean_targets_fg = pos_counts_fg / block_area  # (N, H*W)
 
         # ------------------------------------------------------------------
         # Background GT: complement of the union of all GT masks per image
         # ------------------------------------------------------------------
         # union of all FG masks in each image, at original resolution
-        union_fg = (target_masks_full > 0).any(dim=1)         # (B, H_t, W_t)
+        union_fg = (target_masks_full > 0).any(dim=1)  # (B, H_t, W_t)
         union_fg = union_fg.to(dtype=logits_fg.dtype)
 
         # Downsample union to prediction resolution
@@ -130,62 +135,46 @@ class SetCriterion(nn.Module):
             device=logits_fg.device, dtype=logits_fg.dtype
         )
 
-        # (they should match, but we won’t assert to avoid overhead)
-        # assert block_area_bg == block_area
-
         # Background pixels = remaining pixels in each block
-        bg_pos_counts = block_area - pos_counts_union         # (B, H*W)
-        mean_targets_bg = bg_pos_counts / block_area          # (B, H*W)
+        bg_pos_counts = block_area - pos_counts_union  # (B, H*W)
+        mean_targets_bg = bg_pos_counts / block_area   # (B, H*W)
+
+        # Raw background logits (for BCE + Dice)
+        bg_logits_flat = pred_masks[:, -1].view(B, H * W)  # (B, H*W)
 
         # ------------------------------------------------------------------
-        # Softmax loss with learned background logit
+        # 1) BCE loss on each mask (foreground + background)
         # ------------------------------------------------------------------
-        # Split foreground and background logits
-        fg_logits_all = pred_masks[:, :Q_fg]                  # (B, Q_fg, H, W)
-        bg_logits_full = pred_masks[:, -1:]                   # (B, 1, H, W)
+        # Foreground BCE
+        bce_fg = F.binary_cross_entropy_with_logits(
+            logits_fg,                      # (N, H*W)
+            mean_targets_fg,                # (N, H*W)
+            reduction="none",
+        )  # (N, H*W)
 
-        # Mask *unmatched* foreground queries with -inf (background always kept)
-        unmatched_mask = torch.ones(
-            B, Q_fg, dtype=torch.bool, device=pred_masks.device
-        )
-        unmatched_mask[src_idx] = False  # matched (batch, query) pairs are not masked
+        # Background BCE (one mask per image)
+        bce_bg = F.binary_cross_entropy_with_logits(
+            bg_logits_flat,                 # (B, H*W)
+            mean_targets_bg,                # (B, H*W)
+            reduction="none",
+        )  # (B, H*W)
 
-        fg_logits_masked = torch.where(
-            unmatched_mask.view(B, Q_fg, 1, 1),
-            torch.full_like(fg_logits_all, float("-inf")),
-            fg_logits_all,
-        )
-
-        # Concatenate background as last class
-        logits_masked = torch.cat([fg_logits_masked, bg_logits_full], dim=1)  # (B, Q_all, H, W)
-        logits_flat = logits_masked.view(B, Q_all, H * W)                     # (B, Q_all, HW)
-
-        # Foreground expectation term (one row per matched instance)
-        assigned_logits = logits_flat[src_idx]             # (N, H*W)
-        expected_fg_logit = (assigned_logits * mean_targets_fg).sum()
-
-        # Background expectation term (one row per image)
-        bg_logits_flat = logits_masked[:, -1].view(B, H * W)   # (B, H*W)
-        expected_bg_logit = (bg_logits_flat * mean_targets_bg).sum()
-
-        expected_logit = expected_fg_logit + expected_bg_logit
-
-        # Partition function
-        logZ = torch.logsumexp(logits_masked, dim=1)  # (B, H, W)
-        loss_mask = (logZ.sum() - expected_logit) / (num_masks * H * W)
+        # IMPORTANT: each foreground mask and each background mask gets the same weight
+        loss_mask = (bce_fg.sum() + bce_bg.sum()) / ((num_masks + B) * H * W)
 
         # ------------------------------------------------------------------
-        # Dice loss: foreground (per instance) + background (per image)
+        # 2) Dice loss: foreground (per instance) + background (per image)
+        #    (unchanged, using raw logits)
         # ------------------------------------------------------------------
         # Foreground Dice
-        probs_fg = torch.sigmoid(logits_fg)                      # (N, H*W)
+        probs_fg = torch.sigmoid(logits_fg)  # (N, H*W)
         intersection_fg = (probs_fg * pos_counts_fg).sum(dim=1)
         pred_sum_fg = probs_fg.sum(dim=1) * block_area
         target_sum_fg = pos_counts_fg.sum(dim=1)
         dice_fg = 1 - (2 * intersection_fg) / (pred_sum_fg + target_sum_fg + 1e-6)
 
         # Background Dice (one term per image)
-        probs_bg = torch.sigmoid(bg_logits_flat)                 # (B, H*W)
+        probs_bg = torch.sigmoid(bg_logits_flat)  # (B, H*W)
         intersection_bg = (probs_bg * bg_pos_counts).sum(dim=1)
         pred_sum_bg = probs_bg.sum(dim=1) * block_area
         target_sum_bg = bg_pos_counts.sum(dim=1)
@@ -194,9 +183,40 @@ class SetCriterion(nn.Module):
         # IMPORTANT: each foreground mask and each background mask gets the same weight
         loss_dice = (dice_fg.sum() + dice_bg.sum()) / (num_masks + B)
 
+        # ------------------------------------------------------------------
+        # 3) Panoptic softmax CE on score-weighted mask logits
+        #    (old softmax objective, but on "mask * score" logits)
+        # ------------------------------------------------------------------
+        # Gate logits such that sigmoid(mask_pan) = sigmoid(mask) * sigmoid(score)
+        def gate_logits(x, y):
+            zeros = torch.zeros_like(x)
+            # log(1 + exp(x) + exp(y)) in a stable way
+            log_denom = torch.logsumexp(torch.stack([zeros, x, y], dim=0), dim=0)
+            return x + y - log_denom
+        score_logits = torch.logit(mask_scores).view(B, Q_all, 1, 1).expand(-1,-1,H,W)  # (B,Q_all,1,1)
+        weighted_masks = gate_logits(pred_masks, score_logits)  # (B, Q_all, H, W)
+
+        # Concatenate background as last class
+        logits_flat = weighted_masks.view(B, Q_all, H * W)                     # (B, Q_all, HW)
+
+        # Foreground expectation term (one row per matched instance)
+        assigned_logits = logits_flat[src_idx]            # (N, H*W)
+        expected_fg_logit = (assigned_logits * mean_targets_fg).sum()
+
+        # Background expectation term (one row per image)
+        bg_logits_flat_pan = weighted_masks[:, -1].view(B, H * W)  # (B, H*W)
+        expected_bg_logit = (bg_logits_flat_pan * mean_targets_bg).sum()
+
+        expected_logit = expected_fg_logit + expected_bg_logit
+
+        # Partition function
+        logZ = torch.logsumexp(weighted_masks, dim=1)  # (B, H, W)
+        loss_panoptic = (logZ.sum() - expected_logit) / (num_masks * H * W)
+
         losses = {
             "loss_mask": loss_mask,
             "loss_dice": loss_dice,
+            "loss_panoptic": loss_panoptic,
         }
 
         return losses
