@@ -272,7 +272,8 @@ class FCCLIP(nn.Module):
             "loss_ce": class_weight,
             "loss_mask": mask_weight,
             "loss_dice": dice_weight,
-            "loss_panoptic": mask_weight,
+            "loss_panoptic_mask": mask_weight,
+            "loss_panoptic_dice": dice_weight,
             "loss_tv": tv_weight,
             "loss_bbox": bbox_weight,
             "loss_giou": giou_weight
@@ -394,6 +395,7 @@ class FCCLIP(nn.Module):
             mask_cls_results = outputs["pred_logits"]
             mask_pred_results = outputs["pred_masks"]
             mask_box_results = outputs.get("pred_boxes")
+            mask_pred_offset_results = outputs.get("pred_masks_offset")
 
             # We ensemble the pred logits of in-vocab and out-vocab
             clip_feature = features["clip_vis_dense"]
@@ -461,8 +463,8 @@ class FCCLIP(nn.Module):
                 mask_box_results = [None] * len(batched_inputs)
 
             processed_results = []
-            for mask_cls_result, mask_up_pred_result, mask_pred_result, mask_box_result, input_per_image, image_size in zip(
-                mask_cls_results, mask_up_pred_results, mask_pred_results, mask_box_results, batched_inputs, images.image_sizes
+            for mask_cls_result, mask_up_pred_result, mask_pred_offset_result, mask_pred_result, mask_box_result, input_per_image, image_size in zip(
+                mask_cls_results, mask_up_pred_results, mask_pred_offset_results, mask_pred_results, mask_box_results, batched_inputs, images.image_sizes
             ):
                 height = input_per_image.get("height", image_size[0])
                 width = input_per_image.get("width", image_size[1])
@@ -487,7 +489,7 @@ class FCCLIP(nn.Module):
 
                 # panoptic segmentation inference
                 if self.panoptic_on:
-                    panoptic_r = retry_if_cuda_oom(self.panoptic_inference)(mask_cls_result, mask_up_pred_result)
+                    panoptic_r = retry_if_cuda_oom(self.panoptic_inference)(mask_cls_result, mask_pred_offset_result, mask_up_pred_result)
                     processed_results[-1]["panoptic_seg"] = panoptic_r
                 
                 # instance segmentation inference
@@ -602,18 +604,22 @@ class FCCLIP(nn.Module):
         semseg = torch.einsum("qc,qhw->chw", mask_cls, mask_pred)
         return semseg
 
-    def panoptic_inference(self, mask_cls, mask_pred):
+    def panoptic_inference(self, mask_cls, mask_ofst, mask_pred):
         scores, labels = F.softmax(mask_cls, dim=-1).max(-1)
+        
+        H,W = mask_pred.shape[-2:]
+        prob_masks = (mask_pred + mask_ofst[:,None,None].expand(-1,H,W)).softmax(0) # (Q,H,W)
+
         mask_pred = mask_pred.sigmoid()
+
         num_classes = len(self.test_metadata.stuff_classes)
         keep = labels.ne(num_classes) & (scores > self.object_mask_threshold)
-        cur_scores = scores[keep]
-        cur_classes = labels[keep]
-        cur_masks = mask_pred[keep]
-        cur_mask_cls = mask_cls[keep]
+        cur_scores = scores #[keep]
+        cur_classes = labels #[keep]
+        cur_masks = mask_pred #[keep]
+        cur_mask_cls = mask_cls #[keep]
+        cur_prob_masks = prob_masks #[keep]
         cur_mask_cls = cur_mask_cls[:, :-1]
-
-        cur_prob_masks = cur_scores.view(-1, 1, 1) * cur_masks
 
         h, w = cur_masks.shape[-2:]
         panoptic_seg = torch.zeros((h, w), dtype=torch.int32, device=cur_masks.device)
@@ -662,7 +668,7 @@ class FCCLIP(nn.Module):
                     )
 
             return panoptic_seg, segments_info
-
+    
     def instance_inference(self, mask_cls, mask_pred, mask_box):
         # mask_pred is already processed to have the same shape as original input
         image_size = mask_pred.shape[-2:]

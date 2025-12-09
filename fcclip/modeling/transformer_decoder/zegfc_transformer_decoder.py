@@ -374,6 +374,8 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         else:
             raise ValueError(f"Unknown mask_embed_type: {self.mask_embed_type}")
 
+        self.mask_offset = MLP(hidden_dim, hidden_dim, 1, 3)
+
         if self.separate_thing_stuff_mask_embed:
             self.thing_stuff_temperature = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
@@ -486,6 +488,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
 
         predictions_class = []
         predictions_mask = []
+        predictions_mask_offset = []
         predictions_bbox = []
 
         # Optional starting cross-attention for text. 
@@ -499,7 +502,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             text_attn_logits = None
 
         # prediction heads on learnable query features
-        outputs_class, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
+        outputs_class, outputs_mask, outputs_mask_offset, output_box, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
             output, 
             mask_features,
             text_attn_logits,
@@ -512,6 +515,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         )
         predictions_class.append(outputs_class)
         predictions_mask.append(outputs_mask)
+        predictions_mask_offset.append(outputs_mask_offset)
         predictions_bbox.append(output_box)
 
         for i in range(self.num_layers):
@@ -560,7 +564,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                 output
             )
 
-            outputs_class, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
+            outputs_class, outputs_mask, outputs_mask_offset, output_box, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
                 output, 
                 mask_features, 
                 text_attn_logits,
@@ -573,6 +577,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             )
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
+            predictions_mask_offset.append(outputs_mask_offset)
             predictions_bbox.append(output_box)
 
         assert len(predictions_class) == self.num_layers + 1
@@ -580,9 +585,10 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         out = {
             'pred_logits': predictions_class[-1],
             'pred_masks': predictions_mask[-1],
+            'pred_masks_offset': predictions_mask_offset[-1],
             'pred_boxes': predictions_bbox[-1],
             'aux_outputs': self._set_aux_loss(
-                predictions_class if self.mask_classification else None, predictions_mask, predictions_bbox
+                predictions_class if self.mask_classification else None, predictions_mask, predictions_mask_offset, predictions_bbox
             )
         }
         return out
@@ -618,6 +624,9 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             outputs_mask = torch.einsum("bqhw,bq->bqhw", thing_mask, output_thing_mask) + torch.einsum("bqhw,bq->bqhw", stuff_mask, 1-output_thing_mask)  # (B,Q,H,W)
         else:
             outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)  # (B,Q,H,W)
+
+        outputs_mask_offset = self.mask_offset(decoder_output).squeeze(-1)  # (B,Q)
+        
 
         # Apply convolution MLP to the mask features.
         if self.attn_conv_kernel_size:
@@ -661,20 +670,20 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         attn_mask = (attn_mask.sigmoid().flatten(2).unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0, 1) < 0.5).bool()
         attn_mask = attn_mask.detach()
 
-        return outputs_class, outputs_mask, outputs_bbox, query_bbox_unsigmoid_detached, attn_mask
+        return outputs_class, outputs_mask, outputs_mask_offset, outputs_bbox, query_bbox_unsigmoid_detached, attn_mask
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_seg_masks, outputs_bboxes):
+    def _set_aux_loss(self, outputs_class, outputs_seg_masks, outputs_seg_mask_offsets, outputs_bboxes):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
         if self.mask_classification:
             return [
-                {"pred_logits": a, "pred_masks": b, "pred_boxes": c}
-                for a, b, c in zip(outputs_class[:-1], outputs_seg_masks[:-1], outputs_bboxes[:-1])
+                {"pred_logits": a, "pred_masks": b, "pred_masks_offset": c, "pred_boxes": d}
+                for a, b, c, d in zip(outputs_class[:-1], outputs_seg_masks[:-1], outputs_seg_mask_offsets[:-1], outputs_bboxes[:-1])
             ]
         else:
             return [
-                {"pred_masks": b, "pred_boxes": c}
-                for b, c in zip(outputs_seg_masks[:-1], outputs_bboxes[:-1])
+                {"pred_masks": b, "pred_masks_offset": c, "pred_boxes": d}
+                for b, c, d in zip(outputs_seg_masks[:-1], outputs_seg_mask_offsets[:-1], outputs_bboxes[:-1])
             ]

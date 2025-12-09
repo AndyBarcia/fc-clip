@@ -79,13 +79,11 @@ class SetCriterion(nn.Module):
         src_idx = self._get_src_permutation_idx(indices)
         tgt_idx = self._get_tgt_permutation_idx(indices)
 
-        # Classification logits -> per-query scores
-        src_logits = outputs["pred_logits"].float()  # (B, Q, C)
-        mask_scores = F.softmax(src_logits, dim=-1).max(-1).values  # (B, Q)
-
         pred_masks = outputs["pred_masks"]  # (B, Q_all, H, W)
         B, Q_all, H, W = pred_masks.shape
         Q_fg = Q_all - 1  # last query is background
+
+        mask_offsets = outputs["pred_masks_offset"].float() # (B,Q)
 
         src_masks = pred_masks[src_idx]  # (N, H, W)
         masks = [t["masks"] for t in targets]
@@ -98,10 +96,12 @@ class SetCriterion(nn.Module):
         target_masks = target_masks_full[tgt_idx]  # (N, H_t, W_t)
 
         if src_masks.shape[0] == 0:
+            zero = outputs["pred_masks"].sum() * 0.0
             losses = {
-                "loss_mask": outputs["pred_masks"].sum() * 0.0,
-                "loss_dice": outputs["pred_masks"].sum() * 0.0,
-                "loss_panoptic": outputs["pred_masks"].sum() * 0.0,
+                "loss_mask": zero,
+                "loss_dice": zero,
+                "loss_panoptic_mask": zero,
+                "loss_panoptic_dice": zero,
             }
             return losses
 
@@ -185,16 +185,10 @@ class SetCriterion(nn.Module):
 
         # ------------------------------------------------------------------
         # 3) Panoptic softmax CE on score-weighted mask logits
-        #    (old softmax objective, but on "mask * score" logits)
         # ------------------------------------------------------------------
-        # Gate logits such that sigmoid(mask_pan) = sigmoid(mask) * sigmoid(score)
-        def gate_logits(x, y):
-            zeros = torch.zeros_like(x)
-            # log(1 + exp(x) + exp(y)) in a stable way
-            log_denom = torch.logsumexp(torch.stack([zeros, x, y], dim=0), dim=0)
-            return x + y - log_denom
-        score_logits = torch.logit(mask_scores).view(B, Q_all, 1, 1).expand(-1,-1,H,W)  # (B,Q_all,1,1)
-        weighted_masks = gate_logits(pred_masks, score_logits)  # (B, Q_all, H, W)
+        # TODO maybe here we need to detach pred_masks so that the softmax variants
+        # only learn the correct offsets?
+        weighted_masks = pred_masks + mask_offsets[:,:,None,None].expand(-1,-1,H,W)  # (B, Q_all, H, W)
 
         # Concatenate background as last class
         logits_flat = weighted_masks.view(B, Q_all, H * W)                     # (B, Q_all, HW)
@@ -211,12 +205,44 @@ class SetCriterion(nn.Module):
 
         # Partition function
         logZ = torch.logsumexp(weighted_masks, dim=1)  # (B, H, W)
-        loss_panoptic = (logZ.sum() - expected_logit) / (num_masks * H * W)
+        loss_panoptic_mask = (logZ.sum() - expected_logit) / (num_masks * H * W)
+
+        # ------------------------------------------------------------------
+        # 4) Panoptic Dice using softmax probabilities
+        #    (same targets, but now using the panoptic softmax distribution)
+        # ------------------------------------------------------------------
+        probs_panoptic = F.softmax(weighted_masks, dim=1)           # (B, Q_all, H, W)
+        probs_flat_pan = probs_panoptic.view(B, Q_all, H * W)       # (B, Q_all, HW)
+
+        # Foreground probabilities for matched queries
+        assigned_probs = probs_flat_pan[src_idx]                    # (N, H*W)
+
+        # Background probabilities (last query)
+        bg_probs_flat_pan = probs_panoptic[:, -1].view(B, H * W)    # (B, H*W)
+
+        # Foreground panoptic Dice
+        intersection_fg_pan = (assigned_probs * pos_counts_fg).sum(dim=1)
+        pred_sum_fg_pan = assigned_probs.sum(dim=1) * block_area
+        # target_sum_fg is reused from above
+        dice_fg_pan = 1 - (2 * intersection_fg_pan) / (
+            pred_sum_fg_pan + target_sum_fg + 1e-6
+        )
+
+        # Background panoptic Dice
+        intersection_bg_pan = (bg_probs_flat_pan * bg_pos_counts).sum(dim=1)
+        pred_sum_bg_pan = bg_probs_flat_pan.sum(dim=1) * block_area
+        target_sum_bg = bg_pos_counts.sum(dim=1)
+        dice_bg_pan = 1 - (2 * intersection_bg_pan) / (
+            pred_sum_bg_pan + target_sum_bg + 1e-6
+        )
+
+        loss_panoptic_dice = (dice_fg_pan.sum() + dice_bg_pan.sum()) / (num_masks + B)
 
         losses = {
             "loss_mask": loss_mask,
             "loss_dice": loss_dice,
-            "loss_panoptic": loss_panoptic,
+            "loss_panoptic_mask": loss_panoptic_mask,
+            "loss_panoptic_dice": loss_panoptic_dice
         }
 
         return losses

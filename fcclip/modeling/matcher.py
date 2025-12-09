@@ -30,6 +30,14 @@ def batch_sigmoid_ce_loss(
     loss = sum_max[:, None] - dot + sum_logexp[:, None]
     return loss / original_hw
 
+def batch_softmax_ce_loss(
+    logits: torch.Tensor,
+    target_counts: torch.Tensor,
+    original_hw: int,
+) -> torch.Tensor:
+    log_probs = logits.log_softmax(dim=0)[:-1]  # [num_queries-1, C]
+    loss = -torch.einsum("qc,mc->qm", log_probs, target_counts)
+    return loss / float(original_hw)
 
 def batch_dice_loss(
     logits: torch.Tensor, target_counts: torch.Tensor, block_area: int
@@ -38,10 +46,18 @@ def batch_dice_loss(
     intersection = torch.einsum("qc,mc->qm", probs, target_counts)
     pred_sum = block_area * probs.sum(dim=1)
     target_sum = target_counts.sum(dim=1)
-    #loss = 1 - (2 * intersection + 1) / (pred_sum[:, None] + target_sum[None, :] + 1)
     loss = 1 - (2 * intersection) / (pred_sum[:, None] + target_sum[None, :])
     return loss
 
+def batch_softmax_dice_loss(
+    logits: torch.Tensor, target_counts: torch.Tensor, block_area: int
+) -> torch.Tensor:
+    probs = torch.softmax(logits, dim=0)[:-1] # [num_queries-1, C]
+    intersection = torch.einsum("qc,mc->qm", probs, target_counts)
+    pred_sum = block_area * probs.sum(dim=1)
+    target_sum = target_counts.sum(dim=1)
+    loss = 1 - (2 * intersection) / (pred_sum[:, None] + target_sum[None, :])
+    return loss
 
 class HungarianMatcher(nn.Module):
     """This class computes an assignment between the targets and the predictions of the network
@@ -85,7 +101,12 @@ class HungarianMatcher(nn.Module):
                 # Compute the classification cost.
                 cost_class = -out_prob[:, tgt_ids]
 
-                out_mask = outputs["pred_masks"][b,:-1]  # [num_queries-1, H_pred, W_pred]
+                out_mask = outputs["pred_masks"][b]  # [num_queries, H_pred, W_pred]
+                out_ofst = outputs["pred_masks_offset"][b] # (num_queries)
+                
+                H,W = out_mask.shape[-2:]
+                out_mask = out_mask + out_ofst[:,None,None].expand(-1,H,W) # [num_queries, H_pred, W_pred]
+
                 tgt_mask = targets[b]["masks"].to(out_mask)
                 target_counts, block_area, H_t, W_t = compute_mask_block_counts(
                     tgt_mask, out_mask.shape[-2:]
@@ -97,11 +118,11 @@ class HungarianMatcher(nn.Module):
                     out_mask = out_mask.float()
                     target_counts = target_counts.float()
                     # Compute the focal loss between masks
-                    cost_mask = batch_sigmoid_ce_loss(
-                        out_mask, target_counts, block_area, H_t * W_t
+                    cost_mask = batch_softmax_ce_loss(
+                        out_mask, target_counts, H_t * W_t
                     )
                     # Compute the dice loss between masks
-                    cost_dice = batch_dice_loss(out_mask, target_counts, block_area)
+                    cost_dice = batch_softmax_dice_loss(out_mask, target_counts, block_area)
 
                 # Final cost matrix
                 C = (
