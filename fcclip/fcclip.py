@@ -284,6 +284,9 @@ class FCCLIP(nn.Module):
                 aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
             weight_dict.update(aux_weight_dict)
 
+        selected_weight_dict = {f"selected_{k}": v for k, v in weight_dict.items()}
+        weight_dict.update(selected_weight_dict)
+
         losses = ["labels", "masks", "boxes"]
 
         criterion = SetCriterion(
@@ -377,11 +380,31 @@ class FCCLIP(nn.Module):
             features['thing_mask'] = self.test_thing_mask
             #features['thing_mask'] = torch.ones_like(self.test_thing_mask)
 
-        outputs = self.sem_seg_head(features)
+        decoder_inputs = None
+        sem_seg_outputs = self.sem_seg_head(features, return_decoder_inputs=self.training)
+        if self.training:
+            outputs, decoder_inputs = sem_seg_outputs
+        else:
+            outputs = sem_seg_outputs
 
         if self.training:
             # bipartite matching-based loss
             losses = self.criterion(outputs, targets)
+
+            selected_indices = self.criterion.matcher(
+                {k: v for k, v in outputs.items() if k != "aux_outputs"},
+                targets,
+            )
+            selected_outputs = self.sem_seg_head(
+                features,
+                selected_indices=selected_indices,
+                decoder_inputs=decoder_inputs,
+            )
+            selected_losses = self.criterion(selected_outputs, targets, indices=selected_indices)
+
+            selected_losses = {f"selected_{k}": v for k, v in selected_losses.items()}
+            for key, value in selected_losses.items():
+                losses[key] = losses.get(key, 0) + value
 
             for k in list(losses.keys()):
                 if k in self.criterion.weight_dict:
