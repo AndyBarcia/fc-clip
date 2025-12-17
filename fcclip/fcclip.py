@@ -284,6 +284,9 @@ class FCCLIP(nn.Module):
                 aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
             weight_dict.update(aux_weight_dict)
 
+        selected_weight_dict = {f"selected_{k}": v for k, v in weight_dict.items()}
+        weight_dict.update(selected_weight_dict)
+
         losses = ["labels", "masks", "boxes"]
 
         criterion = SetCriterion(
@@ -399,6 +402,7 @@ class FCCLIP(nn.Module):
             )
             selected_losses = self.criterion(selected_outputs, targets, indices=selected_indices)
 
+            selected_losses = {f"selected_{k}": v for k, v in selected_losses.items()}
             for key, value in selected_losses.items():
                 losses[key] = losses.get(key, 0) + value
 
