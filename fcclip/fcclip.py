@@ -28,6 +28,8 @@ from .modeling.matcher import HungarianMatcher
 from .modeling.transformer_decoder.box_regression import box_xyxy_to_cxcywh, box_cxcywh_to_xyxy, masks_to_boxes
 
 from .modeling.transformer_decoder.fcclip_transformer_decoder import MaskPooling, get_classification_logits
+from .utils.misc import softmax_with_fixed_background
+
 VILD_PROMPT = [
     "a photo of a {}.",
     "This is a photo of a {}",
@@ -138,11 +140,9 @@ class FCCLIP(nn.Module):
 
         self.train_text_classifier = None
         self.test_text_classifier = None
-        self.void_embedding = nn.Embedding(1, backbone.dim_latent) # use this for void
-
-        (   _, 
-            self.train_num_templates, 
-            self.train_class_names, 
+        (   _,
+            self.train_num_templates,
+            self.train_class_names,
             self.train_thing_mask
         ) = self.prepare_class_names_from_metadata(train_metadata, train_metadata)
         (
@@ -362,8 +362,6 @@ class FCCLIP(nn.Module):
 
         features = self.backbone(images.tensor)
         text_classifier, num_templates = self.get_text_classifier()
-        # Append void class weight
-        text_classifier = torch.cat([text_classifier, F.normalize(self.void_embedding.weight, dim=-1)], dim=0)
         features['text_classifier'] = text_classifier
         features['num_templates'] = num_templates
 
@@ -408,12 +406,13 @@ class FCCLIP(nn.Module):
                 raise NotImplementedError
 
             out_vocab_cls_results = get_classification_logits(pooled_clip_feature, text_classifier, self.backbone.clip_model.logit_scale, num_templates)
-            in_vocab_cls_results = mask_cls_results[..., :-1] # remove void
-            out_vocab_cls_results = out_vocab_cls_results[..., :-1] # remove void
+            in_vocab_cls_probs_full = softmax_with_fixed_background(mask_cls_results)
+            out_vocab_cls_probs_full = softmax_with_fixed_background(out_vocab_cls_results)
+
+            in_vocab_cls_probs = in_vocab_cls_probs_full[..., :-1]
+            out_vocab_cls_probs = out_vocab_cls_probs_full[..., :-1]
 
             # Reference: https://github.com/NVlabs/ODISE/blob/main/odise/modeling/meta_arch/odise.py#L1506
-            out_vocab_cls_probs = out_vocab_cls_results.softmax(-1)
-            in_vocab_cls_results = in_vocab_cls_results.softmax(-1)
             category_overlapping_mask = self.category_overlapping_mask.to(self.device)
 
             if self.ensemble_on_valid_mask:
@@ -430,20 +429,20 @@ class FCCLIP(nn.Module):
                 beta = self.geometric_ensemble_beta
 
             cls_logits_seen = (
-                (in_vocab_cls_results ** (1 - alpha) * out_vocab_cls_probs**alpha).log()
+                (in_vocab_cls_probs ** (1 - alpha) * out_vocab_cls_probs**alpha).log()
                 * category_overlapping_mask
             )
             cls_logits_unseen = (
-                (in_vocab_cls_results ** (1 - beta) * out_vocab_cls_probs**beta).log()
+                (in_vocab_cls_probs ** (1 - beta) * out_vocab_cls_probs**beta).log()
                 * (1 - category_overlapping_mask)
             )
             cls_results = cls_logits_seen + cls_logits_unseen
 
-            # This is used to filtering void predictions.
-            is_void_prob = F.softmax(mask_cls_results, dim=-1)[..., -1:]
+            # This is used to filtering background predictions.
+            background_prob = in_vocab_cls_probs_full[..., -1:]
             mask_cls_probs = torch.cat([
-                cls_results.softmax(-1) * (1.0 - is_void_prob),
-                is_void_prob], dim=-1)
+                cls_results.softmax(-1) * (1.0 - background_prob),
+                background_prob], dim=-1)
             mask_cls_results = torch.log(mask_cls_probs + 1e-8)
 
             # upsample masks

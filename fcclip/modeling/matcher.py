@@ -12,6 +12,7 @@ from scipy.optimize import linear_sum_assignment
 from torch import nn
 from torch.cuda.amp import autocast
 
+from ..utils.misc import softmax_with_fixed_background
 from .mask_utils import compute_mask_block_counts
 
 
@@ -78,7 +79,7 @@ class HungarianMatcher(nn.Module):
         # Iterate through batch size
         for b in range(bs):
 
-            out_prob = outputs["pred_logits"][b].softmax(-1)  # [num_queries, num_classes]
+            out_prob = softmax_with_fixed_background(outputs["pred_logits"][b])  # [num_queries, num_classes + 1]
             tgt_ids = targets[b]["labels"]
 
             if tgt_ids.numel() > 0:

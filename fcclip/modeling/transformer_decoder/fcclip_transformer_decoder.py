@@ -41,8 +41,8 @@ def get_classification_logits(x, text_classifier, logit_scale, num_templates=Non
     # text_classifier: either [num_classes, C] or [B, num_classes, C]
     # text_attn_logits: optional [B, Q, num_classes]
     # logit_scale: scalar
-    # num_templates: list of template counts per non-void class
-    # Returns: [B, *, num_classes_final] where num_classes_final = len(num_templates) + 1
+    # num_templates: list of template counts per class
+    # Returns: [B, *, num_classes_final] where num_classes_final = len(num_templates)
     
     # Normalize input features
     x = F.normalize(x, dim=-1)
@@ -76,8 +76,6 @@ def get_classification_logits(x, text_classifier, logit_scale, num_templates=Non
         group_logits = pred_logits[..., cur_idx:cur_idx + num_t]
         final_pred_logits.append(group_logits.max(-1).values)
         cur_idx += num_t
-    # Append void class (last element)
-    final_pred_logits.append(pred_logits[..., -1])
     # Stack along new class dimension
     final_pred_logits = torch.stack(final_pred_logits, dim=-1)
     
