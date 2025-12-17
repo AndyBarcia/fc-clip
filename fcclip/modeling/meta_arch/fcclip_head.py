@@ -220,12 +220,22 @@ class FCCLIPHead(nn.Module):
 
         return rd_out.float()  # (B,T,C)
 
-    def forward(self, features, mask=None):
-        return self.layers(features, mask)
+    def forward(self, features, mask=None, selected_indices=None, return_decoder_inputs=False, decoder_inputs=None):
+        return self.layers(
+            features,
+            mask,
+            selected_indices=selected_indices,
+            return_decoder_inputs=return_decoder_inputs,
+            decoder_inputs=decoder_inputs,
+        )
 
-    def layers(self, features, mask=None):
+    def layers(self, features, mask=None, selected_indices=None, return_decoder_inputs=False, decoder_inputs=None):
         # Deformable-attention encoder.
-        mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(features)
+        if decoder_inputs is None:
+            mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(features)
+            decoder_inputs = (mask_features, transformer_encoder_features, multi_scale_features)
+        else:
+            mask_features, transformer_encoder_features, multi_scale_features = decoder_inputs
 
         # Semantically enrich text embeddings with relationship descriptor
         text_classifier = self.get_relationship_descriptor(
@@ -238,13 +248,16 @@ class FCCLIPHead(nn.Module):
         # FC-CLIP decoder.
         if self.transformer_in_feature == "multi_scale_pixel_decoder":
             predictions = self.predictor(
-                multi_scale_features, 
-                mask_features, 
+                multi_scale_features,
+                mask_features,
                 mask,
-                text_classifier=text_classifier, 
+                text_classifier=text_classifier,
                 thing_mask=features['thing_mask'],
-                num_templates=features["num_templates"]
+                num_templates=features["num_templates"],
+                selected_indices=selected_indices,
             )
         else:
             raise NotImplementedError
+        if return_decoder_inputs:
+            return predictions, decoder_inputs
         return predictions

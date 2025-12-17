@@ -392,6 +392,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         else:
             raise ValueError(f"Unknown class_embed_type: {self.class_embed_type}")
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        self.selected_query_embed = nn.Embedding(1, hidden_dim)
 
         # ZEG-FC
         self.text_attn = text_attn
@@ -458,7 +459,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         ret["separate_thing_stuff_mask_embed"] = cfg.MODEL.ZEG_FC.SEPARATE_THING_STUFF_MASK_EMBED
         return ret
 
-    def forward(self, x, mask_features, mask = None, text_classifier=None, thing_mask=None, num_templates=None):
+    def forward(self, x, mask_features, mask = None, text_classifier=None, thing_mask=None, num_templates=None, selected_indices=None):
         # x is a list of multi-scale feature
         assert len(x) == self.num_feature_levels
         src = []
@@ -479,8 +480,27 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
 
         _, bs, _ = src[0].shape
 
+        selected_query_mask = None
+        if selected_indices is not None:
+            selected_query_mask = torch.zeros(
+                self.num_queries,
+                bs,
+                dtype=torch.bool,
+                device=src[0].device,
+            )
+            for b_idx, (src_idx, _) in enumerate(selected_indices):
+                if len(src_idx) > 0:
+                    selected_query_mask[src_idx, b_idx] = True
+
+        def apply_selected_query_embedding(query_embedding):
+            if selected_query_mask is None:
+                return query_embedding
+            selected_query_bias = self.selected_query_embed.weight.view(1, 1, -1)
+            return query_embedding + selected_query_mask.unsqueeze(-1) * selected_query_bias
+
         # QxNxC
         query_embed = self.query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
+        query_embed = apply_selected_query_embedding(query_embed)
         output = self.query_feat.weight.unsqueeze(1).repeat(1, bs, 1)
         query_bbox_unsigmoid = self.query_bbox.weight.unsqueeze(1).repeat(1, bs, 1) if self.query_bbox else None
 
