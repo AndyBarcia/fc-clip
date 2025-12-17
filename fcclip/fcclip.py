@@ -272,7 +272,7 @@ class FCCLIP(nn.Module):
             "loss_ce": class_weight,
             "loss_mask": mask_weight,
             "loss_dice": dice_weight,
-            "loss_tv": tv_weight,
+            #"loss_tv": tv_weight,
             "loss_bbox": bbox_weight,
             "loss_giou": giou_weight
         }
@@ -284,7 +284,7 @@ class FCCLIP(nn.Module):
                 aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
             weight_dict.update(aux_weight_dict)
 
-        losses = ["labels", "masks", "boxes", "tv"]
+        losses = ["labels", "masks", "boxes"]
 
         criterion = SetCriterion(
             sem_seg_head.num_classes,
@@ -375,6 +375,7 @@ class FCCLIP(nn.Module):
             features['thing_mask'] = thing_mask
         else:
             features['thing_mask'] = self.test_thing_mask
+            #features['thing_mask'] = torch.ones_like(self.test_thing_mask)
 
         outputs = self.sem_seg_head(features)
 
@@ -531,27 +532,12 @@ class FCCLIP(nn.Module):
                     was_flipped = bool(flip_mask[cls].item())
                     is_thing_now = bool(new_thing_mask[cls].item())
 
-                    # Case 1: thing -> stuff (merge instances)
-                    if not is_thing_now and was_flipped:
+                    # If class is stuff now, merge all disjoint masks into one
+                    if not is_thing_now:
                         merged = cls_masks.any(dim=0)  # [H, W] union
                         new_masks_list.append(merged.to(gt_masks.dtype))
                         new_labels_list.append(cls)
-                    # Case 2: stuff -> thing (split via connected components)
-                    elif is_thing_now and was_flipped:
-                        merged = cls_masks.any(dim=0)  # [H, W] union of stuff region
-
-                        # connected components on CPU with OpenCV
-                        merged_np = merged.to(torch.uint8).cpu().numpy()
-                        num_cc, cc_labels = cv2.connectedComponents(merged_np)
-
-                        for cc_id in range(1, num_cc):  # 0 is background
-                            cc_mask_np = (cc_labels == cc_id).astype(np.uint8)
-                            cc_mask = torch.from_numpy(cc_mask_np).to(
-                                device=gt_masks.device, dtype=gt_masks.dtype
-                            )
-                            new_masks_list.append(cc_mask)
-                            new_labels_list.append(cls)
-                    # Case 3: unchanged thing->thing or stuff->stuff (keep instances)
+                    # If class is thing now, keep all disjoint instances separate
                     else:
                         for idx in cls_inds:
                             new_masks_list.append(gt_masks[idx])

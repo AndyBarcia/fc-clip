@@ -194,6 +194,60 @@ class MemEfficientDetectionCheckpointer(DetectionCheckpointer):
         self.tag_last_checkpoint(basename)
 
 
+class SwapProbabilitySchedulerHook(hooks.HookBase):
+    """Linearly swap thing/stuff probabilities over the course of training."""
+
+    def __init__(
+        self,
+        base_model,
+        training_model,
+        max_iter,
+        start_thing: float,
+        end_thing: float,
+        start_stuff: float,
+        end_stuff: float,
+    ):
+        self.base_model = base_model
+        self.training_model = training_model
+        self.max_iter = max_iter
+        self.start_thing = start_thing
+        self.end_thing = end_thing
+        self.start_stuff = start_stuff
+        self.end_stuff = end_stuff
+
+    def _set_probabilities(self, progress: float):
+        prob_swap_thing = max(
+            0.0, min(1.0, self.start_thing + (self.end_thing - self.start_thing) * progress)
+        )
+        prob_swap_stuff = max(
+            0.0, min(1.0, self.start_stuff + (self.end_stuff - self.start_stuff) * progress)
+        )
+
+        for model in (self.base_model, self.training_model):
+            if model is None:
+                continue
+
+            target_model = model.module if hasattr(model, "module") else model
+
+            if hasattr(target_model, "probability_swap_thing"):
+                target_model.probability_swap_thing = prob_swap_thing
+            if hasattr(target_model, "probability_swap_stuff"):
+                target_model.probability_swap_stuff = prob_swap_stuff
+
+    def _progress(self, iteration: int) -> float:
+        # Ensure we handle edge cases like a single-iteration training run.
+        denom = max(self.max_iter - 1, 1)
+        return max(0.0, min(1.0, iteration / denom))
+
+    def before_train(self):
+        progress = self._progress(getattr(self.trainer, "start_iter", 0))
+        self._set_probabilities(progress)
+
+    def before_step(self):
+        progress = self._progress(self.trainer.iter)
+        self._set_probabilities(progress)
+
+
 class Trainer(DefaultTrainer):
     """
     Extension of the Trainer class adapted to FCCLIP.
@@ -263,6 +317,15 @@ class Trainer(DefaultTrainer):
 
         ret = [
             hooks.IterationTimer(),
+            SwapProbabilitySchedulerHook(
+                self.base_model,
+                self._trainer.model,
+                self.max_iter,
+                cfg.MODEL.ZEG_FC.PROBABILITY_SWAP_THING,
+                cfg.MODEL.ZEG_FC.PROBABILITY_SWAP_THING_END,
+                cfg.MODEL.ZEG_FC.PROBABILITY_SWAP_STUFF,
+                cfg.MODEL.ZEG_FC.PROBABILITY_SWAP_STUFF_END,
+            ),
             hooks.LRScheduler(),
             hooks.PreciseBN(
                 # Run at the same freq as (but before) evaluation.

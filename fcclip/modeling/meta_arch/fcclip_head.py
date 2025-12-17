@@ -132,50 +132,85 @@ class FCCLIPHead(nn.Module):
             thing_mask = torch.cat([thing_mask, torch.zeros((B,1), dtype=thing_mask.dtype, device=thing_mask.device)], dim=1)  # (B,T)
         stuff_mask = ~thing_mask  # (T) or (B,T)
 
-        # Add bias if needed
-        if self.thing_stuff_adapter == "bias":
-            text_bias = torch.empty_like(text)
-            if thing_mask.any():
-                text_bias[thing_mask] = text[thing_mask] + self.thing_bias
-            if stuff_mask.any():
-                text_bias[stuff_mask] = text_b[stuff_mask] + self.stuff_bias
+        # Normalize text to (B,T,C) upfront to handle both Bias and RD logic uniformly
+        if text.dim() == 2:  # (T,C)
+            text_b = text.unsqueeze(0).expand(B, -1, -1)  # (B,T,C)
         else:
-            text_bias = text
-
-        # Normalize text to (B,T,C)
-        if text_bias.dim() == 2:  # (T,C)
-            T, C = text_bias.shape
-            text_b = text_bias.unsqueeze(0).expand(B, -1, -1)  # (B,T,C)
-        else:
-            B_t, T, C = text_bias.shape
+            B_t, T, C = text.shape
             assert B_t == B, "Batch size of text and img must match"
-            text_b = text_bias
+            text_b = text
+
+        # Add bias if needed
+        # Modified to handle all-thing or all-stuff cases (DDP fix)
+        if self.thing_stuff_adapter == "bias":
+            text_bias = text_b.clone()
+            
+            # Ensure masks are (B,T) for consistent indexing
+            if thing_mask.dim() == 1:
+                tm = thing_mask.unsqueeze(0).expand(B, -1)
+                sm = stuff_mask.unsqueeze(0).expand(B, -1)
+            else:
+                tm, sm = thing_mask, stuff_mask
+
+            if tm.any():
+                text_bias[tm] = text_b[tm] + self.thing_bias
+            else:
+                # Add 0 * param to graph if unused
+                text_bias = text_bias + 0.0 * self.thing_bias.sum()
+
+            if sm.any():
+                text_bias[sm] = text_b[sm] + self.stuff_bias
+            else:
+                # Add 0 * param to graph if unused
+                text_bias = text_bias + 0.0 * self.stuff_bias.sum()
+        else:
+            text_bias = text_b
 
         # Build base descriptor rd
         if self.use_rd:
             if text.dim() == 2:
                 # (T,C) × (B,C) → (B,T,C)
                 rd = einsum(text, img, "t c, b c -> b t c")
-                rd = torch.cat((rd, text_b), dim=-1)  # (B,T,2C)
+                rd = torch.cat((rd, text_bias), dim=-1)  # (B,T,2C)
             else:
                 # (B,T,C) × (B,C) → (B,T,C)
                 rd = einsum(text, img, "b t c, b c -> b t c")
-                rd = torch.cat((rd, text_b), dim=-1)  # (B,T,2C)
+                rd = torch.cat((rd, text_bias), dim=-1)  # (B,T,2C)
         else:
-            rd = text_b  # (B,T,C)
+            rd = text_bias  # (B,T,C)
 
         # Apply linear adapters
+        # Modified to handle all-thing or all-stuff cases (DDP fix)
         if self.thing_stuff_adapter == "linear":
+            T = rd.shape[1]
+            
             # Normalize thing_mask to (B,T) bool
             if thing_mask.dim() == 1:
-                thing_mask = thing_mask.bool().unsqueeze(0).expand(B, -1)  # (B,T)
-                stuff_mask = stuff_mask.bool().unsqueeze(0).expand(B, -1)  # (B,T)
+                tm = thing_mask.bool().unsqueeze(0).expand(B, -1)  # (B,T)
+                sm = stuff_mask.bool().unsqueeze(0).expand(B, -1)  # (B,T)
+            else:
+                tm = thing_mask.bool()
+                sm = stuff_mask.bool()
+
             # Per-type linear heads
             rd_out = torch.empty(B, T, self.clip_embedding_dim, device=rd.device, dtype=rd.dtype)
-            if thing_mask.any():
-                rd_out[thing_mask] = self.thing_class_embed(rd[thing_mask]).to(rd.dtype)
-            if stuff_mask.any():
-                rd_out[stuff_mask] = self.stuff_class_embed(rd[stuff_mask]).to(rd.dtype)
+            
+            if tm.any():
+                rd_out[tm] = self.thing_class_embed(rd[tm]).to(rd.dtype)
+            else:
+                # Fake computation for DDP
+                rd_out = rd_out + 0.0 * self.thing_class_embed.weight.sum()
+                if self.thing_class_embed.bias is not None:
+                    rd_out = rd_out + 0.0 * self.thing_class_embed.bias.sum()
+
+            if sm.any():
+                rd_out[sm] = self.stuff_class_embed(rd[sm]).to(rd.dtype)
+            else:
+                # Fake computation for DDP
+                rd_out = rd_out + 0.0 * self.stuff_class_embed.weight.sum()
+                if self.stuff_class_embed.bias is not None:
+                    rd_out = rd_out + 0.0 * self.stuff_class_embed.bias.sum()
+
         elif self.use_rd:
             # Shared linear head
             rd_out = self.class_embed(rd)

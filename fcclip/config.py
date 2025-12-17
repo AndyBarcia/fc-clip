@@ -159,5 +159,7 @@ def add_zegfc_config(cfg):
     cfg.MODEL.ZEG_FC.MASK_POS_MLP_TYPE = "none"  # Options: "none", "brpb", "rpb"
     cfg.MODEL.ZEG_FC.PROBABILITY_SWAP_THING = 0.0
     cfg.MODEL.ZEG_FC.PROBABILITY_SWAP_STUFF = 0.0
+    cfg.MODEL.ZEG_FC.PROBABILITY_SWAP_THING_END = 0.0
+    cfg.MODEL.ZEG_FC.PROBABILITY_SWAP_STUFF_END = 0.0
     cfg.MODEL.ZEG_FC.SEPARATE_THING_STUFF_MASK_EMBED = False
     cfg.MODEL.ZEG_FC.THING_STUFF_ADAPTER_TYPE = "none"  # Options: "linear", "bias", "none"
