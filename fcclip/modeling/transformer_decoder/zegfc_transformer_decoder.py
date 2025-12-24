@@ -224,6 +224,8 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         text_atnn_cls: bool,
         clip_embedding_dim: int,
         separate_thing_stuff_mask_embed: bool = False,
+        parameter_sharing: bool = True,
+        tbptl_no_grad_layers: int = 0,
     ):
         """
         NOTE: this interface is experimental.
@@ -245,6 +247,10 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
 
         assert mask_classification, "Only support mask classification model"
         self.mask_classification = mask_classification
+        self.hidden_dim = hidden_dim
+        self.parameter_sharing = parameter_sharing
+        self.tbptl_no_grad_layers = min(tbptl_no_grad_layers, dec_layers)
+        self._depth_embedding_cache = {}
 
         # positional encoding
         N_steps = hidden_dim // 2
@@ -281,7 +287,8 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         self.transformer_text_cross_attention_layers = nn.ModuleList()
         self.transformer_ffn_layers = nn.ModuleList()
 
-        for _ in range(self.num_layers):
+        layer_count = 1 if self.parameter_sharing else self.num_layers
+        for _ in range(layer_count):
             self.transformer_self_attention_layers.append(
                 SelfAttentionLayer(
                     d_model=hidden_dim,
@@ -422,6 +429,22 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         else:
             self.mask_pos_mlp = None
 
+    def _get_depth_embedding(self, depth_index: int, device, dtype):
+        key = (depth_index, device, dtype)
+        if key not in self._depth_embedding_cache:
+            half_dim = self.hidden_dim // 2
+            depth = torch.tensor(depth_index, device=device, dtype=dtype)
+            div_term = torch.exp(torch.arange(half_dim, device=device, dtype=dtype) * -(math.log(10000.0) / half_dim))
+            depth_emb = torch.zeros(self.hidden_dim, device=device, dtype=dtype)
+            depth_emb[0::2] = torch.sin(depth * div_term)
+            depth_emb[1::2] = torch.cos(depth * div_term)
+            self._depth_embedding_cache[key] = depth_emb
+        return self._depth_embedding_cache[key]
+
+    def _apply_depth_embedding(self, query_embed: Tensor, depth_index: int):
+        depth_embedding = self._get_depth_embedding(depth_index, query_embed.device, query_embed.dtype)
+        return query_embed + depth_embedding.unsqueeze(0).unsqueeze(1)
+
     @classmethod
     def from_config(cls, cfg, in_channels, mask_classification):
         ret = {}
@@ -456,6 +479,8 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         ret["self_attn_type"] = cfg.MODEL.ZEG_FC.SELF_ATTN_TYPE
         ret["mask_pos_mlp_type"] = cfg.MODEL.ZEG_FC.MASK_POS_MLP_TYPE
         ret["separate_thing_stuff_mask_embed"] = cfg.MODEL.ZEG_FC.SEPARATE_THING_STUFF_MASK_EMBED
+        ret["parameter_sharing"] = cfg.MODEL.ZEG_FC.PARAMETER_SHARING
+        ret["tbptl_no_grad_layers"] = cfg.MODEL.ZEG_FC.TBPTL_NO_GRAD_LAYERS
         return ret
 
     def forward(self, x, mask_features, mask = None, text_classifier=None, thing_mask=None, num_templates=None):
@@ -483,6 +508,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         query_embed = self.query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
         output = self.query_feat.weight.unsqueeze(1).repeat(1, bs, 1)
         query_bbox_unsigmoid = self.query_bbox.weight.unsqueeze(1).repeat(1, bs, 1) if self.query_bbox else None
+        base_query_embed = self._apply_depth_embedding(query_embed, 0)
 
         predictions_class = []
         predictions_mask = []
@@ -492,7 +518,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         if self.text_atnn_cls:
             output, text_attn_logits = self.intermediate_text_cross_attention_layer(
                 output, text_classifier,
-                query_pos=query_embed,
+                query_pos=base_query_embed,
                 return_attn_logits=self.text_atnn_cls
             )
         else:
@@ -516,6 +542,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
 
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
+            layer_query_embed = self._apply_depth_embedding(query_embed, i + 1)
             
             # Un-mask queries that are not paying attention to any pixels (Row check)
             query_sees_nothing = attn_mask.all(dim=2) # Shape: [B*Heads, Q]
@@ -527,62 +554,69 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                 pixel_seen_by_no_one = attn_mask.all(dim=1) # Shape: [B*Heads, HW]            
                 attn_mask[pixel_seen_by_no_one.unsqueeze(1).expand_as(attn_mask)] = False
 
-            # attention: cross-attention first
-            output, _ = self.transformer_cross_attention_layers[i](
-                output.transpose(0,1), # (B,Q,C)
-                src[level_index].transpose(0,1).view(bs, size_list[level_index][0], size_list[level_index][1], -1), # (B,H,W,C)
-                attn_mask=attn_mask.view(bs, self.num_heads, self.num_queries, size_list[level_index][0], size_list[level_index][1]), # (B, num_heads, Q, H,W)
-                memory_pos_emb=pos[level_index].transpose(0,1).view(bs, size_list[level_index][0], size_list[level_index][1], -1), # (B,H,W,C), 
-                query_pos_emb=query_embed.transpose(0,1), # (B,Q,C)
-                pos=query_bbox_unsigmoid.sigmoid().transpose(0,1) if query_bbox_unsigmoid is not None else None, # (B,Q,[x,y,w,j])
-            )
-            output = output.transpose(0,1) # (Q,B,C)
-
-            # then, text cross-attention
-            if self.text_attn:
-                output, text_attn_logits = self.transformer_text_cross_attention_layers[i](
-                    output, text_classifier,
-                    query_pos=query_embed,
-                    return_attn_logits=self.text_atnn_cls
+            grad_enabled = i >= self.tbptl_no_grad_layers
+            with torch.set_grad_enabled(grad_enabled):
+                # attention: cross-attention first
+                output, _ = self._get_decoder_layer(self.transformer_cross_attention_layers, i)(
+                    output.transpose(0,1), # (B,Q,C)
+                    src[level_index].transpose(0,1).view(bs, size_list[level_index][0], size_list[level_index][1], -1), # (B,H,W,C)
+                    attn_mask=attn_mask.view(bs, self.num_heads, self.num_queries, size_list[level_index][0], size_list[level_index][1]), # (B, num_heads, Q, H,W)
+                    memory_pos_emb=pos[level_index].transpose(0,1).view(bs, size_list[level_index][0], size_list[level_index][1], -1), # (B,H,W,C), 
+                    query_pos_emb=layer_query_embed.transpose(0,1), # (B,Q,C)
+                    pos=query_bbox_unsigmoid.sigmoid().transpose(0,1) if query_bbox_unsigmoid is not None else None, # (B,Q,[x,y,w,j])
                 )
-            else:
-                text_attn_logits = None
-            # then, self-attention
-            output, _ = self.transformer_self_attention_layers[i](
-                output.transpose(0,1), # (B,Q,C) 
-                pos_emb=query_embed.transpose(0,1), # # (B,Q,C) 
-                pos=query_bbox_unsigmoid.sigmoid().transpose(0,1) if query_bbox_unsigmoid is not None else None, # (B,Q,[x,y,w,j])
-            )
-            output = output.transpose(0,1) # (Q,B,C)
-            
-            # FFN
-            output = self.transformer_ffn_layers[i](
-                output
-            )
+                output = output.transpose(0,1) # (Q,B,C)
 
-            outputs_class, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
-                output, 
-                mask_features, 
-                text_attn_logits,
-                query_bbox_unsigmoid=query_bbox_unsigmoid,
-                attn_mask_size=size_list[i % self.num_feature_levels],
-                attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels],
-                text_classifier=text_classifier, 
-                thing_mask=thing_mask,
-                num_templates=num_templates
-            )
+                # then, text cross-attention
+                if self.text_attn:
+                    output, text_attn_logits = self._get_decoder_layer(self.transformer_text_cross_attention_layers, i)(
+                        output, text_classifier,
+                        query_pos=layer_query_embed,
+                        return_attn_logits=self.text_atnn_cls
+                    )
+                else:
+                    text_attn_logits = None
+                # then, self-attention
+                output, _ = self._get_decoder_layer(self.transformer_self_attention_layers, i)(
+                    output.transpose(0,1), # (B,Q,C) 
+                    pos_emb=layer_query_embed.transpose(0,1), # # (B,Q,C) 
+                    pos=query_bbox_unsigmoid.sigmoid().transpose(0,1) if query_bbox_unsigmoid is not None else None, # (B,Q,[x,y,w,j])
+                )
+                output = output.transpose(0,1) # (Q,B,C)
+                
+                # FFN
+                output = self._get_decoder_layer(self.transformer_ffn_layers, i)(
+                    output
+                )
+
+                outputs_class, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
+                    output, 
+                    mask_features, 
+                    text_attn_logits,
+                    query_bbox_unsigmoid=query_bbox_unsigmoid,
+                    attn_mask_size=size_list[i % self.num_feature_levels],
+                    attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels],
+                    text_classifier=text_classifier, 
+                    thing_mask=thing_mask,
+                    num_templates=num_templates
+                )
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
             predictions_bbox.append(output_box)
 
         assert len(predictions_class) == self.num_layers + 1
 
+        loss_start_idx = min(self.tbptl_no_grad_layers, self.num_layers) + 1
+        aux_predictions_class = predictions_class[loss_start_idx:] if self.mask_classification else None
+        aux_predictions_mask = predictions_mask[loss_start_idx:]
+        aux_predictions_bbox = predictions_bbox[loss_start_idx:]
+
         out = {
             'pred_logits': predictions_class[-1],
             'pred_masks': predictions_mask[-1],
             'pred_boxes': predictions_bbox[-1],
             'aux_outputs': self._set_aux_loss(
-                predictions_class if self.mask_classification else None, predictions_mask, predictions_bbox
+                aux_predictions_class if self.mask_classification else None, aux_predictions_mask, aux_predictions_bbox
             )
         }
         return out
@@ -662,6 +696,11 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         attn_mask = attn_mask.detach()
 
         return outputs_class, outputs_mask, outputs_bbox, query_bbox_unsigmoid_detached, attn_mask
+
+    def _get_decoder_layer(self, layers: nn.ModuleList, idx: int):
+        if self.parameter_sharing:
+            return layers[0]
+        return layers[idx]
 
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_seg_masks, outputs_bboxes):
