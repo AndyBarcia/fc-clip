@@ -163,3 +163,5 @@ def add_zegfc_config(cfg):
     cfg.MODEL.ZEG_FC.PROBABILITY_SWAP_STUFF_END = 0.0
     cfg.MODEL.ZEG_FC.SEPARATE_THING_STUFF_MASK_EMBED = False
     cfg.MODEL.ZEG_FC.THING_STUFF_ADAPTER_TYPE = "none"  # Options: "linear", "bias", "none"
+    cfg.MODEL.ZEG_FC.PARAMETER_SHARING = True
+    cfg.MODEL.ZEG_FC.TBPTL_NO_GRAD_LAYERS = 0
