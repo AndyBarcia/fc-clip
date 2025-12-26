@@ -150,6 +150,8 @@ def add_zegfc_config(cfg):
     cfg.MODEL.ZEG_FC.TEXT_ATTN = False
     cfg.MODEL.ZEG_FC.TEXT_ATTN_CLS = False
     cfg.MODEL.ZEG_FC.MEM_ATTN_MASK = False
+    cfg.MODEL.ZEG_FC.QUERY_H = 16
+    cfg.MODEL.ZEG_FC.QUERY_W = 16
     cfg.MODEL.ZEG_FC.MASK_EMBED_TYPE = "mlp"  # Options: "mlp", "linear"
     cfg.MODEL.ZEG_FC.CLASS_EMBED_TYPE = "mlp"  # Options: "mlp", "linear"
     cfg.MODEL.ZEG_FC.ATTN_CONV_KERNEL_SIZE = None

@@ -206,7 +206,8 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         mask_classification=True,
         *,
         hidden_dim: int,
-        num_queries: int,
+        query_h: int,
+        query_w: int,
         nheads: int,
         dim_feedforward: int,
         dec_layers: int,
@@ -231,7 +232,8 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             in_channels: channels of the input features
             mask_classification: whether to add mask classifier or not
             hidden_dim: Transformer feature dimension
-            num_queries: number of queries
+            query_h: number of query rows
+            query_w: number of query columns
             nheads: number of heads
             dim_feedforward: feature dimension in feedforward network
             enc_layers: number of Transformer encoder layers
@@ -252,8 +254,9 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         
         # Box regression module
         self.box_reg_type = box_reg_type
-        self.query_h = 16
-        self.query_w = 16
+        self.query_h = query_h
+        self.query_w = query_w
+        assert self.query_h > 0 and self.query_w > 0, "query_h and query_w must be positive"
         self.num_queries = self.query_h * self.query_w
         if self.box_reg_type == "mlp":
             self._bbox_embed = BBoxMLPRegression(hidden_dim)
@@ -429,7 +432,8 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         ret["mask_classification"] = mask_classification
         
         ret["hidden_dim"] = cfg.MODEL.MASK_FORMER.HIDDEN_DIM
-        ret["num_queries"] = cfg.MODEL.MASK_FORMER.NUM_OBJECT_QUERIES
+        ret["query_h"] = cfg.MODEL.ZEG_FC.QUERY_H
+        ret["query_w"] = cfg.MODEL.ZEG_FC.QUERY_W
         # Transformer parameters:
         ret["nheads"] = cfg.MODEL.MASK_FORMER.NHEADS
         ret["dim_feedforward"] = cfg.MODEL.MASK_FORMER.DIM_FEEDFORWARD
