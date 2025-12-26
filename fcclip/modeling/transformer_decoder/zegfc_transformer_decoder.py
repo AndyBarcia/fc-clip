@@ -355,6 +355,8 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
 
         # 2D query grid
         self.query_pos_embed = PositionEmbeddingSine(hidden_dim // 2, normalize=True)
+        self.query_feat_proj = Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
+        weight_init.c2_xavier_fill(self.query_feat_proj)
 
         # level embedding (we always use 3 scales)
         self.num_feature_levels = 3
@@ -488,7 +490,10 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         areas = [h * w for h, w in size_list]
         low_res_level = areas.index(min(areas))
         low_res_feat = self.input_proj[low_res_level](x[low_res_level])
-        query_feat = F.interpolate(low_res_feat, size=(self.query_h, self.query_w), mode="bilinear", align_corners=False)
+        query_feat = F.adaptive_avg_pool2d(
+            self.query_feat_proj(low_res_feat),
+            output_size=(self.query_h, self.query_w),
+        )
         query_pos_map = self.query_pos_embed(query_feat, None)
         # maintain 2D spatial structure (Hq, Wq, B, C)
         query_embed = query_pos_map.permute(2, 3, 0, 1)
