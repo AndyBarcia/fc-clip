@@ -8,7 +8,7 @@ Reference: https://github.com/facebookresearch/Mask2Former/blob/main/mask2former
 import math
 import logging
 import fvcore.nn.weight_init as weight_init
-from typing import Optional
+from typing import Optional, Tuple, Union
 import numpy as np
 import torch
 from torch import nn, Tensor
@@ -40,6 +40,152 @@ from .pos_mlp_bias.functions import (
     PosMLPSelfAttention,
     PosMLP
 )
+
+
+def _find_multiple(n: int, k: int) -> int:
+    return int(math.ceil(n / k) * k)
+
+
+class Conv2dSwiGLU(nn.Module):
+    """
+    NHWC variant of ConvSwiGLU:
+      x: (B, H, W, C)
+      out: (B, H, W, C)
+
+    Uses:
+      gate_up_proj: Linear(C -> 2*inter)
+      SwiGLU: silu(gate) * up
+      depthwise Conv2d over spatial dims (H, W) in expanded space (inter channels)
+      down_proj: Linear(inter -> C)
+    """
+    def __init__(
+        self,
+        hidden_size: int,
+        expansion: float,
+        conv_kernel: Union[int, Tuple[int, int]] = 2,
+        intermediate_size: Optional[int] = None,
+    ):
+        super().__init__()
+
+        inter = (
+            intermediate_size
+            if intermediate_size is not None
+            else _find_multiple(round(expansion * hidden_size * 2 / 3), 256)
+        )
+        self.inter = inter
+
+        # Produces (gate, up) packed along the last dim
+        self.gate_up_proj = nn.Linear(hidden_size, inter * 2, bias=False)
+
+        # Depthwise Conv2d expects NCHW, so we will permute in forward
+        if isinstance(conv_kernel, int):
+            kH, kW = conv_kernel, conv_kernel
+        else:
+            kH, kW = conv_kernel
+
+        pH, pW = kH // 2, kW // 2
+
+        self.dwconv = nn.Conv2d(
+            in_channels=inter,
+            out_channels=inter,
+            kernel_size=(kH, kW),
+            padding=(pH, pW),
+            groups=inter,   # depthwise
+            bias=True,
+        )
+
+        self.act = nn.SiLU()
+        self.down_proj = nn.Linear(inter, hidden_size, bias=False)
+
+    def forward(self, x: torch.Tensor, timer: Optional[object] = None, prefix: str = ""):
+        """
+        x: (B, H, W, C)
+        """
+        B, H, W, C = x.shape
+
+        # (B, H, W, 2*inter) -> two tensors (B, H, W, inter)
+        gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+
+        # SwiGLU
+        x_ffn = F.silu(gate) * up  # (B, H, W, inter)
+
+        # Conv2d expects (B, inter, H, W)
+        x_nchw = x_ffn.permute(0, 3, 1, 2)  # (B, inter, H, W)
+        x_conv = self.dwconv(x_nchw)  # (B, inter, H_out, W_out)
+
+        # If kernel is even, padding=(k//2) yields H_out = H+1 (same for W).
+        # Slice back to original spatial size.
+        x_conv = x_conv[:, :, :H, :W]
+
+        x_conv = self.act(x_conv)
+
+        # Back to NHWC: (B, H, W, inter)
+        x_conv = x_conv.permute(0, 2, 3, 1).contiguous()
+
+        # Project back to hidden size: (B, H, W, C)
+        x_out = self.down_proj(x_conv)
+        return x_out
+
+
+class Conv2dSwiGLUFFNLayer(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        dim_feedforward: int = 2048,
+        dropout: float = 0.0,
+        normalize_before: bool = False,
+        query_h: int = 1,
+        query_w: int = 1,
+        conv_kernel: Union[int, Tuple[int, int]] = 2,
+    ):
+        super().__init__()
+        self.query_h = query_h
+        self.query_w = query_w
+        self.normalize_before = normalize_before
+
+        self.ffn = Conv2dSwiGLU(
+            hidden_size=d_model,
+            expansion=dim_feedforward / d_model,
+            conv_kernel=conv_kernel,
+            intermediate_size=dim_feedforward,
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(d_model)
+
+    def _reshape_to_grid(self, tgt: Tensor) -> Tensor:
+        num_queries, bs, dim = tgt.shape
+        expected = self.query_h * self.query_w
+        if num_queries != expected:
+            raise ValueError(
+                f"Expected {expected} queries to reshape into ({self.query_h}, {self.query_w}) grid, "
+                f"but got {num_queries}."
+            )
+        return tgt.transpose(0, 1).reshape(bs, self.query_h, self.query_w, dim)
+
+    def _reshape_to_sequence(self, tgt: Tensor) -> Tensor:
+        bs, h, w, dim = tgt.shape
+        return tgt.reshape(bs, h * w, dim).transpose(0, 1)
+
+    def forward_post(self, tgt: Tensor) -> Tensor:
+        tgt_grid = self._reshape_to_grid(tgt)
+        tgt_ffn = self.ffn(tgt_grid)
+        tgt_ffn = self._reshape_to_sequence(tgt_ffn)
+        tgt = tgt + self.dropout(tgt_ffn)
+        tgt = self.norm(tgt)
+        return tgt
+
+    def forward_pre(self, tgt: Tensor) -> Tensor:
+        tgt2 = self.norm(tgt)
+        tgt_grid = self._reshape_to_grid(tgt2)
+        tgt_ffn = self.ffn(tgt_grid)
+        tgt_ffn = self._reshape_to_sequence(tgt_ffn)
+        tgt = tgt + self.dropout(tgt_ffn)
+        return tgt
+
+    def forward(self, tgt: Tensor) -> Tensor:
+        if self.normalize_before:
+            return self.forward_pre(tgt)
+        return self.forward_post(tgt)
 
 
 class TextCrossAttentionLayer(nn.Module):
@@ -210,6 +356,8 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         query_w: int,
         nheads: int,
         dim_feedforward: int,
+        ffn_type: str = "mlp",
+        ffn_conv_kernel_size: int = 2,
         dec_layers: int,
         pre_norm: bool,
         mask_dim: int,
@@ -278,6 +426,8 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         # Attention type
         self.self_attn_type = self_attn_type
         self.cross_attn_type = cross_attn_type
+        self.ffn_type = ffn_type
+        self.ffn_conv_kernel_size = ffn_conv_kernel_size
 
         # define Transformer decoder here
         self.num_heads = nheads
@@ -342,14 +492,26 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                     )
                 )
 
-            self.transformer_ffn_layers.append(
-                FFNLayer(
+            if self.ffn_type == "mlp":
+                ffn_layer = FFNLayer(
                     d_model=hidden_dim,
                     dim_feedforward=dim_feedforward,
                     dropout=0.0,
                     normalize_before=pre_norm,
                 )
-            )
+            elif self.ffn_type == "conv2d_swiglu":
+                ffn_layer = Conv2dSwiGLUFFNLayer(
+                    d_model=hidden_dim,
+                    dim_feedforward=dim_feedforward,
+                    dropout=0.0,
+                    normalize_before=pre_norm,
+                    query_h=self.query_h,
+                    query_w=self.query_w,
+                    conv_kernel=self.ffn_conv_kernel_size,
+                )
+            else:
+                raise ValueError(f"Unknown ffn_type: {self.ffn_type}")
+            self.transformer_ffn_layers.append(ffn_layer)
 
         self.decoder_norm = nn.LayerNorm(hidden_dim)
 
@@ -439,6 +601,8 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         # Transformer parameters:
         ret["nheads"] = cfg.MODEL.MASK_FORMER.NHEADS
         ret["dim_feedforward"] = cfg.MODEL.MASK_FORMER.DIM_FEEDFORWARD
+        ret["ffn_type"] = cfg.MODEL.ZEG_FC.FFN_TYPE
+        ret["ffn_conv_kernel_size"] = cfg.MODEL.ZEG_FC.FFN_CONV_KERNEL_SIZE
 
         # NOTE: because we add learnable query features which requires supervision,
         # we add minus 1 to decoder layers to be consistent with our loss
