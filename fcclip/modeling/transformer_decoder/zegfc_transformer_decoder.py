@@ -46,12 +46,6 @@ def _find_multiple(n: int, k: int) -> int:
     return int(math.ceil(n / k) * k)
 
 
-class CastedLinear(nn.Linear):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = F.linear(x.to(self.weight.dtype), self.weight, self.bias)
-        return out.to(x.dtype) if out.dtype != x.dtype else out
-
-
 class Conv2dSwiGLU(nn.Module):
     """
     NHWC variant of ConvSwiGLU:
@@ -70,7 +64,6 @@ class Conv2dSwiGLU(nn.Module):
         expansion: float,
         conv_kernel: Union[int, Tuple[int, int]] = 2,
         intermediate_size: Optional[int] = None,
-        conv_dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
 
@@ -82,7 +75,7 @@ class Conv2dSwiGLU(nn.Module):
         self.inter = inter
 
         # Produces (gate, up) packed along the last dim
-        self.gate_up_proj = CastedLinear(hidden_size, inter * 2, bias=False)
+        self.gate_up_proj = nn.Linear(hidden_size, inter * 2, bias=False)
 
         # Depthwise Conv2d expects NCHW, so we will permute in forward
         if isinstance(conv_kernel, int):
@@ -99,10 +92,10 @@ class Conv2dSwiGLU(nn.Module):
             padding=(pH, pW),
             groups=inter,   # depthwise
             bias=True,
-        ).to(dtype=conv_dtype)
+        )
 
         self.act = nn.SiLU()
-        self.down_proj = CastedLinear(inter, hidden_size, bias=False)
+        self.down_proj = nn.Linear(inter, hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor, timer: Optional[object] = None, prefix: str = ""):
         """
@@ -117,7 +110,7 @@ class Conv2dSwiGLU(nn.Module):
         x_ffn = F.silu(gate) * up  # (B, H, W, inter)
 
         # Conv2d expects (B, inter, H, W)
-        x_nchw = x_ffn.permute(0, 3, 1, 2).to(self.dwconv.weight.dtype)  # (B, inter, H, W)
+        x_nchw = x_ffn.permute(0, 3, 1, 2)  # (B, inter, H, W)
         x_conv = self.dwconv(x_nchw)  # (B, inter, H_out, W_out)
 
         # If kernel is even, padding=(k//2) yields H_out = H+1 (same for W).
@@ -144,7 +137,6 @@ class Conv2dSwiGLUFFNLayer(nn.Module):
         query_h: int = 1,
         query_w: int = 1,
         conv_kernel: Union[int, Tuple[int, int]] = 2,
-        conv_dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
         self.query_h = query_h
@@ -156,7 +148,6 @@ class Conv2dSwiGLUFFNLayer(nn.Module):
             expansion=dim_feedforward / d_model,
             conv_kernel=conv_kernel,
             intermediate_size=dim_feedforward,
-            conv_dtype=conv_dtype,
         )
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(d_model)
@@ -178,7 +169,7 @@ class Conv2dSwiGLUFFNLayer(nn.Module):
     def forward_post(self, tgt: Tensor) -> Tensor:
         tgt_grid = self._reshape_to_grid(tgt)
         tgt_ffn = self.ffn(tgt_grid)
-        tgt_ffn = self._reshape_to_sequence(tgt_ffn).to(tgt.dtype)
+        tgt_ffn = self._reshape_to_sequence(tgt_ffn)
         tgt = tgt + self.dropout(tgt_ffn)
         tgt = self.norm(tgt)
         return tgt
@@ -187,7 +178,7 @@ class Conv2dSwiGLUFFNLayer(nn.Module):
         tgt2 = self.norm(tgt)
         tgt_grid = self._reshape_to_grid(tgt2)
         tgt_ffn = self.ffn(tgt_grid)
-        tgt_ffn = self._reshape_to_sequence(tgt_ffn).to(tgt.dtype)
+        tgt_ffn = self._reshape_to_sequence(tgt_ffn)
         tgt = tgt + self.dropout(tgt_ffn)
         return tgt
 
@@ -367,7 +358,6 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         dim_feedforward: int,
         ffn_type: str = "mlp",
         ffn_conv_kernel_size: int = 2,
-        ffn_conv_dtype: torch.dtype = torch.bfloat16,
         dec_layers: int,
         pre_norm: bool,
         mask_dim: int,
@@ -438,7 +428,6 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         self.cross_attn_type = cross_attn_type
         self.ffn_type = ffn_type
         self.ffn_conv_kernel_size = ffn_conv_kernel_size
-        self.ffn_conv_dtype = ffn_conv_dtype
 
         # define Transformer decoder here
         self.num_heads = nheads
@@ -519,7 +508,6 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                     query_h=self.query_h,
                     query_w=self.query_w,
                     conv_kernel=self.ffn_conv_kernel_size,
-                    conv_dtype=self.ffn_conv_dtype,
                 )
             else:
                 raise ValueError(f"Unknown ffn_type: {self.ffn_type}")
@@ -615,12 +603,6 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         ret["dim_feedforward"] = cfg.MODEL.MASK_FORMER.DIM_FEEDFORWARD
         ret["ffn_type"] = cfg.MODEL.ZEG_FC.FFN_TYPE
         ret["ffn_conv_kernel_size"] = cfg.MODEL.ZEG_FC.FFN_CONV_KERNEL_SIZE
-        ffn_conv_dtype = cfg.MODEL.ZEG_FC.FFN_CONV_DTYPE
-        if isinstance(ffn_conv_dtype, str):
-            if not hasattr(torch, ffn_conv_dtype):
-                raise ValueError(f"Unsupported dtype string for FFN convolution: {ffn_conv_dtype}")
-            ffn_conv_dtype = getattr(torch, ffn_conv_dtype)
-        ret["ffn_conv_dtype"] = ffn_conv_dtype
 
         # NOTE: because we add learnable query features which requires supervision,
         # we add minus 1 to decoder layers to be consistent with our loss
