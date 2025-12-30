@@ -518,12 +518,12 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             text_attn_logits = None
 
         # prediction heads on learnable query features
-        outputs_class, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
+        outputs_class, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask, self_attn_mask = self.forward_prediction_heads(
             output.flatten(0, 1), 
             mask_features,
             text_attn_logits,
             query_bbox_unsigmoid=query_bbox_unsigmoid,
-            attn_mask_size=size_list[0],
+            attn_mask_size=(self.query_h, self.query_w),
             attn_mask_target_size=size_list[0],
             text_classifier=text_classifier, 
             thing_mask=thing_mask,
@@ -540,6 +540,10 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             # Un-mask queries that are not paying attention to any pixels (Row check)
             query_sees_nothing = attn_mask.all(dim=2) # Shape: [B*Heads, Q]
             attn_mask[query_sees_nothing.unsqueeze(2).expand_as(attn_mask)] = False
+            if self_attn_mask is not None:
+                self_attn_mask[query_sees_nothing.unsqueeze(2).expand_as(self_attn_mask)] = False
+                self_query_sees_nothing = self_attn_mask.all(dim=2)
+                self_attn_mask[self_query_sees_nothing.unsqueeze(2).expand_as(self_attn_mask)] = False
 
             # When using SlotAttention, Un-mask pixels that are not being attended to 
             # by any query (Column check)
@@ -572,6 +576,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             # then, self-attention
             output_flat, _ = self.transformer_self_attention_layers[i](
                 output_flat.transpose(0,1), # (B,Q,C) 
+                tgt_mask=self_attn_mask,
                 pos_emb=query_embed_flat.transpose(0,1), # # (B,Q,C) 
                 pos=query_bbox_unsigmoid.sigmoid().transpose(0,1) if query_bbox_unsigmoid is not None else None, # (B,Q,[x,y,w,j])
             )
@@ -582,12 +587,12 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                 output_flat
             )
 
-            outputs_class, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
+            outputs_class, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask, self_attn_mask = self.forward_prediction_heads(
                 output_flat, 
                 mask_features, 
                 text_attn_logits,
                 query_bbox_unsigmoid=query_bbox_unsigmoid,
-                attn_mask_size=size_list[i % self.num_feature_levels],
+                attn_mask_size=(self.query_h, self.query_w),
                 attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels],
                 text_classifier=text_classifier, 
                 thing_mask=thing_mask,
@@ -676,6 +681,12 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         class_embed = self.class_embed(maskpool_embeddings + decoder_output)
         outputs_class = get_classification_logits(class_embed, text_classifier, self.logit_scale, num_templates, text_attn_logits)
 
+        # Self-attention mask on the query grid resolution
+        self_attn_mask = F.interpolate(outputs_mask, size=attn_mask_size, mode="bilinear", align_corners=False)
+        self_attn_mask = (self_attn_mask.sigmoid().flatten(2) < 0.5).bool()
+        self_attn_mask = self_attn_mask.unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0, 1)
+        self_attn_mask = self_attn_mask.detach()
+
         # NOTE: prediction is of higher-resolution
         # [B, Q, H, W] -> [B, Q, H*W] -> [B, h, Q, H*W] -> [B*h, Q, HW]
         attn_mask = F.interpolate(outputs_mask, size=attn_mask_target_size, mode="bilinear", align_corners=False)
@@ -684,7 +695,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         attn_mask = (attn_mask.sigmoid().flatten(2).unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0, 1) < 0.5).bool()
         attn_mask = attn_mask.detach()
 
-        return outputs_class, outputs_mask, outputs_bbox, query_bbox_unsigmoid_detached, attn_mask
+        return outputs_class, outputs_mask, outputs_bbox, query_bbox_unsigmoid_detached, attn_mask, self_attn_mask
 
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_seg_masks, outputs_bboxes):
