@@ -41,6 +41,31 @@ from .pos_mlp_bias.functions import (
     PosMLP
 )
 
+def build_attn_mask_maxpool(outputs_mask, attn_mask_target_size, num_heads, thresh=0.5):
+    """
+    outputs_mask: [B, Q, H, W] (mask logits at higher resolution)
+    attn_mask_target_size: (h, w) target spatial size for cross-attn keys
+    returns: Bool attn_mask [B*num_heads, Q, h*w], where True = blocked
+    """
+    B, Q, H, W = outputs_mask.shape
+    h, w = attn_mask_target_size
+
+    # 1) convert logits -> probs, then max-pool down to (h, w)
+    probs = outputs_mask.sigmoid()                          # [B, Q, H, W]
+    x = probs.view(B * Q, 1, H, W)                          # [B*Q, 1, H, W]
+    pooled = F.adaptive_max_pool2d(x, output_size=(h, w))   # [B*Q, 1, h, w]
+    pooled = pooled.view(B, Q, h, w)                        # [B, Q, h, w]
+
+    # 2) build per-head boolean mask (True = NOT allowed to attend)
+    attn_mask = (pooled.flatten(2) < thresh)                # [B, Q, h*w]
+    attn_mask = attn_mask.unsqueeze(1).repeat(1, num_heads, 1, 1)  # [B, heads, Q, h*w]
+    attn_mask = attn_mask.flatten(0, 1).bool()              # [B*heads, Q, h*w]
+
+    # 3) safety valve (Mask2Former-style): if a query blocks everything, allow all
+    all_blocked = attn_mask.sum(-1) == attn_mask.shape[-1]
+    attn_mask[all_blocked] = False
+
+    return attn_mask.detach()
 
 class TextCrossAttentionLayer(nn.Module):
 
@@ -676,13 +701,12 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         class_embed = self.class_embed(maskpool_embeddings + decoder_output)
         outputs_class = get_classification_logits(class_embed, text_classifier, self.logit_scale, num_templates, text_attn_logits)
 
-        # NOTE: prediction is of higher-resolution
-        # [B, Q, H, W] -> [B, Q, H*W] -> [B, h, Q, H*W] -> [B*h, Q, HW]
-        attn_mask = F.interpolate(outputs_mask, size=attn_mask_target_size, mode="bilinear", align_corners=False)
-        # must use bool type
-        # If a BoolTensor is provided, positions with ``True`` are not allowed to attend while ``False`` values will be unchanged.
-        attn_mask = (attn_mask.sigmoid().flatten(2).unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0, 1) < 0.5).bool()
-        attn_mask = attn_mask.detach()
+        attn_mask = build_attn_mask_maxpool(
+            outputs_mask, 
+            attn_mask_target_size, 
+            self.num_heads,
+            thresh=0.5
+        )
 
         return outputs_class, outputs_mask, outputs_bbox, query_bbox_unsigmoid_detached, attn_mask
 
