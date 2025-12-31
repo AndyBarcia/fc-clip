@@ -122,13 +122,20 @@ class HungarianMatcher(nn.Module):
 
                 if spatial_mask is not None:
                     spatial_mask = spatial_mask.to(device=cost_mask.device)
-                    invalid_pairs = ~spatial_mask
-                    inf = torch.tensor(float("inf"), device=cost_mask.device, dtype=cost_mask.dtype)
-                    cost_mask = cost_mask.masked_fill(invalid_pairs, inf)
-                    cost_dice = cost_dice.masked_fill(invalid_pairs, inf)
-                    cost_class = cost_class.masked_fill(
-                        invalid_pairs, torch.tensor(float("inf"), device=cost_class.device, dtype=cost_class.dtype)
-                    )
+                    has_valid_query = spatial_mask.any(dim=0)  # [num_targets]
+                    if has_valid_query.any():
+                        # Only mask columns that have at least one valid query so that
+                        # the assignment stays feasible. For targets with no valid query,
+                        # we leave the original costs untouched (global competition).
+                        invalid_pairs = ~spatial_mask
+                        invalid_pairs = invalid_pairs * has_valid_query.unsqueeze(0)
+                        inf = torch.tensor(float("inf"), device=cost_mask.device, dtype=cost_mask.dtype)
+                        cost_mask = cost_mask.masked_fill(invalid_pairs, inf)
+                        cost_dice = cost_dice.masked_fill(invalid_pairs, inf)
+                        cost_class = cost_class.masked_fill(
+                            invalid_pairs,
+                            torch.tensor(float("inf"), device=cost_class.device, dtype=cost_class.dtype),
+                        )
 
                 # Final cost matrix
                 C = (
