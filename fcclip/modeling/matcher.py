@@ -51,13 +51,15 @@ class HungarianMatcher(nn.Module):
     while the others are un-matched (and thus treated as non-objects).
     """
 
-    def __init__(self, cost_class: float = 1, cost_mask: float = 1, cost_dice: float = 1, num_points: int = 0):
+    def __init__(self, cost_class: float = 1, cost_mask: float = 1, cost_dice: float = 1, num_points: int = 0, query_h: int = None, query_w: int = None):
         """Creates the matcher
 
         Params:
             cost_class: This is the relative weight of the classification error in the matching cost
             cost_mask: This is the relative weight of the focal loss of the binary mask in the matching cost
             cost_dice: This is the relative weight of the dice loss of the binary mask in the matching cost
+            query_h: Number of query rows (required for spatially grounded matching)
+            query_w: Number of query columns (required for spatially grounded matching)
         """
         super().__init__()
         self.cost_class = cost_class
@@ -67,6 +69,10 @@ class HungarianMatcher(nn.Module):
         assert cost_class != 0 or cost_mask != 0 or cost_dice != 0, "all costs cant be 0"
 
         self.num_points = num_points
+        self.query_h = query_h
+        self.query_w = query_w
+        if (self.query_h is None) != (self.query_w is None):
+            raise ValueError("query_h and query_w must be both set or both None")
 
     @torch.no_grad()
     def memory_efficient_forward(self, outputs, targets):
@@ -90,6 +96,17 @@ class HungarianMatcher(nn.Module):
                 target_counts, block_area, H_t, W_t = compute_mask_block_counts(
                     tgt_mask, out_mask.shape[-2:]
                 )
+                spatial_mask = None
+                if self.query_h is not None and self.query_w is not None:
+                    if num_queries != self.query_h * self.query_w:
+                        raise ValueError(
+                            f"Number of queries ({num_queries}) does not match query grid "
+                            f"({self.query_h}x{self.query_w})."
+                        )
+                    query_block_counts, _, _, _ = compute_mask_block_counts(
+                        tgt_mask, (self.query_h, self.query_w)
+                    )
+                    spatial_mask = (query_block_counts > 0).transpose(0, 1)
                 out_mask = out_mask.flatten(1)
                 target_counts = target_counts.to(device=out_mask.device, dtype=out_mask.dtype)
 
@@ -102,6 +119,23 @@ class HungarianMatcher(nn.Module):
                     )
                     # Compute the dice loss between masks
                     cost_dice = batch_dice_loss(out_mask, target_counts, block_area)
+
+                if spatial_mask is not None:
+                    spatial_mask = spatial_mask.to(device=cost_mask.device)
+                    has_valid_query = spatial_mask.any(dim=0)  # [num_targets]
+                    if has_valid_query.any():
+                        # Only mask columns that have at least one valid query so that
+                        # the assignment stays feasible. For targets with no valid query,
+                        # we leave the original costs untouched (global competition).
+                        invalid_pairs = ~spatial_mask
+                        invalid_pairs = invalid_pairs * has_valid_query.unsqueeze(0)
+                        inf = torch.tensor(float("inf"), device=cost_mask.device, dtype=cost_mask.dtype)
+                        cost_mask = cost_mask.masked_fill(invalid_pairs, inf)
+                        cost_dice = cost_dice.masked_fill(invalid_pairs, inf)
+                        cost_class = cost_class.masked_fill(
+                            invalid_pairs,
+                            torch.tensor(float("inf"), device=cost_class.device, dtype=cost_class.dtype),
+                        )
 
                 # Final cost matrix
                 C = (
@@ -155,6 +189,8 @@ class HungarianMatcher(nn.Module):
             "cost_class: {}".format(self.cost_class),
             "cost_mask: {}".format(self.cost_mask),
             "cost_dice: {}".format(self.cost_dice),
+            "query_h: {}".format(self.query_h),
+            "query_w: {}".format(self.query_w),
         ]
         lines = [head] + [" " * _repr_indent + line for line in body]
         return "\n".join(lines)

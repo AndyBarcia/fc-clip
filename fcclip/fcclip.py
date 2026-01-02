@@ -266,6 +266,8 @@ class FCCLIP(nn.Module):
             cost_mask=mask_weight,
             cost_dice=dice_weight,
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
+            query_h=cfg.MODEL.ZEG_FC.QUERY_H,
+            query_w=cfg.MODEL.ZEG_FC.QUERY_W,
         )
 
         weight_dict = {
