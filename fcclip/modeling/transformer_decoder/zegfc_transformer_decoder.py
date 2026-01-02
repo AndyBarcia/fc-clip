@@ -543,7 +543,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             text_attn_logits = None
 
         # prediction heads on learnable query features
-        outputs_class, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
+        outputs_class, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask, attn_mask_serial = self.forward_prediction_heads(
             output.flatten(0, 1), 
             mask_features,
             text_attn_logits,
@@ -597,6 +597,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             # then, self-attention
             output_flat, _ = self.transformer_self_attention_layers[i](
                 output_flat.transpose(0,1), # (B,Q,C) 
+                tgt_mask=attn_mask_serial,
                 pos_emb=query_embed_flat.transpose(0,1), # # (B,Q,C) 
                 pos=query_bbox_unsigmoid.sigmoid().transpose(0,1) if query_bbox_unsigmoid is not None else None, # (B,Q,[x,y,w,j])
             )
@@ -607,7 +608,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                 output_flat
             )
 
-            outputs_class, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
+            outputs_class, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask, attn_mask_serial = self.forward_prediction_heads(
                 output_flat, 
                 mask_features, 
                 text_attn_logits,
@@ -708,7 +709,21 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             thresh=0.5
         )
 
-        return outputs_class, outputs_mask, outputs_bbox, query_bbox_unsigmoid_detached, attn_mask
+        attn_mask_serial = build_attn_mask_maxpool(
+            outputs_mask,
+            (self.query_h, self.query_w),
+            self.num_heads,
+            thresh=0.5
+        )
+
+        return (
+            outputs_class,
+            outputs_mask,
+            outputs_bbox,
+            query_bbox_unsigmoid_detached,
+            attn_mask,
+            attn_mask_serial,
+        )
 
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_seg_masks, outputs_bboxes):
