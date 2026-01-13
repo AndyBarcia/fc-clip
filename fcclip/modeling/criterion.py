@@ -68,6 +68,12 @@ class SetCriterion(nn.Module):
         )
         target_classes[idx] = target_classes_o
 
+        unmatched = target_classes == self.num_classes
+        if unmatched.any():
+            non_bg_logits = src_logits[..., :self.num_classes]
+            non_bg_logits = torch.where(unmatched.unsqueeze(-1), non_bg_logits.detach(), non_bg_logits)
+            src_logits = torch.cat([non_bg_logits, src_logits[..., self.num_classes:]], dim=-1)
+
         loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
         losses = {"loss_ce": loss_ce}
         return losses
