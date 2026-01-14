@@ -380,6 +380,17 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
 
         self.decoder_norm = nn.LayerNorm(hidden_dim)
 
+        self.query_init_type = query_init_type
+        if self.query_init_type not in {"avg_pool", "feature", "learned"}:
+            raise ValueError(f"Unknown query_init_type: {self.query_init_type}")
+        self.query_pos_init_type = query_pos_init_type
+        if self.query_pos_init_type not in {"learned", "sine"}:
+            raise ValueError(f"Unknown query_pos_init_type: {self.query_pos_init_type}")
+        
+        # Learned query features
+        if self.query_init_type == "learned":
+            self.query_feat = nn.Embedding(self.num_queries, hidden_dim)
+
         # 2D query grid
         self.query_pos_embed = PositionEmbeddingSine(hidden_dim // 2, normalize=True)
         if self.query_pos_init_type == "learned":
@@ -458,13 +469,6 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         else:
             self.mask_pos_mlp = None
 
-        self.query_init_type = query_init_type
-        if self.query_init_type not in {"avg_pool", "feature"}:
-            raise ValueError(f"Unknown query_init_type: {self.query_init_type}")
-        self.query_pos_init_type = query_pos_init_type
-        if self.query_pos_init_type not in {"learned", "sine"}:
-            raise ValueError(f"Unknown query_pos_init_type: {self.query_pos_init_type}")
-
     @classmethod
     def from_config(cls, cfg, in_channels, mask_classification):
         ret = {}
@@ -526,7 +530,13 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         _, bs, _ = src[0].shape
 
         # initialize 2D queries
-        if self.query_init_type == "avg_pool":
+        if self.query_init_type == "learned":
+            query_feat = self.query_feat.weight.view(self.query_h, self.query_w, -1)
+            output = query_feat.permute(0, 1, 2).unsqueeze(2).repeat(1, 1, bs, 1)
+            if self.query_pos_init_type == "sine":
+                query_pos_map = self.query_pos_embed(query_feat.unsqueeze(2), None)
+                query_embed = query_pos_map.permute(0, 1, 2).unsqueeze(2).repeat(1, 1, bs, 1)
+        elif self.query_init_type == "avg_pool":
             # choose the feature level with the smallest spatial size
             areas = [h * w for h, w in size_list]
             low_res_level = areas.index(min(areas))
@@ -553,9 +563,8 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                 thing_mask=thing_mask,
                 num_templates=num_templates,
             )
-            patch_scores = outputs_class.max(dim=-1).values
-            topk = min(self.num_queries, patch_scores.shape[1])
-            topk_indices = patch_scores.topk(topk, dim=1).indices
+            patch_scores = outputs_class[...,:-1].max(dim=-1).values
+            topk_indices = patch_scores.topk(self.num_queries, dim=1).indices
             patch_output = patch_output.permute(1, 0, 2)
             topk_features = torch.gather(
                 patch_output,
@@ -569,13 +578,6 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                     1,
                     topk_indices.unsqueeze(-1).expand(-1, -1, patch_pos.shape[-1]),
                 )
-            if topk < self.num_queries:
-                pad_count = self.num_queries - topk
-                pad_features = topk_features[:, -1:, :].repeat(1, pad_count, 1)
-                topk_features = torch.cat([topk_features, pad_features], dim=1)
-                if self.query_pos_init_type == "sine":
-                    pad_pos = topk_pos[:, -1:, :].repeat(1, pad_count, 1)
-                    topk_pos = torch.cat([topk_pos, pad_pos], dim=1)
             output = topk_features.permute(1, 0, 2).view(self.query_h, self.query_w, bs, -1)
             if self.query_pos_init_type == "sine":
                 query_embed = topk_pos.permute(1, 0, 2).view(self.query_h, self.query_w, bs, -1)
