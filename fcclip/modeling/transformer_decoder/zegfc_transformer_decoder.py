@@ -250,6 +250,8 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         text_atnn_cls: bool,
         clip_embedding_dim: int,
         separate_thing_stuff_mask_embed: bool = False,
+        query_init_type: str = "avg_pool",
+        query_pos_init_type: str = "learned",
     ):
         """
         NOTE: this interface is experimental.
@@ -378,8 +380,23 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
 
         self.decoder_norm = nn.LayerNorm(hidden_dim)
 
+        self.query_init_type = query_init_type
+        if self.query_init_type not in {"avg_pool", "feature", "learned"}:
+            raise ValueError(f"Unknown query_init_type: {self.query_init_type}")
+        self.query_pos_init_type = query_pos_init_type
+        if self.query_pos_init_type not in {"learned", "sine"}:
+            raise ValueError(f"Unknown query_pos_init_type: {self.query_pos_init_type}")
+        
+        # Learned query features
+        if self.query_init_type == "learned":
+            self.query_feat = nn.Embedding(self.num_queries, hidden_dim)
+
         # 2D query grid
         self.query_pos_embed = PositionEmbeddingSine(hidden_dim // 2, normalize=True)
+        if self.query_pos_init_type == "learned":
+            self.query_embed = nn.Embedding(self.num_queries, hidden_dim)
+        else:
+            self.query_embed = None
         self.query_feat_proj = Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
         weight_init.c2_xavier_fill(self.query_feat_proj)
 
@@ -461,6 +478,8 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         ret["hidden_dim"] = cfg.MODEL.MASK_FORMER.HIDDEN_DIM
         ret["query_h"] = cfg.MODEL.ZEG_FC.QUERY_H
         ret["query_w"] = cfg.MODEL.ZEG_FC.QUERY_W
+        ret["query_init_type"] = cfg.MODEL.ZEG_FC.QUERY_INIT_TYPE
+        ret["query_pos_init_type"] = cfg.MODEL.ZEG_FC.QUERY_POS_INIT_TYPE
         # Transformer parameters:
         ret["nheads"] = cfg.MODEL.MASK_FORMER.NHEADS
         ret["dim_feedforward"] = cfg.MODEL.MASK_FORMER.DIM_FEEDFORWARD
@@ -510,19 +529,61 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
 
         _, bs, _ = src[0].shape
 
-        # initialize 2D queries from the lowest-resolution feature map
-        # choose the feature level with the smallest spatial size
-        areas = [h * w for h, w in size_list]
-        low_res_level = areas.index(min(areas))
-        low_res_feat = self.input_proj[low_res_level](x[low_res_level])
-        query_feat = F.adaptive_avg_pool2d(
-            self.query_feat_proj(low_res_feat),
-            output_size=(self.query_h, self.query_w),
-        )
-        query_pos_map = self.query_pos_embed(query_feat, None)
-        # maintain 2D spatial structure (Hq, Wq, B, C)
-        query_embed = query_pos_map.permute(2, 3, 0, 1)
-        output = query_feat.permute(2, 3, 0, 1)
+        # initialize 2D queries
+        if self.query_init_type == "learned":
+            query_feat = self.query_feat.weight.view(self.query_h, self.query_w, -1)
+            output = query_feat.permute(0, 1, 2).unsqueeze(2).repeat(1, 1, bs, 1)
+            if self.query_pos_init_type == "sine":
+                query_pos_map = self.query_pos_embed(query_feat.unsqueeze(2), None)
+                query_embed = query_pos_map.permute(0, 1, 2).unsqueeze(2).repeat(1, 1, bs, 1)
+        elif self.query_init_type == "avg_pool":
+            # choose the feature level with the smallest spatial size
+            areas = [h * w for h, w in size_list]
+            low_res_level = areas.index(min(areas))
+            low_res_feat = self.input_proj[low_res_level](x[low_res_level])
+            query_feat = F.adaptive_avg_pool2d(
+                self.query_feat_proj(low_res_feat),
+                output_size=(self.query_h, self.query_w),
+            )
+            output = query_feat.permute(2, 3, 0, 1)
+            if self.query_pos_init_type == "sine":
+                query_pos_map = self.query_pos_embed(query_feat, None)
+                query_embed = query_pos_map.permute(2, 3, 0, 1)
+        else:
+            patch_output = torch.cat(src, dim=0)
+            patch_pos = torch.cat(pos, dim=0)
+            outputs_class, _, _, _, _ = self.forward_prediction_heads(
+                patch_output,
+                mask_features,
+                None,
+                query_bbox_unsigmoid=None,
+                attn_mask_size=size_list[0],
+                attn_mask_target_size=size_list[0],
+                text_classifier=text_classifier,
+                thing_mask=thing_mask,
+                num_templates=num_templates,
+            )
+            patch_scores = outputs_class[...,:-1].max(dim=-1).values
+            topk_indices = patch_scores.topk(self.num_queries, dim=1).indices
+            patch_output = patch_output.permute(1, 0, 2)
+            topk_features = torch.gather(
+                patch_output,
+                1,
+                topk_indices.unsqueeze(-1).expand(-1, -1, patch_output.shape[-1]),
+            )
+            if self.query_pos_init_type == "sine":
+                patch_pos = patch_pos.permute(1, 0, 2)
+                topk_pos = torch.gather(
+                    patch_pos,
+                    1,
+                    topk_indices.unsqueeze(-1).expand(-1, -1, patch_pos.shape[-1]),
+                )
+            output = topk_features.permute(1, 0, 2).view(self.query_h, self.query_w, bs, -1)
+            if self.query_pos_init_type == "sine":
+                query_embed = topk_pos.permute(1, 0, 2).view(self.query_h, self.query_w, bs, -1)
+
+        if self.query_pos_init_type == "learned":
+            query_embed = self.query_embed.weight.view(self.query_h, self.query_w, 1, -1).repeat(1, 1, bs, 1)
         query_bbox_unsigmoid = self.query_bbox.weight.unsqueeze(1).repeat(1, bs, 1) if self.query_bbox else None
 
         predictions_class = []
