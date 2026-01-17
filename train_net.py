@@ -75,6 +75,7 @@ from fcclip import (
     MaskFormerPanopticDatasetMapper,
     MaskFormerSemanticDatasetMapper,
     SemanticSegmentorWithTTA,
+    ZSSemSegEvaluator,
     add_maskformer2_config,
     add_fcclip_config,
     add_zegfc_config,
@@ -398,6 +399,15 @@ class Trainer(DefaultTrainer):
                     output_dir=output_folder,
                 )
             )
+        elif evaluator_type in ["zs_sem_seg", "zs_ade20k_panoptic_seg"]:
+            evaluator_list.append(
+                ZSSemSegEvaluator(
+                    dataset_name,
+                    distributed=True,
+                    output_dir=output_folder,
+                )
+            )
+
         # instance segmentation
         if evaluator_type == "coco":
             evaluator_list.append(COCOEvaluator(dataset_name, output_dir=output_folder))
@@ -421,13 +431,30 @@ class Trainer(DefaultTrainer):
         # COCO
         if evaluator_type == "coco_panoptic_seg" and cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON:
             evaluator_list.append(COCOEvaluator(dataset_name, output_dir=output_folder))
-        if evaluator_type == "coco_panoptic_seg" and cfg.MODEL.MASK_FORMER.TEST.SEMANTIC_ON:
-            evaluator_list.append(SemSegEvaluator(dataset_name, distributed=True, output_dir=output_folder))
+        if evaluator_type in ["coco_panoptic_seg", "zs_coco_panoptic_seg"] and cfg.MODEL.MASK_FORMER.TEST.SEMANTIC_ON:
+            sem_seg_evaluator = (
+                ZSSemSegEvaluator
+                if evaluator_type == "zs_coco_panoptic_seg"
+                else SemSegEvaluator
+            )
+            evaluator_list.append(
+                sem_seg_evaluator(dataset_name, distributed=True, output_dir=output_folder)
+            )
         # Mapillary Vistas
         if evaluator_type == "mapillary_vistas_panoptic_seg" and cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON:
             evaluator_list.append(InstanceSegEvaluator(dataset_name, output_dir=output_folder))
-        if evaluator_type == "mapillary_vistas_panoptic_seg" and cfg.MODEL.MASK_FORMER.TEST.SEMANTIC_ON:
-            evaluator_list.append(SemSegEvaluator(dataset_name, distributed=True, output_dir=output_folder))
+        if evaluator_type in [
+            "mapillary_vistas_panoptic_seg",
+            "zs_mapillary_vistas_panoptic_seg",
+        ] and cfg.MODEL.MASK_FORMER.TEST.SEMANTIC_ON:
+            sem_seg_evaluator = (
+                ZSSemSegEvaluator
+                if evaluator_type == "zs_mapillary_vistas_panoptic_seg"
+                else SemSegEvaluator
+            )
+            evaluator_list.append(
+                sem_seg_evaluator(dataset_name, distributed=True, output_dir=output_folder)
+            )
         # Cityscapes
         if evaluator_type == "cityscapes_instance":
             assert (
