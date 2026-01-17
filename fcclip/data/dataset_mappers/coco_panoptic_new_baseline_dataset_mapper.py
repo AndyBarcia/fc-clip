@@ -142,6 +142,14 @@ class COCOPanopticNewBaselineDatasetMapper:
         # but not efficient on large generic data structures due to the use of pickle & mp.Queue.
         # Therefore it's important to use torch.Tensor.
         dataset_dict["image"] = torch.as_tensor(np.ascontiguousarray(image.transpose(2, 0, 1)))
+        
+        # semantic segmentation
+        if "sem_seg_file_name" in dataset_dict:
+            # PyTorch transformation not implemented for uint16, so converting it to double first
+            sem_seg_gt = utils.read_image(dataset_dict.pop("sem_seg_file_name")).astype("double")
+            # apply the same transformation to panoptic segmentation
+            sem_seg_gt = transforms.apply_segmentation(sem_seg_gt)
+            dataset_dict["sem_seg"] = sem_seg_gt.long()
 
         if "pan_seg_file_name" in dataset_dict:
             pan_seg_gt = utils.read_image(dataset_dict.pop("pan_seg_file_name"), "RGB")
@@ -170,25 +178,6 @@ class COCOPanopticNewBaselineDatasetMapper:
                 classes.append(class_id)
                 masks.append(mask)
 
-                """
-                if segment_info["isthing"]:
-                    classes.append(class_id)
-                    masks.append(mask)
-                else:
-                    # Split into connected components so that disjoint masks
-                    # become separate instances
-                    # connectedComponents uses 0 as background, 1..N as components
-                    num_labels, labels = cv2.connectedComponents(
-                        mask.astype(np.uint8)
-                    )
-
-                    # For each connected component, create a separate mask
-                    for label_id in range(1, num_labels):
-                        component_mask = labels == label_id
-                        if component_mask.any():
-                            classes.append(class_id)
-                            masks.append(component_mask)
-                """
 
             classes = np.array(classes)
             instances.gt_classes = torch.tensor(classes, dtype=torch.int64)

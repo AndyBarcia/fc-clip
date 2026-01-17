@@ -111,6 +111,7 @@ def register_ade20k_panoptic(
         panoptic_root=panoptic_root,
         image_root=image_root,
         panoptic_json=panoptic_json,
+        semantic_root=semantic_root,
         json_file=instances_json,
         evaluator_type="zs_ade20k_panoptic_seg",
         ignore_label=255,
@@ -348,23 +349,5 @@ def register_all_ade20k_panoptic(root):
             os.path.join(root, instance_json),
         )
 
-def register_all_ade20k_semantic(root):
-    root = os.path.join(root, "ADEChallengeData2016")
-    for name, dirname in [("train", "training"), ("val", "validation")]:
-        image_dir = os.path.join(root, "images", dirname)
-        gt_dir = os.path.join(root, "annotations_detectron2", dirname)
-        name = f"openvocab_ade20k_sem_seg_{name}"
-        DatasetCatalog.register(
-            name, lambda x=image_dir, y=gt_dir: load_sem_seg(y, x, gt_ext="png", image_ext="jpg")
-        )
-        MetadataCatalog.get(name).set(
-            stuff_classes=[x["name"] for x in ADE20K_150_CATEGORIES],
-            image_root=image_dir,
-            sem_seg_root=gt_dir,
-            evaluator_type="sem_seg",
-            ignore_label=255,
-        )
-
 _root = os.getenv("DETECTRON2_DATASETS", "datasets")
 register_all_ade20k_panoptic(_root)
-register_all_ade20k_semantic(_root)
