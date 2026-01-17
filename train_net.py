@@ -391,9 +391,14 @@ class Trainer(DefaultTrainer):
         evaluator_list = []
         evaluator_type = MetadataCatalog.get(dataset_name).evaluator_type
         # semantic segmentation
-        if evaluator_type in ["sem_seg", "ade20k_panoptic_seg"]:
+        if evaluator_type in ["sem_seg", "zs_sem_seg", "ade20k_panoptic_seg", "zs_ade20k_panoptic_seg"]:
+            sem_seg_evaluator = (
+                ZSSemSegEvaluator
+                if evaluator_type in ["zs_sem_seg", "zs_ade20k_panoptic_seg"]
+                else SemSegEvaluator
+            )
             evaluator_list.append(
-                SemSegEvaluator(
+                sem_seg_evaluator(
                     dataset_name,
                     distributed=True,
                     output_dir=output_folder,
