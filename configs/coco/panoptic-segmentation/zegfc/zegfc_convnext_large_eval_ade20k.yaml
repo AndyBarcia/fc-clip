@@ -14,6 +14,8 @@ MODEL:
     TEXT_ATTN: True
     TEXT_ATTN_CLS: True
     MEM_ATTN_MASK: True
+    QUERY_H: 16
+    QUERY_W: 16
   FC_CLIP:
     CLIP_MODEL_NAME: "convnext_large_d_320"
     CLIP_PRETRAINED_WEIGHTS: "laion2b_s29b_b131k_ft_soup"
@@ -22,7 +24,6 @@ MODEL:
     GEOMETRIC_ENSEMBLE_BETA: 0.8
   MASK_FORMER:
     TRANSFORMER_DECODER_NAME: "MultiScaleExtendedMaskedTransformerDecoder"
-    NUM_OBJECT_QUERIES: 250
     TEST:
       SEMANTIC_ON: True
       INSTANCE_ON: True

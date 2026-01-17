@@ -14,82 +14,10 @@ import torch.nn.functional as F
 from torch import nn
 
 from detectron2.utils.comm import get_world_size
-from detectron2.projects.point_rend.point_features import (
-    get_uncertain_point_coords_with_randomness,
-    point_sample,
-)
 
 from ..utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list
 from .transformer_decoder.box_regression import generalized_box_iou, box_cxcywh_to_xyxy
-
-
-def dice_loss(
-        inputs: torch.Tensor,
-        targets: torch.Tensor,
-        num_masks: float,
-    ):
-    """
-    Compute the DICE loss, similar to generalized IOU for masks
-    Args:
-        inputs: A float tensor of arbitrary shape.
-                The predictions for each example.
-        targets: A float tensor with the same shape as inputs. Stores the binary
-                 classification label for each element in inputs
-                (0 for the negative class and 1 for the positive class).
-    """
-    inputs = inputs.sigmoid()
-    inputs = inputs.flatten(1)
-    numerator = 2 * (inputs * targets).sum(-1)
-    denominator = inputs.sum(-1) + targets.sum(-1)
-    loss = 1 - (numerator + 1) / (denominator + 1)
-    return loss.sum() / num_masks
-
-
-dice_loss_jit = torch.jit.script(
-    dice_loss
-)  # type: torch.jit.ScriptModule
-
-
-def sigmoid_ce_loss(
-        inputs: torch.Tensor,
-        targets: torch.Tensor,
-        num_masks: float,
-    ):
-    """
-    Args:
-        inputs: A float tensor of arbitrary shape.
-                The predictions for each example.
-        targets: A float tensor with the same shape as inputs. Stores the binary
-                 classification label for each element in inputs
-                (0 for the negative class and 1 for the positive class).
-    Returns:
-        Loss tensor
-    """
-    loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
-
-    return loss.mean(1).sum() / num_masks
-
-
-sigmoid_ce_loss_jit = torch.jit.script(
-    sigmoid_ce_loss
-)  # type: torch.jit.ScriptModule
-
-
-def calculate_uncertainty(logits):
-    """
-    We estimate uncerainty as L1 distance between 0.0 and the logit prediction in 'logits' for the
-        foreground class in `classes`.
-    Args:
-        logits (Tensor): A tensor of shape (R, 1, ...) for class-specific or
-            class-agnostic, where R is the total number of predicted masks in all images and C is
-            the number of foreground classes. The values are logits.
-    Returns:
-        scores (Tensor): A tensor of shape (R, 1, ...) that contains uncertainty scores with
-            the most uncertain locations having the highest uncertainty score.
-    """
-    assert logits.shape[1] == 1
-    gt_class_logits = logits.clone()
-    return -(torch.abs(gt_class_logits))
+from .mask_utils import compute_mask_block_counts
 
 
 class SetCriterion(nn.Module):
@@ -119,6 +47,8 @@ class SetCriterion(nn.Module):
         empty_weight[-1] = self.eos_coef
         self.register_buffer("empty_weight", empty_weight)
 
+        self.tv_eps = 1e-6
+
         # pointwise mask loss parameters
         self.num_points = num_points
         self.oversample_ratio = oversample_ratio
@@ -143,9 +73,7 @@ class SetCriterion(nn.Module):
         return losses
     
     def loss_masks(self, outputs, targets, indices, num_masks):
-        """Compute the losses related to the masks: the focal loss and the dice loss.
-        targets dicts must contain the key "masks" containing a tensor of dim [nb_target_boxes, h, w]
-        """
+        """Compute the losses related to the masks using exact high-resolution targets."""
         assert "pred_masks" in outputs
 
         src_idx = self._get_src_permutation_idx(indices)
@@ -158,13 +86,6 @@ class SetCriterion(nn.Module):
         target_masks = target_masks.to(src_masks)
         target_masks = target_masks[tgt_idx]
 
-        # No need to upsample predictions as we are using normalized coordinates :)
-        # N x 1 x H x W
-        src_masks = src_masks[:, None]
-        target_masks = target_masks[:, None]
-
-        # If no masks, finish now. Otherwise we get weird errors. Remember to
-        # use loss_mask.sum() * 0.0 to avoid angering the DDP gods.
         if src_masks.shape[0] == 0:
             losses = {
                 "loss_mask": outputs["pred_masks"].sum() * 0.0,
@@ -172,35 +93,32 @@ class SetCriterion(nn.Module):
             }
             return losses
 
-        with torch.no_grad():
-            # sample point_coords
-            point_coords = get_uncertain_point_coords_with_randomness(
-                src_masks,
-                lambda logits: calculate_uncertainty(logits),
-                self.num_points,
-                self.oversample_ratio,
-                self.importance_sample_ratio,
-            )
-            # get gt labels
-            point_labels = point_sample(
-                target_masks,
-                point_coords,
-                align_corners=False,
-            ).squeeze(1)
+        logits = src_masks.reshape(src_masks.shape[0], -1)
+        pos_counts, block_area, H_t, W_t = compute_mask_block_counts(
+            target_masks, src_masks.shape[-2:]
+        )
+        pos_counts = pos_counts.to(device=logits.device, dtype=logits.dtype)
 
-        point_logits = point_sample(
-            src_masks,
-            point_coords,
-            align_corners=False,
-        ).squeeze(1)
+        abs_logits = logits.abs()
+        max_logits = torch.clamp(logits, min=0)
+        logexp = torch.log1p(torch.exp(-abs_logits))
+        loss_block = block_area * max_logits - logits * pos_counts + block_area * logexp
+        loss_mask = loss_block.sum(dim=1) / (H_t * W_t)
+        loss_mask = loss_mask.sum() / num_masks
+
+        probs = torch.sigmoid(logits)
+        intersection = (probs * pos_counts).sum(dim=1)
+        pred_sum = probs.sum(dim=1) * block_area
+        target_sum = pos_counts.sum(dim=1)
+        #loss_dice = 1 - (2 * intersection + 1) / (pred_sum + target_sum + 1)
+        loss_dice = 1 - (2 * intersection) / (pred_sum + target_sum)
+        loss_dice = loss_dice.sum() / num_masks
 
         losses = {
-            "loss_mask": sigmoid_ce_loss_jit(point_logits, point_labels, num_masks),
-            "loss_dice": dice_loss_jit(point_logits, point_labels, num_masks),
+            "loss_mask": loss_mask,
+            "loss_dice": loss_dice,
         }
 
-        del src_masks
-        del target_masks
         return losses
     
     def loss_boxes(self, outputs, targets, indices, num_boxes):
@@ -226,6 +144,31 @@ class SetCriterion(nn.Module):
 
         return losses
 
+    def loss_tv(self, outputs, targets, indices, num_masks):
+        """Total variation regularization for all predicted masks."""
+
+        if "pred_masks" not in outputs:
+            return {}
+
+        pred_masks = outputs["pred_masks"]
+
+        if pred_masks.numel() == 0:
+            return {"loss_tv": pred_masks.sum() * 0.0}
+
+        probs = torch.sigmoid(pred_masks)
+        dx = probs[:, :, 1:, :] - probs[:, :, :-1, :]
+        dy = probs[:, :, :, 1:] - probs[:, :, :, :-1]
+
+        dx = F.pad(dx, (0, 0, 0, 1))
+        dy = F.pad(dy, (0, 1, 0, 0))
+
+        grad_mag = torch.sqrt(dx * dx + dy * dy + self.tv_eps)
+
+        tv_per_mask = grad_mag.sum(dim=[2, 3]) / (probs.shape[-2] * probs.shape[-1])
+        loss_tv = tv_per_mask.mean()
+
+        return {"loss_tv": loss_tv}
+
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -242,7 +185,8 @@ class SetCriterion(nn.Module):
         loss_map = {
             'labels': self.loss_labels,
             'masks': self.loss_masks,
-            'boxes': self.loss_boxes
+            'boxes': self.loss_boxes,
+            'tv': self.loss_tv
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_masks)

@@ -253,6 +253,8 @@ def get_metadata():
     unseen_classes = [k["name"] for k in ADE20K_150_CATEGORIES if k["id"] in UNSEEN_ADE20K_CATEGORY_IDS]
     unseen_colors = [k["color"] for k in ADE20K_150_CATEGORIES if k["id"] in UNSEEN_ADE20K_CATEGORY_IDS]
 
+    thing_mask = [k["isthing"] == 1 for k in ADE20K_150_CATEGORIES]
+
     meta["thing_classes"] = thing_classes
     meta["thing_colors"] = thing_colors
     meta["stuff_classes"] = stuff_classes
@@ -262,6 +264,8 @@ def get_metadata():
     meta["seen_colors"] = seen_colors
     meta["unseen_classes"] = unseen_classes
     meta["unseen_colors"] = unseen_colors
+
+    meta["thing_mask"] = thing_mask
 
     # Convert category id for training:
     #   category id: like semantic segmentation, it is the class id for each

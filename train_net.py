@@ -40,6 +40,12 @@ from detectron2.engine import (
     AMPTrainer,
     SimpleTrainer
 )
+from detectron2.data import (
+    DatasetCatalog,
+    MetadataCatalog,
+    build_detection_train_loader,
+    build_detection_test_loader,
+)
 from detectron2.evaluation import (
     CityscapesInstanceEvaluator,
     CityscapesSemSegEvaluator,
@@ -52,6 +58,10 @@ from detectron2.evaluation import (
 from detectron2.projects.deeplab import add_deeplab_config, build_lr_scheduler
 from detectron2.solver.build import maybe_add_gradient_clipping
 from detectron2.utils.logger import setup_logger
+from detectron2.data.common import DatasetFromList, MapDataset
+from detectron2.data.dataset_mapper import DatasetMapper
+from detectron2.data.samplers import InferenceSampler
+from detectron2.data.build import build_batch_data_loader, trivial_batch_collator
 import weakref
 
 from fcclip import (
@@ -60,6 +70,7 @@ from fcclip import (
     InstanceSegEvaluator,
     COCOPanopticEvaluator,
     COCOZSPanopticEvaluator,
+    ExportEvaluator,
     MaskFormerInstanceDatasetMapper,
     MaskFormerPanopticDatasetMapper,
     MaskFormerSemanticDatasetMapper,
@@ -69,6 +80,56 @@ from fcclip import (
     add_zegfc_config,
     build_compiled_model
 )
+
+
+def build_limited_detection_test_loader(cfg, dataset_name, mapper, max_eval_images):
+    """Create an evaluation data loader that only iterates over a subset."""
+
+    logger = logging.getLogger(__name__)
+    dataset_dicts = DatasetCatalog.get(dataset_name)
+    total_images = len(dataset_dicts)
+
+    if total_images == 0:
+        logger.warning(
+            "Dataset '%s' is empty. Returning the standard test loader.",
+            dataset_name,
+        )
+        return build_detection_test_loader(cfg, dataset_name, mapper=mapper)
+
+    if max_eval_images < total_images and comm.is_main_process():
+        logger.info(
+            "Limiting evaluation on '%s' to %d images (out of %d).",
+            dataset_name,
+            max_eval_images,
+            total_images,
+        )
+
+    limited_dicts = list(dataset_dicts[:max_eval_images])
+
+    if len(limited_dicts) < max_eval_images and comm.is_main_process():
+        logger.warning(
+            "Requested %d evaluation images, but dataset '%s' only has %d. Using all available images.",
+            max_eval_images,
+            dataset_name,
+            len(limited_dicts),
+        )
+
+    dataset = DatasetFromList(limited_dicts, copy=False)
+
+    if mapper is None:
+        mapper = DatasetMapper(cfg, is_train=False)
+
+    dataset = MapDataset(dataset, mapper)
+
+    sampler = InferenceSampler(len(limited_dicts))
+
+    return build_batch_data_loader(
+        dataset,
+        sampler,
+        cfg.SOLVER.IMS_PER_BATCH,
+        num_workers=cfg.DATALOADER.NUM_WORKERS,
+        collate_fn=trivial_batch_collator,
+    )
 
 
 class MemEfficientDetectionCheckpointer(DetectionCheckpointer):
@@ -131,6 +192,60 @@ class MemEfficientDetectionCheckpointer(DetectionCheckpointer):
         with self.path_manager.open(save_file, "wb") as f:
             torch.save(data, f)
         self.tag_last_checkpoint(basename)
+
+
+class SwapProbabilitySchedulerHook(hooks.HookBase):
+    """Linearly swap thing/stuff probabilities over the course of training."""
+
+    def __init__(
+        self,
+        base_model,
+        training_model,
+        max_iter,
+        start_thing: float,
+        end_thing: float,
+        start_stuff: float,
+        end_stuff: float,
+    ):
+        self.base_model = base_model
+        self.training_model = training_model
+        self.max_iter = max_iter
+        self.start_thing = start_thing
+        self.end_thing = end_thing
+        self.start_stuff = start_stuff
+        self.end_stuff = end_stuff
+
+    def _set_probabilities(self, progress: float):
+        prob_swap_thing = max(
+            0.0, min(1.0, self.start_thing + (self.end_thing - self.start_thing) * progress)
+        )
+        prob_swap_stuff = max(
+            0.0, min(1.0, self.start_stuff + (self.end_stuff - self.start_stuff) * progress)
+        )
+
+        for model in (self.base_model, self.training_model):
+            if model is None:
+                continue
+
+            target_model = model.module if hasattr(model, "module") else model
+
+            if hasattr(target_model, "probability_swap_thing"):
+                target_model.probability_swap_thing = prob_swap_thing
+            if hasattr(target_model, "probability_swap_stuff"):
+                target_model.probability_swap_stuff = prob_swap_stuff
+
+    def _progress(self, iteration: int) -> float:
+        # Ensure we handle edge cases like a single-iteration training run.
+        denom = max(self.max_iter - 1, 1)
+        return max(0.0, min(1.0, iteration / denom))
+
+    def before_train(self):
+        progress = self._progress(getattr(self.trainer, "start_iter", 0))
+        self._set_probabilities(progress)
+
+    def before_step(self):
+        progress = self._progress(self.trainer.iter)
+        self._set_probabilities(progress)
 
 
 class Trainer(DefaultTrainer):
@@ -202,6 +317,15 @@ class Trainer(DefaultTrainer):
 
         ret = [
             hooks.IterationTimer(),
+            SwapProbabilitySchedulerHook(
+                self.base_model,
+                self._trainer.model,
+                self.max_iter,
+                cfg.MODEL.ZEG_FC.PROBABILITY_SWAP_THING,
+                cfg.MODEL.ZEG_FC.PROBABILITY_SWAP_THING_END,
+                cfg.MODEL.ZEG_FC.PROBABILITY_SWAP_STUFF,
+                cfg.MODEL.ZEG_FC.PROBABILITY_SWAP_STUFF_END,
+            ),
             hooks.LRScheduler(),
             hooks.PreciseBN(
                 # Run at the same freq as (but before) evaluation.
@@ -331,7 +455,12 @@ class Trainer(DefaultTrainer):
             evaluator_list.append(InstanceSegEvaluator(dataset_name, output_dir=output_folder))
         # LVIS
         if evaluator_type == "lvis":
-            return LVISEvaluator(dataset_name, output_dir=output_folder)
+            evaluator_list.append(LVISEvaluator(dataset_name, output_dir=output_folder))
+        
+        # Output save
+        if cfg.MODEL.MASK_FORMER.TEST.EXPORT_OUTPUTS:
+            evaluator_list.append(ExportEvaluator(dataset_name, output_dir=output_folder))
+
         if len(evaluator_list) == 0:
             raise NotImplementedError(
                 "no Evaluator for the dataset {} with the type {}".format(
@@ -367,6 +496,20 @@ class Trainer(DefaultTrainer):
         else:
             mapper = None
             return build_detection_train_loader(cfg, mapper=mapper)
+
+    @classmethod
+    def build_test_loader(cls, cfg, dataset_name):
+        mapper = None
+        if cfg.INPUT.DATASET_MAPPER_NAME == "coco_instance_lsj":
+            mapper = COCOInstanceNewBaselineDatasetMapper(cfg, False)
+        elif cfg.INPUT.DATASET_MAPPER_NAME == "coco_panoptic_lsj":
+            mapper = COCOPanopticNewBaselineDatasetMapper(cfg, False)
+
+        max_eval_images = cfg.MODEL.MASK_FORMER.TEST.MAX_EVAL_IMAGES
+        if max_eval_images and max_eval_images > 0:
+            return build_limited_detection_test_loader(cfg, dataset_name, mapper, max_eval_images)
+
+        return build_detection_test_loader(cfg, dataset_name, mapper=mapper)
 
     @classmethod
     def build_lr_scheduler(cls, cfg, optimizer):

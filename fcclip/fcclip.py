@@ -9,6 +9,9 @@ from typing import Tuple
 import torch
 torch._dynamo.config.suppress_errors = True
 
+import cv2
+import numpy as np
+
 from torch import nn
 from torch.nn import functional as F
 
@@ -22,7 +25,7 @@ from detectron2.utils.memory import retry_if_cuda_oom
 
 from .modeling.criterion import SetCriterion
 from .modeling.matcher import HungarianMatcher
-from .modeling.transformer_decoder.box_regression import box_xyxy_to_cxcywh, box_cxcywh_to_xyxy
+from .modeling.transformer_decoder.box_regression import box_xyxy_to_cxcywh, box_cxcywh_to_xyxy, masks_to_boxes
 
 from .modeling.transformer_decoder.fcclip_transformer_decoder import MaskPooling, get_classification_logits
 VILD_PROMPT = [
@@ -41,7 +44,6 @@ VILD_PROMPT = [
     "There is a medium {} in the scene.",
     "There is a large {} in the scene.",
 ]
-
 
 @META_ARCH_REGISTRY.register()
 class FCCLIP(nn.Module):
@@ -74,6 +76,9 @@ class FCCLIP(nn.Module):
         geometric_ensemble_alpha: float,
         geometric_ensemble_beta: float,
         ensemble_on_valid_mask: bool,
+        # Zeg-FC
+        probability_swap_thing: float = 0.1,
+        probability_swap_stuff: float = 0.1,
     ):
         """
         Args:
@@ -135,8 +140,21 @@ class FCCLIP(nn.Module):
         self.test_text_classifier = None
         self.void_embedding = nn.Embedding(1, backbone.dim_latent) # use this for void
 
-        _, self.train_num_templates, self.train_class_names = self.prepare_class_names_from_metadata(train_metadata, train_metadata)
-        self.category_overlapping_mask, self.test_num_templates, self.test_class_names = self.prepare_class_names_from_metadata(test_metadata, train_metadata)
+        (   _, 
+            self.train_num_templates, 
+            self.train_class_names, 
+            self.train_thing_mask
+        ) = self.prepare_class_names_from_metadata(train_metadata, train_metadata)
+        (
+            self.category_overlapping_mask, 
+            self.test_num_templates, 
+            self.test_class_names,
+            self.test_thing_mask
+        ) = self.prepare_class_names_from_metadata(test_metadata, train_metadata)
+
+        # Zeg-FC args
+        self.probability_swap_thing = probability_swap_thing
+        self.probability_swap_stuff = probability_swap_stuff
 
     def prepare_class_names_from_metadata(self, metadata, train_metadata):
         def split_labels(x):
@@ -149,10 +167,12 @@ class FCCLIP(nn.Module):
         # get text classifier
         try:
             class_names = split_labels(metadata.stuff_classes) # it includes both thing and stuff
+            thing_mask = torch.tensor(metadata.thing_mask) # (C,) 1 if thing else 0 
             train_class_names = split_labels(train_metadata.stuff_classes)
         except:
             # this could be for insseg, where only thing_classes are available
             class_names = split_labels(metadata.thing_classes)
+            thing_mask = torch.tensor([True] * len(metadata.thing_classes)) # (C,) 1 if thing else 0
             train_class_names = split_labels(train_metadata.thing_classes)
         train_class_names = {l for label in train_class_names for l in label}
         category_overlapping_list = []
@@ -177,11 +197,16 @@ class FCCLIP(nn.Module):
             num_templates.append(templated_classes_num) # how many templates for current classes
         class_names = templated_class_names
         #print("text for classification:", class_names)
-        return category_overlapping_mask, num_templates, class_names
+        return category_overlapping_mask, num_templates, class_names, thing_mask
 
     def set_metadata(self, metadata):
         self.test_metadata = metadata
-        self.category_overlapping_mask, self.test_num_templates, self.test_class_names = self.prepare_class_names_from_metadata(metadata, self.train_metadata)
+        (
+            self.category_overlapping_mask, 
+            self.test_num_templates, 
+            self.test_class_names,
+            self.test_thing_mask
+        ) = self.prepare_class_names_from_metadata(metadata, self.train_metadata)
         self.test_text_classifier = None
         return
 
@@ -231,6 +256,7 @@ class FCCLIP(nn.Module):
         class_weight = cfg.MODEL.MASK_FORMER.CLASS_WEIGHT
         dice_weight = cfg.MODEL.MASK_FORMER.DICE_WEIGHT
         mask_weight = cfg.MODEL.MASK_FORMER.MASK_WEIGHT
+        tv_weight = cfg.MODEL.MASK_FORMER.TV_WEIGHT
         bbox_weight = cfg.MODEL.MASK_FORMER.BBOX_WEIGHT
         giou_weight = cfg.MODEL.MASK_FORMER.GIOU_WEIGHT
 
@@ -243,9 +269,10 @@ class FCCLIP(nn.Module):
         )
 
         weight_dict = {
-            "loss_ce": class_weight, 
-            "loss_mask": mask_weight, 
+            "loss_ce": class_weight,
+            "loss_mask": mask_weight,
             "loss_dice": dice_weight,
+            #"loss_tv": tv_weight,
             "loss_bbox": bbox_weight,
             "loss_giou": giou_weight
         }
@@ -274,7 +301,7 @@ class FCCLIP(nn.Module):
             "backbone": backbone,
             "sem_seg_head": sem_seg_head,
             "criterion": criterion,
-            "num_queries": cfg.MODEL.MASK_FORMER.NUM_OBJECT_QUERIES,
+            "num_queries": cfg.MODEL.ZEG_FC.QUERY_H * cfg.MODEL.ZEG_FC.QUERY_W,
             "object_mask_threshold": cfg.MODEL.MASK_FORMER.TEST.OBJECT_MASK_THRESHOLD,
             "overlap_threshold": cfg.MODEL.MASK_FORMER.TEST.OVERLAP_THRESHOLD,
             "train_metadata": MetadataCatalog.get(cfg.DATASETS.TRAIN[0]),
@@ -294,7 +321,9 @@ class FCCLIP(nn.Module):
             "test_topk_per_image": cfg.TEST.DETECTIONS_PER_IMAGE,
             "geometric_ensemble_alpha": cfg.MODEL.FC_CLIP.GEOMETRIC_ENSEMBLE_ALPHA,
             "geometric_ensemble_beta": cfg.MODEL.FC_CLIP.GEOMETRIC_ENSEMBLE_BETA,
-            "ensemble_on_valid_mask": cfg.MODEL.FC_CLIP.ENSEMBLE_ON_VALID_MASK
+            "ensemble_on_valid_mask": cfg.MODEL.FC_CLIP.ENSEMBLE_ON_VALID_MASK,
+            "probability_swap_thing": cfg.MODEL.ZEG_FC.PROBABILITY_SWAP_THING,
+            "probability_swap_stuff": cfg.MODEL.ZEG_FC.PROBABILITY_SWAP_STUFF,
         }
 
     @property
@@ -337,16 +366,20 @@ class FCCLIP(nn.Module):
         text_classifier = torch.cat([text_classifier, F.normalize(self.void_embedding.weight, dim=-1)], dim=0)
         features['text_classifier'] = text_classifier
         features['num_templates'] = num_templates
+
+        # In training, randomly swap thing and stuff classes
+        if self.training:
+            # mask classification target
+            gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
+            targets, thing_mask = self.prepare_targets(gt_instances, images)
+            features['thing_mask'] = thing_mask
+        else:
+            features['thing_mask'] = self.test_thing_mask
+            #features['thing_mask'] = torch.ones_like(self.test_thing_mask)
+
         outputs = self.sem_seg_head(features)
 
         if self.training:
-            # mask classification target
-            if "instances" in batched_inputs[0]:
-                gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
-                targets = self.prepare_targets(gt_instances, images)
-            else:
-                targets = None
-
             # bipartite matching-based loss
             losses = self.criterion(outputs, targets)
 
@@ -414,7 +447,7 @@ class FCCLIP(nn.Module):
             mask_cls_results = torch.log(mask_cls_probs + 1e-8)
 
             # upsample masks
-            mask_pred_results = F.interpolate(
+            mask_up_pred_results = F.interpolate(
                 mask_pred_results,
                 size=(images.tensor.shape[-2], images.tensor.shape[-1]),
                 mode="bilinear",
@@ -428,56 +461,125 @@ class FCCLIP(nn.Module):
                 mask_box_results = [None] * len(batched_inputs)
 
             processed_results = []
-            for mask_cls_result, mask_pred_result, mask_box_result, input_per_image, image_size in zip(
-                mask_cls_results, mask_pred_results, mask_box_results, batched_inputs, images.image_sizes
+            for mask_cls_result, mask_up_pred_result, mask_pred_result, mask_box_result, input_per_image, image_size in zip(
+                mask_cls_results, mask_up_pred_results, mask_pred_results, mask_box_results, batched_inputs, images.image_sizes
             ):
                 height = input_per_image.get("height", image_size[0])
                 width = input_per_image.get("width", image_size[1])
                 processed_results.append({})
 
+                # Save raw results
+                processed_results[-1]["raw_seg"] = mask_pred_result
+                processed_results[-1]["raw_cls"] = mask_cls_result
+
                 if self.sem_seg_postprocess_before_inference:
-                    mask_pred_result = retry_if_cuda_oom(sem_seg_postprocess)(
-                        mask_pred_result, image_size, height, width
+                    mask_up_pred_result = retry_if_cuda_oom(sem_seg_postprocess)(
+                        mask_up_pred_result, image_size, height, width
                     )
-                    mask_cls_result = mask_cls_result.to(mask_pred_result)
+                    mask_cls_result = mask_cls_result.to(mask_up_pred_result)
 
                 # semantic segmentation inference
                 if self.semantic_on:
-                    r = retry_if_cuda_oom(self.semantic_inference)(mask_cls_result, mask_pred_result)
+                    r = retry_if_cuda_oom(self.semantic_inference)(mask_cls_result, mask_up_pred_result)
                     if not self.sem_seg_postprocess_before_inference:
                         r = retry_if_cuda_oom(sem_seg_postprocess)(r, image_size, height, width)
                     processed_results[-1]["sem_seg"] = r
 
                 # panoptic segmentation inference
                 if self.panoptic_on:
-                    panoptic_r = retry_if_cuda_oom(self.panoptic_inference)(mask_cls_result, mask_pred_result)
+                    panoptic_r = retry_if_cuda_oom(self.panoptic_inference)(mask_cls_result, mask_up_pred_result)
                     processed_results[-1]["panoptic_seg"] = panoptic_r
                 
                 # instance segmentation inference
                 if self.instance_on:
-                    instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, mask_box_result)
+                    instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_up_pred_result, mask_box_result)
                     processed_results[-1]["instances"] = instance_r
 
             return processed_results
 
     def prepare_targets(self, targets, images):
+        # Decide to randomly swap thing and stuff classes
+        if self.probability_swap_thing != 0.0 and self.probability_swap_stuff != 0.0:
+            swap_probability = torch.where(
+                self.train_thing_mask,
+                torch.full_like(self.train_thing_mask, self.probability_swap_thing, dtype=torch.float),
+                torch.full_like(self.train_thing_mask, self.probability_swap_stuff, dtype=torch.float)
+            )
+            flip_mask = torch.bernoulli(swap_probability).bool()
+            new_thing_mask = torch.logical_xor(self.train_thing_mask, flip_mask)
+        else:
+            flip_mask = torch.zeros_like(self.train_thing_mask).bool()
+            new_thing_mask = self.train_thing_mask
+        
         h_pad, w_pad = images.tensor.shape[-2:]
         new_targets = []
+
         for targets_per_image in targets:
-            # pad gt
-            gt_masks = targets_per_image.gt_masks
-            padded_masks = torch.zeros((gt_masks.shape[0], h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
-            padded_masks[:, : gt_masks.shape[1], : gt_masks.shape[2]] = gt_masks
+            gt_masks = targets_per_image.gt_masks  # [N, H, W]
+            gt_classes = targets_per_image.gt_classes  # [N]
+            h, w = targets_per_image.image_size
+
+            new_masks_list = []
+            new_labels_list = []
+            if gt_masks.numel() > 0:
+                unique_classes = gt_classes.unique()
+
+                for cls in unique_classes:
+                    cls = int(cls.item())
+                    cls_inds = torch.nonzero(gt_classes == cls, as_tuple=True)[0]
+                    cls_masks = gt_masks[cls_inds]  # [K, H, W]
+
+                    was_flipped = bool(flip_mask[cls].item())
+                    is_thing_now = bool(new_thing_mask[cls].item())
+
+                    # If class is stuff now, merge all disjoint masks into one
+                    if not is_thing_now:
+                        merged = cls_masks.any(dim=0)  # [H, W] union
+                        new_masks_list.append(merged.to(gt_masks.dtype))
+                        new_labels_list.append(cls)
+                    # If class is thing now, keep all disjoint instances separate
+                    else:
+                        for idx in cls_inds:
+                            new_masks_list.append(gt_masks[idx])
+                            new_labels_list.append(cls)
+
+            if len(new_masks_list) > 0:
+                new_masks = torch.stack(new_masks_list, dim=0)  # [N', H, W]
+                new_labels = torch.tensor(
+                    new_labels_list,
+                    device=gt_classes.device,
+                    dtype=gt_classes.dtype,
+                )
+            else:
+                # No masks in this image
+                new_masks = gt_masks.new_zeros((0, h, w))
+                new_labels = gt_classes.new_zeros((0,))
+
+            # pad masks to (h_pad, w_pad)
+            padded_masks = torch.zeros(
+                (new_masks.shape[0], h_pad, w_pad),
+                dtype=new_masks.dtype,
+                device=new_masks.device,
+            )
+            padded_masks[:, : new_masks.shape[1], : new_masks.shape[2]] = new_masks
+
             attributes = {
-                "labels": targets_per_image.gt_classes,
+                "labels": new_labels,
                 "masks": padded_masks,
             }
-            if targets_per_image.has("gt_boxes"):
-                h, w = targets_per_image.image_size
-                image_size_xyxy = torch.as_tensor([w, h, w, h], dtype=torch.float, device=self.device)
-                attributes["boxes"] = box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor)/image_size_xyxy
+
+            # Recompute boxes from final masks if boxes exist
+            image_size_xyxy = torch.as_tensor(
+                [w, h, w, h], dtype=torch.float, device=self.device
+            )
+            boxes_xyxy = masks_to_boxes(new_masks)  # [N', 4]
+            attributes["boxes"] = (
+                box_xyxy_to_cxcywh(boxes_xyxy) / image_size_xyxy
+            )
+
             new_targets.append(attributes)
-        return new_targets
+
+        return new_targets, new_thing_mask
 
     def semantic_inference(self, mask_cls, mask_pred):
         mask_cls = F.softmax(mask_cls, dim=-1)[..., :-1]

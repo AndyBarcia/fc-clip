@@ -40,6 +40,7 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.CLASS_WEIGHT = 1.0
     cfg.MODEL.MASK_FORMER.DICE_WEIGHT = 1.0
     cfg.MODEL.MASK_FORMER.MASK_WEIGHT = 20.0
+    cfg.MODEL.MASK_FORMER.TV_WEIGHT = 0.0
     cfg.MODEL.MASK_FORMER.BBOX_WEIGHT = 1.0
     cfg.MODEL.MASK_FORMER.GIOU_WEIGHT = 1.0
 
@@ -65,6 +66,8 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.TEST.OBJECT_MASK_THRESHOLD = 0.0
     cfg.MODEL.MASK_FORMER.TEST.OVERLAP_THRESHOLD = 0.0
     cfg.MODEL.MASK_FORMER.TEST.SEM_SEG_POSTPROCESSING_BEFORE_INFERENCE = False
+    cfg.MODEL.MASK_FORMER.TEST.MAX_EVAL_IMAGES = None
+    cfg.MODEL.MASK_FORMER.TEST.EXPORT_OUTPUTS = False
 
     # Sometimes `backbone.size_divisibility` is set to 0 for some backbone (e.g. ResNet)
     # you can use this config to override
@@ -147,6 +150,10 @@ def add_zegfc_config(cfg):
     cfg.MODEL.ZEG_FC.TEXT_ATTN = False
     cfg.MODEL.ZEG_FC.TEXT_ATTN_CLS = False
     cfg.MODEL.ZEG_FC.MEM_ATTN_MASK = False
+    cfg.MODEL.ZEG_FC.QUERY_H = 16
+    cfg.MODEL.ZEG_FC.QUERY_W = 16
+    cfg.MODEL.ZEG_FC.QUERY_INIT_TYPE = "avg_pool"  # Options: "avg_pool", "feature"
+    cfg.MODEL.ZEG_FC.QUERY_POS_INIT_TYPE = "learned"  # Options: "learned", "sine"
     cfg.MODEL.ZEG_FC.MASK_EMBED_TYPE = "mlp"  # Options: "mlp", "linear"
     cfg.MODEL.ZEG_FC.CLASS_EMBED_TYPE = "mlp"  # Options: "mlp", "linear"
     cfg.MODEL.ZEG_FC.ATTN_CONV_KERNEL_SIZE = None
@@ -154,3 +161,9 @@ def add_zegfc_config(cfg):
     cfg.MODEL.ZEG_FC.CROSS_ATTN_TYPE = "standard"  # Options: "standard", "pos_mlp_brpb", "pos_mlp_rpb"
     cfg.MODEL.ZEG_FC.SELF_ATTN_TYPE = "standard"  # Options: "standard", "pos_mlp_brpb", "pos_mlp_rpb"
     cfg.MODEL.ZEG_FC.MASK_POS_MLP_TYPE = "none"  # Options: "none", "brpb", "rpb"
+    cfg.MODEL.ZEG_FC.PROBABILITY_SWAP_THING = 0.0
+    cfg.MODEL.ZEG_FC.PROBABILITY_SWAP_STUFF = 0.0
+    cfg.MODEL.ZEG_FC.PROBABILITY_SWAP_THING_END = 0.0
+    cfg.MODEL.ZEG_FC.PROBABILITY_SWAP_STUFF_END = 0.0
+    cfg.MODEL.ZEG_FC.SEPARATE_THING_STUFF_MASK_EMBED = False
+    cfg.MODEL.ZEG_FC.THING_STUFF_ADAPTER_TYPE = "none"  # Options: "linear", "bias", "none"
