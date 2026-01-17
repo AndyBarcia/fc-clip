@@ -13,6 +13,7 @@ from collections import OrderedDict
 
 import numpy as np
 import torch
+from tabulate import tabulate
 
 from detectron2.data import MetadataCatalog
 from detectron2.evaluation import SemSegEvaluator
@@ -171,6 +172,29 @@ class ZSSemSegEvaluator(SemSegEvaluator):
         res["fwIoU_un"] = 100 * unseen_metrics["fwIoU"]
         res["mACC_un"] = 100 * unseen_metrics["mACC"]
         res["pACC_un"] = 100 * unseen_metrics["pACC"]
+
+        headers = ["", "mIoU", "fwIoU", "mACC", "pACC"]
+        data = [
+            ["All", 100 * miou, 100 * fiou, 100 * macc, 100 * pacc],
+            [
+                "Seen",
+                100 * seen_metrics["mIoU"],
+                100 * seen_metrics["fwIoU"],
+                100 * seen_metrics["mACC"],
+                100 * seen_metrics["pACC"],
+            ],
+            [
+                "Unseen",
+                100 * unseen_metrics["mIoU"],
+                100 * unseen_metrics["fwIoU"],
+                100 * unseen_metrics["mACC"],
+                100 * unseen_metrics["pACC"],
+            ],
+        ]
+        table = tabulate(
+            data, headers=headers, tablefmt="pipe", floatfmt=".3f", stralign="center", numalign="center"
+        )
+        self._logger.info("Semantic Segmentation Evaluation Results:\n" + table)
 
         if self._output_dir:
             file_path = os.path.join(self._output_dir, "sem_seg_evaluation.pth")
