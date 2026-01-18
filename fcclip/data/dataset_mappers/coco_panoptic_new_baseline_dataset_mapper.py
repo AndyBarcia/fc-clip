@@ -149,6 +149,7 @@ class COCOPanopticNewBaselineDatasetMapper:
             sem_seg_gt = utils.read_image(dataset_dict.pop("sem_seg_file_name")).astype("double")
             # apply the same transformation to panoptic segmentation
             sem_seg_gt = transforms.apply_segmentation(sem_seg_gt)
+            sem_seg_gt = torch.as_tensor(sem_seg_gt.astype("long"))
             dataset_dict["sem_seg"] = sem_seg_gt.long()
 
         if "pan_seg_file_name" in dataset_dict:
