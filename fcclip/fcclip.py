@@ -256,9 +256,14 @@ class FCCLIP(nn.Module):
         class_weight = cfg.MODEL.MASK_FORMER.CLASS_WEIGHT
         dice_weight = cfg.MODEL.MASK_FORMER.DICE_WEIGHT
         mask_weight = cfg.MODEL.MASK_FORMER.MASK_WEIGHT
-        tv_weight = cfg.MODEL.MASK_FORMER.TV_WEIGHT
         bbox_weight = cfg.MODEL.MASK_FORMER.BBOX_WEIGHT
         giou_weight = cfg.MODEL.MASK_FORMER.GIOU_WEIGHT
+
+        # Use sampling for mask loss
+        use_mask_sampling = cfg.MODEL.MASK_FORMER.USE_MASK_SAMPLING
+        use_mask_sampling_matcher = cfg.MODEL.MASK_FORMER.USE_MASK_SAMPLING_MATCHER
+        if use_mask_sampling_matcher is None:
+            use_mask_sampling_matcher = use_mask_sampling
 
         # building criterion
         matcher = HungarianMatcher(
@@ -266,13 +271,13 @@ class FCCLIP(nn.Module):
             cost_mask=mask_weight,
             cost_dice=dice_weight,
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
+            sapmpling_loss=use_mask_sampling_matcher
         )
 
         weight_dict = {
             "loss_ce": class_weight,
             "loss_mask": mask_weight,
             "loss_dice": dice_weight,
-            #"loss_tv": tv_weight,
             "loss_bbox": bbox_weight,
             "loss_giou": giou_weight
         }
@@ -295,6 +300,7 @@ class FCCLIP(nn.Module):
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
             oversample_ratio=cfg.MODEL.MASK_FORMER.OVERSAMPLE_RATIO,
             importance_sample_ratio=cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO,
+            sapmpling_loss=use_mask_sampling
         )
 
         return {

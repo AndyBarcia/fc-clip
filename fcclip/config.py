@@ -44,6 +44,10 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.BBOX_WEIGHT = 1.0
     cfg.MODEL.MASK_FORMER.GIOU_WEIGHT = 1.0
 
+    # Mask loss sampling
+    cfg.MODEL.MASK_FORMER.USE_MASK_SAMPLING = False
+    cfg.MODEL.MASK_FORMER.USE_MASK_SAMPLING_MATCHER = None
+
     # transformer config
     cfg.MODEL.MASK_FORMER.NHEADS = 8
     cfg.MODEL.MASK_FORMER.DROPOUT = 0.1
