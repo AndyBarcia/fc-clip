@@ -71,6 +71,8 @@ class FCCLIP(nn.Module):
         semantic_on: bool,
         panoptic_on: bool,
         instance_on: bool,
+        semantic_full_stuff: bool,
+        instance_only_thing: bool,
         test_topk_per_image: int,
         # FC-CLIP
         geometric_ensemble_alpha: float,
@@ -125,6 +127,8 @@ class FCCLIP(nn.Module):
         self.semantic_on = semantic_on
         self.instance_on = instance_on
         self.panoptic_on = panoptic_on
+        self.semantic_full_stuff = semantic_full_stuff
+        self.instance_only_thing = instance_only_thing
         self.test_topk_per_image = test_topk_per_image
 
         if not self.semantic_on:
@@ -324,6 +328,8 @@ class FCCLIP(nn.Module):
             "semantic_on": cfg.MODEL.MASK_FORMER.TEST.SEMANTIC_ON,
             "instance_on": cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON,
             "panoptic_on": cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_ON,
+            "semantic_full_stuff": cfg.MODEL.MASK_FORMER.TEST.SEMANTIC_FULL_STUFF,
+            "instance_only_thing": cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ONLY_THING,
             "test_topk_per_image": cfg.TEST.DETECTIONS_PER_IMAGE,
             "geometric_ensemble_alpha": cfg.MODEL.FC_CLIP.GEOMETRIC_ENSEMBLE_ALPHA,
             "geometric_ensemble_beta": cfg.MODEL.FC_CLIP.GEOMETRIC_ENSEMBLE_BETA,
@@ -335,6 +341,92 @@ class FCCLIP(nn.Module):
     @property
     def device(self):
         return self.pixel_mean.device
+
+    def _prepare_mask_predictions(self, outputs, clip_feature, text_classifier, num_templates, images):
+        mask_cls_results = outputs["pred_logits"]
+        mask_pred_results = outputs["pred_masks"]
+        mask_box_results = outputs.get("pred_boxes")
+
+        # We ensemble the pred logits of in-vocab and out-vocab
+        mask_for_pooling = F.interpolate(
+            mask_pred_results,
+            size=clip_feature.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        if "convnext" in self.backbone.model_name.lower():
+            pooled_clip_feature = self.mask_pooling(clip_feature, mask_for_pooling)
+            pooled_clip_feature = self.backbone.visual_prediction_forward(pooled_clip_feature)
+        elif "rn" in self.backbone.model_name.lower():
+            pooled_clip_feature = self.backbone.visual_prediction_forward(clip_feature, mask_for_pooling)
+        else:
+            raise NotImplementedError
+
+        out_vocab_cls_results = get_classification_logits(
+            pooled_clip_feature,
+            text_classifier,
+            self.backbone.clip_model.logit_scale,
+            num_templates,
+        )
+        in_vocab_cls_results = mask_cls_results[..., :-1]  # remove void
+        out_vocab_cls_results = out_vocab_cls_results[..., :-1]  # remove void
+
+        # Reference: https://github.com/NVlabs/ODISE/blob/main/odise/modeling/meta_arch/odise.py#L1506
+        out_vocab_cls_probs = out_vocab_cls_results.softmax(-1)
+        in_vocab_cls_results = in_vocab_cls_results.softmax(-1)
+        category_overlapping_mask = self.category_overlapping_mask.to(self.device)
+
+        if self.ensemble_on_valid_mask:
+            # Only include out_vocab cls results on masks with valid pixels
+            # We empirically find that this is important to obtain reasonable AP/mIOU score with ResNet CLIP models
+            valid_masking = (mask_for_pooling > 0).to(mask_for_pooling).sum(-1).sum(-1) > 0
+            valid_masking = valid_masking.to(in_vocab_cls_results.dtype).unsqueeze(-1)
+            alpha = torch.ones_like(in_vocab_cls_results) * self.geometric_ensemble_alpha
+            beta = torch.ones_like(in_vocab_cls_results) * self.geometric_ensemble_beta
+            alpha = alpha * valid_masking
+            beta = beta * valid_masking
+        else:
+            alpha = self.geometric_ensemble_alpha
+            beta = self.geometric_ensemble_beta
+
+        cls_logits_seen = (
+            (in_vocab_cls_results ** (1 - alpha) * out_vocab_cls_probs**alpha).log()
+            * category_overlapping_mask
+        )
+        cls_logits_unseen = (
+            (in_vocab_cls_results ** (1 - beta) * out_vocab_cls_probs**beta).log()
+            * (1 - category_overlapping_mask)
+        )
+        cls_results = cls_logits_seen + cls_logits_unseen
+
+        # This is used to filtering void predictions.
+        is_void_prob = F.softmax(mask_cls_results, dim=-1)[..., -1:]
+        mask_cls_probs = torch.cat(
+            [
+                cls_results.softmax(-1) * (1.0 - is_void_prob),
+                is_void_prob,
+            ],
+            dim=-1,
+        )
+        mask_cls_results = torch.log(mask_cls_probs + 1e-8)
+
+        # upsample masks
+        mask_up_pred_results = F.interpolate(
+            mask_pred_results,
+            size=(images.tensor.shape[-2], images.tensor.shape[-1]),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        if mask_box_results is None:
+            mask_box_results = [None] * mask_pred_results.shape[0]
+
+        return {
+            "mask_cls_results": mask_cls_results,
+            "mask_pred_results": mask_pred_results,
+            "mask_up_pred_results": mask_up_pred_results,
+            "mask_box_results": mask_box_results,
+        }
 
     def forward(self, batched_inputs):
         """
@@ -383,9 +475,8 @@ class FCCLIP(nn.Module):
             features['thing_mask'] = self.test_thing_mask
             #features['thing_mask'] = torch.ones_like(self.test_thing_mask)
 
-        outputs = self.sem_seg_head(features)
-
         if self.training:
+            outputs = self.sem_seg_head(features)
             # bipartite matching-based loss
             losses = self.criterion(outputs, targets)
 
@@ -397,108 +488,126 @@ class FCCLIP(nn.Module):
                     losses.pop(k)
             return losses
         else:
-            mask_cls_results = outputs["pred_logits"]
-            mask_pred_results = outputs["pred_masks"]
-            mask_box_results = outputs.get("pred_boxes")
-
-            # We ensemble the pred logits of in-vocab and out-vocab
             clip_feature = features["clip_vis_dense"]
-            mask_for_pooling = F.interpolate(mask_pred_results, size=clip_feature.shape[-2:],
-                                                mode='bilinear', align_corners=False)
-            if "convnext" in self.backbone.model_name.lower():
-                pooled_clip_feature = self.mask_pooling(clip_feature, mask_for_pooling)
-                pooled_clip_feature = self.backbone.visual_prediction_forward(pooled_clip_feature)
-            elif "rn" in self.backbone.model_name.lower():
-                pooled_clip_feature = self.backbone.visual_prediction_forward(clip_feature, mask_for_pooling)
-            else:
-                raise NotImplementedError
+            base_features = dict(features)
 
-            out_vocab_cls_results = get_classification_logits(pooled_clip_feature, text_classifier, self.backbone.clip_model.logit_scale, num_templates)
-            in_vocab_cls_results = mask_cls_results[..., :-1] # remove void
-            out_vocab_cls_results = out_vocab_cls_results[..., :-1] # remove void
+            default_thing_mask = self.test_thing_mask
+            all_stuff_thing_mask = torch.zeros_like(default_thing_mask)
+            all_thing_mask = torch.ones_like(default_thing_mask)
 
-            # Reference: https://github.com/NVlabs/ODISE/blob/main/odise/modeling/meta_arch/odise.py#L1506
-            out_vocab_cls_probs = out_vocab_cls_results.softmax(-1)
-            in_vocab_cls_results = in_vocab_cls_results.softmax(-1)
-            category_overlapping_mask = self.category_overlapping_mask.to(self.device)
+            semantic_mode = "all_stuff" if self.semantic_full_stuff else "default"
+            instance_mode = "all_thing" if self.instance_only_thing else "default"
+            panoptic_mode = "default"
 
-            if self.ensemble_on_valid_mask:
-                # Only include out_vocab cls results on masks with valid pixels
-                # We empirically find that this is important to obtain reasonable AP/mIOU score with ResNet CLIP models
-                valid_masking = (mask_for_pooling > 0).to(mask_for_pooling).sum(-1).sum(-1) > 0
-                valid_masking = valid_masking.to(in_vocab_cls_results.dtype).unsqueeze(-1)
-                alpha = torch.ones_like(in_vocab_cls_results) * self.geometric_ensemble_alpha
-                beta = torch.ones_like(in_vocab_cls_results) * self.geometric_ensemble_beta
-                alpha = alpha * valid_masking
-                beta = beta * valid_masking
-            else:
-                alpha = self.geometric_ensemble_alpha
-                beta = self.geometric_ensemble_beta
+            required_modes = set()
+            if self.semantic_on:
+                required_modes.add(semantic_mode)
+            if self.instance_on:
+                required_modes.add(instance_mode)
+            if self.panoptic_on:
+                required_modes.add(panoptic_mode)
+            if not required_modes:
+                required_modes.add("default")
 
-            cls_logits_seen = (
-                (in_vocab_cls_results ** (1 - alpha) * out_vocab_cls_probs**alpha).log()
-                * category_overlapping_mask
-            )
-            cls_logits_unseen = (
-                (in_vocab_cls_results ** (1 - beta) * out_vocab_cls_probs**beta).log()
-                * (1 - category_overlapping_mask)
-            )
-            cls_results = cls_logits_seen + cls_logits_unseen
+            thing_masks_by_mode = {
+                "default": default_thing_mask,
+                "all_stuff": all_stuff_thing_mask,
+                "all_thing": all_thing_mask,
+            }
 
-            # This is used to filtering void predictions.
-            is_void_prob = F.softmax(mask_cls_results, dim=-1)[..., -1:]
-            mask_cls_probs = torch.cat([
-                cls_results.softmax(-1) * (1.0 - is_void_prob),
-                is_void_prob], dim=-1)
-            mask_cls_results = torch.log(mask_cls_probs + 1e-8)
+            prepared_by_mode = {}
+            for mode in required_modes:
+                mode_features = dict(base_features)
+                mode_features["thing_mask"] = thing_masks_by_mode[mode]
+                outputs = self.sem_seg_head(mode_features)
+                prepared_by_mode[mode] = self._prepare_mask_predictions(
+                    outputs,
+                    clip_feature,
+                    text_classifier,
+                    num_templates,
+                    images,
+                )
 
-            # upsample masks
-            mask_up_pred_results = F.interpolate(
-                mask_pred_results,
-                size=(images.tensor.shape[-2], images.tensor.shape[-1]),
-                mode="bilinear",
-                align_corners=False,
-            )
-
-            del outputs
-
-            # Prepare an iterator for boxes, which could be None
-            if mask_box_results is None:
-                mask_box_results = [None] * len(batched_inputs)
+            raw_mode = None
+            for branch_mode, is_enabled in (
+                (semantic_mode, self.semantic_on),
+                (panoptic_mode, self.panoptic_on),
+                (instance_mode, self.instance_on),
+            ):
+                if is_enabled:
+                    raw_mode = branch_mode
+                    break
+            if raw_mode is None:
+                raw_mode = next(iter(required_modes))
 
             processed_results = []
-            for mask_cls_result, mask_up_pred_result, mask_pred_result, mask_box_result, input_per_image, image_size in zip(
-                mask_cls_results, mask_up_pred_results, mask_pred_results, mask_box_results, batched_inputs, images.image_sizes
-            ):
+            for image_idx, (input_per_image, image_size) in enumerate(zip(batched_inputs, images.image_sizes)):
                 height = input_per_image.get("height", image_size[0])
                 width = input_per_image.get("width", image_size[1])
                 processed_results.append({})
 
-                # Save raw results
-                processed_results[-1]["raw_seg"] = mask_pred_result
-                processed_results[-1]["raw_cls"] = mask_cls_result
+                raw_results = prepared_by_mode[raw_mode]
+                raw_mask_pred_result = raw_results["mask_pred_results"][image_idx]
+                raw_mask_cls_result = raw_results["mask_cls_results"][image_idx]
 
-                if self.sem_seg_postprocess_before_inference:
-                    mask_up_pred_result = retry_if_cuda_oom(sem_seg_postprocess)(
-                        mask_up_pred_result, image_size, height, width
-                    )
-                    mask_cls_result = mask_cls_result.to(mask_up_pred_result)
+                # Save raw results
+                processed_results[-1]["raw_seg"] = raw_mask_pred_result
+                processed_results[-1]["raw_cls"] = raw_mask_cls_result
 
                 # semantic segmentation inference
                 if self.semantic_on:
-                    r = retry_if_cuda_oom(self.semantic_inference)(mask_cls_result, mask_up_pred_result)
+                    semantic_results = prepared_by_mode[semantic_mode]
+                    mask_up_pred_result = semantic_results["mask_up_pred_results"][image_idx]
+                    mask_cls_result = semantic_results["mask_cls_results"][image_idx]
+
+                    if self.sem_seg_postprocess_before_inference:
+                        mask_up_pred_result = retry_if_cuda_oom(sem_seg_postprocess)(
+                            mask_up_pred_result, image_size, height, width
+                        )
+                        mask_cls_result = mask_cls_result.to(mask_up_pred_result)
+
+                    r = retry_if_cuda_oom(self.semantic_inference)(
+                        mask_cls_result, mask_up_pred_result
+                    )
                     if not self.sem_seg_postprocess_before_inference:
                         r = retry_if_cuda_oom(sem_seg_postprocess)(r, image_size, height, width)
                     processed_results[-1]["sem_seg"] = r
 
                 # panoptic segmentation inference
                 if self.panoptic_on:
-                    panoptic_r = retry_if_cuda_oom(self.panoptic_inference)(mask_cls_result, mask_up_pred_result)
+                    panoptic_results = prepared_by_mode[panoptic_mode]
+                    mask_up_pred_result = panoptic_results["mask_up_pred_results"][image_idx]
+                    mask_cls_result = panoptic_results["mask_cls_results"][image_idx]
+
+                    if self.sem_seg_postprocess_before_inference:
+                        mask_up_pred_result = retry_if_cuda_oom(sem_seg_postprocess)(
+                            mask_up_pred_result, image_size, height, width
+                        )
+                        mask_cls_result = mask_cls_result.to(mask_up_pred_result)
+
+                    panoptic_r = retry_if_cuda_oom(self.panoptic_inference)(
+                        mask_cls_result, mask_up_pred_result
+                    )
                     processed_results[-1]["panoptic_seg"] = panoptic_r
                 
                 # instance segmentation inference
                 if self.instance_on:
-                    instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_up_pred_result, mask_box_result)
+                    instance_results = prepared_by_mode[instance_mode]
+                    mask_up_pred_result = instance_results["mask_up_pred_results"][image_idx]
+                    mask_cls_result = instance_results["mask_cls_results"][image_idx]
+                    mask_box_result = instance_results["mask_box_results"][image_idx]
+
+                    if self.sem_seg_postprocess_before_inference:
+                        mask_up_pred_result = retry_if_cuda_oom(sem_seg_postprocess)(
+                            mask_up_pred_result, image_size, height, width
+                        )
+                        mask_cls_result = mask_cls_result.to(mask_up_pred_result)
+
+                    instance_r = retry_if_cuda_oom(self.instance_inference)(
+                        mask_cls_result,
+                        mask_up_pred_result,
+                        mask_box_result,
+                    )
                     processed_results[-1]["instances"] = instance_r
 
             return processed_results
