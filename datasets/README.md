@@ -214,7 +214,7 @@ cd $DETECTRON2_DATASETS
 wget http://host.robots.ox.ac.uk/pascal/VOC/voc2010/VOCtrainval_03-May-2010.tar
 # generate folder VOCdevkit/VOC2010
 tar -xvf VOCtrainval_03-May-2010.tar 
-wget https://www.cs.stanford.edu/~roozbeh/pascal-context/trainval.tar.gz
+wget https://cs.stanford.edu/~roozbeh/pascal-context/trainval.tar.gz
 # generate folder VOCdevkit/VOC2010/trainval
 tar -xvzf trainval.tar.gz -C VOCdevkit/VOC2010 
 wget https://codalabuser.blob.core.windows.net/public/trainval_merged.json -P VOCdevkit/VOC2010/

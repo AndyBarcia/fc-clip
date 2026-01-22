@@ -947,7 +947,7 @@ def loadAde20K(file):
 
 if __name__ == "__main__":
     dataset_dir = Path(os.getenv("DETECTRON2_DATASETS", "datasets"))
-    index_file = dataset_dir / "ade/ADE20K_2021_17_01" / "index_ade20k.pkl"
+    index_file = dataset_dir / "ADE20K_2021_17_01" / "index_ade20k.pkl"
     with open(index_file, "rb") as f:
         index_ade20k = pkl.load(f)
 
@@ -957,9 +957,9 @@ if __name__ == "__main__":
 
     # make output dir
     for name in ["training", "validation"]:
-        image_dir = dataset_dir / "ade/ADE20K_2021_17_01" / "images_detectron2" / name
+        image_dir = dataset_dir / "ADE20K_2021_17_01" / "images_detectron2" / name
         image_dir.mkdir(parents=True, exist_ok=True)
-        annotation_dir = dataset_dir / "ade/ADE20K_2021_17_01" / "annotations_detectron2" / name
+        annotation_dir = dataset_dir / "ADE20K_2021_17_01" / "annotations_detectron2" / name
         annotation_dir.mkdir(parents=True, exist_ok=True)
 
     # process image and gt
@@ -968,7 +968,7 @@ if __name__ == "__main__":
         total=len(index_ade20k["filename"]),
     ):
         split = "validation" if file_name.split("_")[1] == "val" else "training"
-        info = loadAde20K(str(dataset_dir / "ade" / folder_name / file_name))
+        info = loadAde20K(str(dataset_dir / folder_name / file_name))
 
         # resize image and label
         img = np.asarray(Image.open(info["img_name"]))
@@ -997,10 +997,10 @@ if __name__ == "__main__":
             if obj_id in id_map:
                 output[lab == obj_id] = id_map[obj_id]
 
-        output_img = dataset_dir / "ade/ADE20K_2021_17_01" / "images_detectron2" / split / file_name
+        output_img = dataset_dir / "ADE20K_2021_17_01" / "images_detectron2" / split / file_name
         output_lab = (
             dataset_dir
-            / "ade/ADE20K_2021_17_01"
+            / "ADE20K_2021_17_01"
             / "annotations_detectron2"
             / split
             / file_name.replace(".jpg", ".tif")
