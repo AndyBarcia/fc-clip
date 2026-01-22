@@ -134,6 +134,12 @@ _RAW_CITYSCAPES_PANOPTIC_SPLITS = {
 }
 
 
+UNSEEN_CITYSCAPES_CATEGORY_IDS = [
+    5, # pole,poles
+    12, # rider
+]
+
+
 def register_all_cityscapes_panoptic(root):
     meta = {}
     # The following metadata maps contiguous id from [0, #thing categories +
@@ -146,11 +152,13 @@ def register_all_cityscapes_panoptic(root):
     thing_colors = [k["color"] for k in CITYSCAPES_CATEGORIES]
     stuff_classes = [k["name"] for k in CITYSCAPES_CATEGORIES]
     stuff_colors = [k["color"] for k in CITYSCAPES_CATEGORIES]
+    thing_mask = [k["isthing"] == 1 for k in CITYSCAPES_CATEGORIES]
 
     meta["thing_classes"] = thing_classes
     meta["thing_colors"] = thing_colors
     meta["stuff_classes"] = stuff_classes
     meta["stuff_colors"] = stuff_colors
+    meta["thing_mask"] = thing_mask
 
     # There are three types of ids in cityscapes panoptic segmentation:
     # (1) category id: like semantic segmentation, it is the class id for each
@@ -167,12 +175,44 @@ def register_all_cityscapes_panoptic(root):
     #   instance id by: category_id * 1000 + instance_id.
     thing_dataset_id_to_contiguous_id = {}
     stuff_dataset_id_to_contiguous_id = {}
+    seen_dataset_id_to_contiguous_id = {}
+    seen_dataset_id_to_seen_contiguous_id = {}
+    unseen_dataset_id_to_contiguous_id = {}
 
-    for k in CITYSCAPES_CATEGORIES:
-        if k["isthing"] == 1:
-            thing_dataset_id_to_contiguous_id[k["id"]] = k["trainId"]
+    seen_dataset_id_to_thing_contigous_id = {}
+    unseen_dataset_id_to_thing_contigous_id = {}
+    last_thing_id = 0
+
+    contiguous_id_to_seen_contiguous_id = []
+    last_seen_id = 0
+
+    max_dataset_id = max([ cat["id"] for cat in CITYSCAPES_CATEGORIES])
+    dataset_id_to_seen_contigous_id = [ -1 for _ in range(max_dataset_id+1) ]
+
+    for i, cat in enumerate(CITYSCAPES_CATEGORIES):
+        if cat["isthing"] == 1:
+            thing_dataset_id_to_contiguous_id[cat["id"]] = cat["trainId"]
+            if cat["trainId"] in UNSEEN_CITYSCAPES_CATEGORY_IDS:
+                unseen_dataset_id_to_thing_contigous_id[cat["trainId"]] = last_thing_id
+            else:
+                seen_dataset_id_to_thing_contigous_id[cat["trainId"]] = last_thing_id
+            last_thing_id += 1
+
         else:
-            stuff_dataset_id_to_contiguous_id[k["id"]] = k["trainId"]
+            stuff_dataset_id_to_contiguous_id[cat["id"]] = cat["trainId"]
+        
+        if cat["trainId"] in UNSEEN_CITYSCAPES_CATEGORY_IDS:
+            # If this category is unseen, map it to -1 category.
+            # This allows then easy filtering on unseen categories.
+            contiguous_id_to_seen_contiguous_id.append(-1)
+            unseen_dataset_id_to_contiguous_id[cat["trainId"]] = i
+        else:
+            contiguous_id_to_seen_contiguous_id.append(last_seen_id)
+            seen_dataset_id_to_seen_contiguous_id[cat["trainId"]] = last_seen_id
+            dataset_id_to_seen_contigous_id[cat["trainId"]] = last_seen_id
+            last_seen_id += 1
+            seen_dataset_id_to_contiguous_id[cat["trainId"]] = i
+
 
     meta["thing_dataset_id_to_contiguous_id"] = thing_dataset_id_to_contiguous_id
     meta["stuff_dataset_id_to_contiguous_id"] = stuff_dataset_id_to_contiguous_id
@@ -190,7 +230,7 @@ def register_all_cityscapes_panoptic(root):
             image_root=image_dir,
             panoptic_json=gt_json,
             gt_dir=gt_dir.replace("cityscapes_panoptic_", ""),
-            evaluator_type="cityscapes_panoptic_seg",
+            evaluator_type="zs_cityscapes_panoptic_seg",
             ignore_label=255,
             label_divisor=1000,
             **meta,
