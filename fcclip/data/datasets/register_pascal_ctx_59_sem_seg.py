@@ -51,7 +51,7 @@ def _get_ctx59_meta():
     # Id 0 is reserved for ignore_label, we change ignore_label for 0
     # to 255 in our pre-processing, so all ids are shifted by 1.
     stuff_ids = [k["id"] for k in PASCAL_CTX_59_CATEGORIES]
-    assert len(stuff_ids) == 459, len(stuff_ids)
+    assert len(stuff_ids) == 59, len(stuff_ids)
 
     stuff_classes = [k["name"] for k in PASCAL_CTX_59_CATEGORIES]
 
@@ -126,7 +126,7 @@ def register_all_ctx59(root):
         MetadataCatalog.get(name).set(
             image_root=image_dir,
             sem_seg_root=gt_dir,
-            evaluator_type="sem_seg",
+            evaluator_type="zs_sem_seg",
             ignore_label=255,
             gt_ext="png",
             **meta
