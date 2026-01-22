@@ -35,22 +35,82 @@ MetadataCatalog.get("openvocab_pascal_ctx59_sem_seg_val").set(
     stuff_colors=PASCAL_CTX_59_COLORS[:],
 )
 
+UNSEEN_PASCAL_CTX_59_CLASSES = [
+    1, # bag,bags
+    3, # bedclothes
+    18, # computer case
+    29, # ground,soil,soil ground,dirt ground
+    40, # street,streets
+    44, # sidewalk
+    45, # sign,signs
+    58, # wood piece
+]
+
 def _get_ctx59_meta():
+    meta = {}
     # Id 0 is reserved for ignore_label, we change ignore_label for 0
     # to 255 in our pre-processing, so all ids are shifted by 1.
     stuff_ids = [k["id"] for k in PASCAL_CTX_59_CATEGORIES]
-    assert len(stuff_ids) == 59, len(stuff_ids)
+    assert len(stuff_ids) == 459, len(stuff_ids)
 
-    # For semantic segmentation, this mapping maps from contiguous stuff id
-    # (in [0, 91], used in models) to ids in the dataset (used for processing results)
-    stuff_dataset_id_to_contiguous_id = {k: i for i, k in enumerate(stuff_ids)}
     stuff_classes = [k["name"] for k in PASCAL_CTX_59_CATEGORIES]
 
-    ret = {
-        "stuff_dataset_id_to_contiguous_id": stuff_dataset_id_to_contiguous_id,
-        "stuff_classes": stuff_classes,
-    }
-    return ret
+    thing_dataset_id_to_contiguous_id = {}
+    stuff_dataset_id_to_contiguous_id = {}
+    seen_dataset_id_to_contiguous_id = {}
+    seen_dataset_id_to_seen_contiguous_id = {}
+    unseen_dataset_id_to_contiguous_id = {}
+
+    seen_dataset_id_to_thing_contigous_id = {}
+    unseen_dataset_id_to_thing_contigous_id = {}
+    last_thing_id = 0
+
+    contiguous_id_to_seen_contiguous_id = []
+    last_seen_id = 0
+
+    max_dataset_id = max([ cat["id"] for cat in PASCAL_CTX_59_CATEGORIES ])
+    dataset_id_to_seen_contigous_id = [ -1 for _ in range(max_dataset_id+1) ]
+
+    for i, cat in enumerate(PASCAL_CTX_59_CATEGORIES):
+        if cat["isthing"]:
+            thing_dataset_id_to_contiguous_id[cat["id"]] = i
+            if cat["id"] in UNSEEN_PASCAL_CTX_59_CLASSES:
+                unseen_dataset_id_to_thing_contigous_id[cat["id"]] = last_thing_id
+            else:
+                seen_dataset_id_to_thing_contigous_id[cat["id"]] = last_thing_id
+            last_thing_id += 1
+        # else:
+        #     stuff_dataset_id_to_contiguous_id[cat["id"]] = i
+        
+        # in order to use sem_seg evaluator
+        stuff_dataset_id_to_contiguous_id[cat["id"]] = i
+
+        if cat["id"] in UNSEEN_PASCAL_CTX_59_CLASSES:
+            # If this category is unseen, map it to -1 category.
+            # This allows then easy filtering on unseen categories.
+            contiguous_id_to_seen_contiguous_id.append(-1)
+            unseen_dataset_id_to_contiguous_id[cat["id"]] = i
+        else:
+            contiguous_id_to_seen_contiguous_id.append(last_seen_id)
+            seen_dataset_id_to_seen_contiguous_id[cat["id"]] = last_seen_id
+            dataset_id_to_seen_contigous_id[cat["id"]] = last_seen_id
+            last_seen_id += 1
+            seen_dataset_id_to_contiguous_id[cat["id"]] = i
+
+
+    meta["stuff_dataset_id_to_contiguous_id"] = stuff_dataset_id_to_contiguous_id
+    meta["thing_dataset_id_to_contiguous_id"] = thing_dataset_id_to_contiguous_id
+    meta["seen_dataset_id_to_contiguous_id"] = seen_dataset_id_to_contiguous_id
+    meta["dataset_id_to_seen_contigous_id"] = dataset_id_to_seen_contigous_id
+    meta["seen_dataset_id_to_seen_contiguous_id"] = seen_dataset_id_to_seen_contiguous_id
+    meta["unseen_dataset_id_to_contiguous_id"] = unseen_dataset_id_to_contiguous_id
+    meta["seen_dataset_id_to_thing_contigous_id"] = seen_dataset_id_to_thing_contigous_id
+    meta["unseen_dataset_id_to_thing_contigous_id"] = unseen_dataset_id_to_thing_contigous_id
+    meta["contiguous_id_to_seen_contiguous_id"] = contiguous_id_to_seen_contiguous_id
+
+    meta["stuff_classes"] = stuff_classes
+    return meta
+
 
 
 def register_all_ctx59(root):
@@ -64,14 +124,12 @@ def register_all_ctx59(root):
             name, lambda x=image_dir, y=gt_dir: load_sem_seg(y, x, gt_ext="png", image_ext="jpg")
         )
         MetadataCatalog.get(name).set(
-            stuff_classes=meta["stuff_classes"][:],
-            thing_dataset_id_to_contiguous_id={},  # to make Mask2Former happy
-            stuff_dataset_id_to_contiguous_id=meta["stuff_dataset_id_to_contiguous_id"],
             image_root=image_dir,
             sem_seg_root=gt_dir,
             evaluator_type="sem_seg",
             ignore_label=255,
             gt_ext="png",
+            **meta
         )
         
 _root = os.getenv("DETECTRON2_DATASETS", "datasets")
