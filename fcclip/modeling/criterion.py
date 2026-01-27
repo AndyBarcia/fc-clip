@@ -127,15 +127,38 @@ class SetCriterion(nn.Module):
         self.weight_dict = weight_dict
         self.eos_coef = eos_coef
         self.losses = losses
-        empty_weight = torch.ones(self.num_classes + 1)
-        empty_weight[-1] = self.eos_coef
-        self.register_buffer("empty_weight", empty_weight)
 
         # pointwise mask loss parameters
         self.num_points = num_points
         self.oversample_ratio = oversample_ratio
         self.importance_sample_ratio = importance_sample_ratio
         self.sampling_loss = sapmpling_loss
+
+    def loss_objectness(self, outputs, targets, indices, num_masks):
+        """Classification loss (NLL)
+        targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
+        """
+        assert "pred_obj" in outputs
+        src_logits = outputs["pred_obj"].float()  # (B, Q) single object logit a
+
+        idx = self._get_src_permutation_idx(indices)
+        target_classes = torch.zeros(src_logits.shape[:2], dtype=torch.int64, device=src_logits.device)
+        target_classes[idx] = 1  # assumes labels are 0/1 already (0=no, 1=obj)
+
+        # Convert single logit two logits: (no-object, object)
+        logits2 = torch.stack([torch.zeros_like(src_logits), src_logits], dim=-1)  # (B, Q, 2)
+        # Class weights aligned with (no-object, object)
+        class_weight = torch.tensor([self.eos_coef, 1.0], device=src_logits.device, dtype=src_logits.dtype)
+
+        loss_ce = F.cross_entropy(
+            logits2.transpose(1, 2),  # (B, 2, Q)
+            target_classes,           # (B, Q)
+            weight=class_weight,
+            reduction="sum",
+        )
+
+        losses = {"loss_obj": loss_ce / num_masks}
+        return losses
 
     def loss_labels(self, outputs, targets, indices, num_masks):
         """Classification loss (NLL)
@@ -146,13 +169,11 @@ class SetCriterion(nn.Module):
 
         idx = self._get_src_permutation_idx(indices)
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-        target_classes = torch.full(
-            src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device
-        )
-        target_classes[idx] = target_classes_o
+        src_logits_matched = src_logits[idx]
 
-        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
-        losses = {"loss_ce": loss_ce}
+        loss_ce = F.cross_entropy(src_logits_matched, target_classes_o, reduction="sum")
+        
+        losses = {"loss_ce": loss_ce / num_masks}
         return losses
     
     def loss_masks(self, outputs, targets, indices, num_masks):
@@ -271,6 +292,7 @@ class SetCriterion(nn.Module):
 
     def get_loss(self, loss, outputs, targets, indices, num_masks):
         loss_map = {
+            'objectness': self.loss_objectness,
             'labels': self.loss_labels,
             'masks': self.loss_masks,
             'boxes': self.loss_boxes,

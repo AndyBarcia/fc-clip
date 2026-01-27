@@ -135,19 +135,20 @@ class HungarianMatcher(nn.Module):
     @torch.no_grad()
     def memory_efficient_forward(self, outputs, targets):
         """More memory-friendly matching"""
-        bs, num_queries = outputs["pred_logits"].shape[:2]
+        bs, num_queries = outputs["pred_obj"].shape
 
         indices = []
 
         # Iterate through batch size
         for b in range(bs):
 
-            out_prob = outputs["pred_logits"][b].softmax(-1)  # [num_queries, num_classes]
+            out_prob = outputs["pred_obj"][b].sigmoid()  # [num_queries]
             tgt_ids = targets[b]["labels"]
 
             if tgt_ids.numel() > 0:
-                # Compute the classification cost.
-                cost_class = -out_prob[:, tgt_ids]
+                # Compute the classification cost as just the inverse of the probability of the query
+                # being predicted as an object.
+                cost_class = -out_prob[:, None].repeat(1,tgt_ids.shape[-1])  # [num_queries, 1]
 
                 out_mask = outputs["pred_masks"][b]  # [num_queries, H_pred, W_pred]
                 tgt_mask = targets[b]["masks"].to(out_mask)
