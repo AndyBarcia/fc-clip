@@ -167,7 +167,11 @@ class FCCLIP(nn.Module):
         # get text classifier
         try:
             class_names = split_labels(metadata.stuff_classes) # it includes both thing and stuff
-            thing_mask = torch.tensor(metadata.thing_mask) # (C,) 1 if thing else 0 
+            # If thing_mask is not present, assume all classes are stuff
+            try:
+                thing_mask = torch.tensor(metadata.thing_mask) # (C,) 1 if thing else 0 
+            except:
+                thing_mask = torch.tensor([False] * len(metadata.stuff_classes)) # (C,) 1 if thing else 0
             train_class_names = split_labels(train_metadata.stuff_classes)
         except:
             # this could be for insseg, where only thing_classes are available
@@ -622,6 +626,7 @@ class FCCLIP(nn.Module):
             for k in range(cur_classes.shape[0]):
                 pred_class = cur_classes[k].item()
                 isthing = pred_class in self.test_metadata.thing_dataset_id_to_contiguous_id.values()
+                #                 isthing = self.test_thing_mask[pred_class]
                 mask_area = (cur_mask_ids == k).sum().item()
                 original_area = (cur_masks[k] >= 0.5).sum().item()
                 mask = (cur_mask_ids == k) & (cur_masks[k] >= 0.5)
@@ -676,6 +681,7 @@ class FCCLIP(nn.Module):
             keep = torch.zeros_like(scores_per_image).bool()
             for i, lab in enumerate(labels_per_image):
                 keep[i] = lab in self.test_metadata.thing_dataset_id_to_contiguous_id.values()
+                # keep[i] = self.test_thing_mask[lab]
 
             scores_per_image = scores_per_image[keep]
             labels_per_image = labels_per_image[keep]
