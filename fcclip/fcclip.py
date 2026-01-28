@@ -268,13 +268,19 @@ class FCCLIP(nn.Module):
         if use_mask_sampling_matcher is None:
             use_mask_sampling_matcher = use_mask_sampling
 
+        # Whether to use the classification cost in Hungarian matching
+        # like typical Mask2Former models, or only use the objectness, 
+        # like OMTSeg does.
+        use_class_cost_for_matching = cfg.MODEL.MASK_FORMER.USE_CLASS_COST_FOR_MATCHING
+
         # building criterion
         matcher = HungarianMatcher(
             cost_class=class_weight,
             cost_mask=mask_weight,
             cost_dice=dice_weight,
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
-            sapmpling_loss=use_mask_sampling_matcher
+            sapmpling_loss=use_mask_sampling_matcher,
+            use_class_cost=use_class_cost_for_matching
         )
 
         weight_dict = {

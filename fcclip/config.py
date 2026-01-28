@@ -48,6 +48,10 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.USE_MASK_SAMPLING = False
     cfg.MODEL.MASK_FORMER.USE_MASK_SAMPLING_MATCHER = None
 
+    # Whether to use the classification cost in Hungarian matching.
+    # Defaults to the OMTSeg approach of only using objectness cost.
+    cfg.MODEL.MASK_FORMER.USE_CLASS_COST_FOR_MATCHING = False
+
     # transformer config
     cfg.MODEL.MASK_FORMER.NHEADS = 8
     cfg.MODEL.MASK_FORMER.DROPOUT = 0.1

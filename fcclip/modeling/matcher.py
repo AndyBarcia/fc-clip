@@ -114,6 +114,7 @@ class HungarianMatcher(nn.Module):
         cost_dice: float = 1, 
         num_points: int = 0,
         sapmpling_loss: bool = False,
+        use_class_cost: bool = True,
     ):
         """Creates the matcher
 
@@ -131,6 +132,7 @@ class HungarianMatcher(nn.Module):
 
         self.num_points = num_points
         self.sapmpling_loss = sapmpling_loss
+        self.use_class_cost = use_class_cost
 
     @torch.no_grad()
     def memory_efficient_forward(self, outputs, targets):
@@ -141,14 +143,18 @@ class HungarianMatcher(nn.Module):
 
         # Iterate through batch size
         for b in range(bs):
-
+            
+            out_cls = outputs["pred_logits"][b].softmax(-1)  # [num_queries, num_classes]
             out_prob = outputs["pred_obj"][b].sigmoid()  # [num_queries]
             tgt_ids = targets[b]["labels"]
 
             if tgt_ids.numel() > 0:
-                # Compute the classification cost as just the inverse of the probability of the query
-                # being predicted as an object.
-                cost_class = -out_prob[:, None].repeat(1,tgt_ids.shape[-1])  # [num_queries, 1]
+                if self.use_class_cost:
+                    # Take into account the classification and objectness of the query. 
+                    cost_class = -torch.einsum("qg,q->qg", out_cls[:, tgt_ids], out_prob)
+                else:
+                    # Take into account only the objectness of the query, regardless of class.
+                    cost_class = -out_prob[:, None].repeat(1,tgt_ids.shape[-1])  # [num_queries, 1]
 
                 out_mask = outputs["pred_masks"][b]  # [num_queries, H_pred, W_pred]
                 tgt_mask = targets[b]["masks"].to(out_mask)
