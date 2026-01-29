@@ -138,7 +138,6 @@ class FCCLIP(nn.Module):
 
         self.train_text_classifier = None
         self.test_text_classifier = None
-        self.void_embedding = nn.Embedding(1, backbone.dim_latent) # use this for void
 
         (   _, 
             self.train_num_templates, 
@@ -373,8 +372,6 @@ class FCCLIP(nn.Module):
 
         features = self.backbone(images.tensor)
         text_classifier, num_templates = self.get_text_classifier()
-        # Append void class weight
-        text_classifier = torch.cat([text_classifier, F.normalize(self.void_embedding.weight, dim=-1)], dim=0)
         features['text_classifier'] = text_classifier
         features['num_templates'] = num_templates
 

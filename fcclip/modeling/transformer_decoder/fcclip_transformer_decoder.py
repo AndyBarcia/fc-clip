@@ -51,13 +51,13 @@ def get_classification_logits(x, text_classifier, logit_scale, num_templates=Non
     # Handle different text_classifier dimensions
     if text_classifier.dim() == 3:
         # Original case: [num_classes, 2, C]
-        text_classifier = F.normalize(text_classifier, dim=-1).flatten(1,2) # [num_classes*2, C]
+        text_classifier = F.normalize(text_classifier, dim=-1).flatten(0,1) # [num_classes*2, C]
         # Batched matrix multiplication: [B, *, C] @ [C, num_classes*2] -> [B, *, num_classes*2]
         pred_logits = logit_scale * torch.matmul(x, text_classifier.transpose(-1, -2))
         pred_logits = pred_logits.view(*x.shape[:-1], -1, 2)  # [B, *, num_classes, 2]
     elif text_classifier.dim() == 4:
         # New case: [B, num_classes, 2, C]
-        text_classifier = F.normalize(text_classifier, dim=-1).flatten(2,3) # [B, num_classes*2, C]
+        text_classifier = F.normalize(text_classifier, dim=-1).flatten(1,2) # [B, num_classes*2, C]
         # Batched matrix multiplication: [B, *, C] @ [B, C, num_classes*2] -> [B, *, num_classes*2]
         pred_logits = logit_scale * torch.matmul(x, text_classifier.transpose(-1, -2))
         pred_logits = pred_logits.view(*x.shape[:-1], -1, 2)  # [B, *, num_classes, 2]
