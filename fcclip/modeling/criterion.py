@@ -127,9 +127,6 @@ class SetCriterion(nn.Module):
         self.weight_dict = weight_dict
         self.eos_coef = eos_coef
         self.losses = losses
-        empty_weight = torch.ones(self.num_classes + 1)
-        empty_weight[-1] = self.eos_coef
-        self.register_buffer("empty_weight", empty_weight)
 
         # pointwise mask loss parameters
         self.num_points = num_points
@@ -142,17 +139,33 @@ class SetCriterion(nn.Module):
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
         """
         assert "pred_logits" in outputs
-        src_logits = outputs["pred_logits"].float()
+        src_logits = outputs["pred_logits"].float() # (B,Q,T,2)
+        
+        # Compute classification logits and objectness logits from 2D logit table.
+        obj_logits = src_logits.mean(dim=-2)  # (B,Q,2)
+        cls_logits = src_logits.mean(dim=-1)  # (B,Q,T)
 
         idx = self._get_src_permutation_idx(indices)
-        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-        target_classes = torch.full(
-            src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device
+        
+        # Compute objectness loss for all queries
+        target_objectness = torch.zeros(src_logits.shape[:2], dtype=torch.int64, device=src_logits.device)
+        target_objectness[idx] = 1 # (0=no, 1=obj)
+        class_weight = torch.tensor([self.eos_coef, 1.0], device=src_logits.device, dtype=src_logits.dtype)
+        loss_obj = F.cross_entropy(
+            obj_logits.transpose(1, 2),  # (B, 2, Q)
+            target_objectness,           # (B, Q)
+            weight=class_weight
         )
-        target_classes[idx] = target_classes_o
 
-        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
-        losses = {"loss_ce": loss_ce}
+        # Compute classification loss for matched queries
+        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+        cls_logits_matched = cls_logits[idx]
+        loss_ce = F.cross_entropy(cls_logits_matched, target_classes_o, reduction="sum")
+
+        losses = {
+            "loss_obj": loss_obj,
+            "loss_ce": loss_ce / num_masks,
+        }
         return losses
     
     def loss_masks(self, outputs, targets, indices, num_masks):

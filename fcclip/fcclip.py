@@ -280,6 +280,7 @@ class FCCLIP(nn.Module):
 
         weight_dict = {
             "loss_ce": class_weight,
+            "loss_obj": class_weight,
             "loss_mask": mask_weight,
             "loss_dice": dice_weight,
             "loss_bbox": bbox_weight,
@@ -417,6 +418,7 @@ class FCCLIP(nn.Module):
             else:
                 raise NotImplementedError
 
+            """
             out_vocab_cls_results = get_classification_logits(pooled_clip_feature, text_classifier, self.backbone.clip_model.logit_scale, num_templates)
             in_vocab_cls_results = mask_cls_results[..., :-1] # remove void
             out_vocab_cls_results = out_vocab_cls_results[..., :-1] # remove void
@@ -455,7 +457,8 @@ class FCCLIP(nn.Module):
                 cls_results.softmax(-1) * (1.0 - is_void_prob),
                 is_void_prob], dim=-1)
             mask_cls_results = torch.log(mask_cls_probs + 1e-8)
-
+            """
+            
             # upsample masks
             mask_up_pred_results = F.interpolate(
                 mask_pred_results,
@@ -592,16 +595,22 @@ class FCCLIP(nn.Module):
         return new_targets, new_thing_mask
 
     def semantic_inference(self, mask_cls, mask_pred):
-        mask_cls = F.softmax(mask_cls, dim=-1)[..., :-1]
+        # For semantic segmentation we don't care if a query is an object or not; we only
+        # care about the class probabilities.
+        mask_cls = mask_cls.mean(-1) # (Q,T)
+        mask_cls = F.softmax(mask_cls, dim=-1) # (Q,T)
         mask_pred = mask_pred.sigmoid()
         semseg = torch.einsum("qc,qhw->chw", mask_cls, mask_pred)
         return semseg
 
     def panoptic_inference(self, mask_cls, mask_pred):
-        scores, labels = F.softmax(mask_cls, dim=-1).max(-1)
+        obj_logits = mask_cls.mean(dim=-2)  # (Q,2)
+        cls_logits = mask_cls.mean(dim=-1)  # (Q,T)
+
+        scores, labels = F.softmax(cls_logits, dim=-1).max(-1)
+        objectness = F.softmax(obj_logits, dim=-1)[:, 1] # (Q,)
         mask_pred = mask_pred.sigmoid()
-        num_classes = len(self.test_metadata.stuff_classes)
-        keep = labels.ne(num_classes) & (scores > self.object_mask_threshold)
+        keep = (objectness > 0.5) & (scores > self.object_mask_threshold)
         cur_scores = scores[keep]
         cur_classes = labels[keep]
         cur_masks = mask_pred[keep]
@@ -661,7 +670,7 @@ class FCCLIP(nn.Module):
         image_size = mask_pred.shape[-2:]
 
         # [Q, K]
-        scores = F.softmax(mask_cls, dim=-1)[:, :-1]
+        scores = F.softmax(mask_cls[...,1], dim=-1)
         # if this is panoptic segmentation
         if self.panoptic_on:
             num_classes = len(self.test_metadata.stuff_classes)

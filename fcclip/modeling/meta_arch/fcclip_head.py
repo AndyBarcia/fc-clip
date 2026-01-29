@@ -74,17 +74,17 @@ class FCCLIPHead(nn.Module):
         self.clip_embedding_dim = clip_embedding_dim
         if use_rd:
             if thing_stuff_adapter == "linear":
-                self.thing_class_embed = nn.Linear(self.clip_embedding_dim*2, self.clip_embedding_dim)
-                self.stuff_class_embed = nn.Linear(self.clip_embedding_dim*2, self.clip_embedding_dim)
+                self.thing_class_embed = nn.Linear(self.clip_embedding_dim*2, self.clip_embedding_dim*2)
+                self.stuff_class_embed = nn.Linear(self.clip_embedding_dim*2, self.clip_embedding_dim*2)
             else:
-                self.class_embed = nn.Linear(self.clip_embedding_dim*2, self.clip_embedding_dim)
+                self.class_embed = nn.Linear(self.clip_embedding_dim*2, self.clip_embedding_dim*2)
         elif thing_stuff_adapter == "linear":
-            self.thing_class_embed = nn.Linear(self.clip_embedding_dim, self.clip_embedding_dim)
-            self.stuff_class_embed = nn.Linear(self.clip_embedding_dim, self.clip_embedding_dim)
+            self.thing_class_embed = nn.Linear(self.clip_embedding_dim, self.clip_embedding_dim*2)
+            self.stuff_class_embed = nn.Linear(self.clip_embedding_dim, self.clip_embedding_dim*2)
     
         if thing_stuff_adapter == "bias":
-            self.thing_bias = nn.Parameter(torch.zeros(self.clip_embedding_dim))
-            self.stuff_bias = nn.Parameter(torch.zeros(self.clip_embedding_dim))
+            self.thing_bias = nn.Parameter(torch.zeros(self.clip_embedding_dim*2))
+            self.stuff_bias = nn.Parameter(torch.zeros(self.clip_embedding_dim*2))
 
     @classmethod
     def from_config(cls, cfg, input_shape: Dict[str, ShapeSpec]):
@@ -115,110 +115,100 @@ class FCCLIPHead(nn.Module):
 
     def get_relationship_descriptor(
         self,
-        text: torch.Tensor,   # (T,C) or (B,T,C) 
-        img: torch.Tensor,    # (B,C)
-        thing_mask: torch.Tensor,  # (T',) or (B,T')
-        num_templates: list # [T',]
-    ) -> torch.Tensor:
+        text: torch.Tensor,          # (T,C) or (B,T,C)
+        img: torch.Tensor,           # (B,C)
+        thing_mask: torch.Tensor,    # (T',) or (B,T')
+        num_templates: list          # [T',]
+    ) -> torch.Tensor:               # (B,T,2,C)
         B = img.shape[0]
 
         # Expand thing mask for templates.
-        num_templates = torch.tensor(num_templates, dtype=torch.long, device=thing_mask.device)  # (T',)
-        thing_mask = torch.repeat_interleave(thing_mask, num_templates, dim=-1) # (T) or (B,T)
-        # Append 0 for the final void class, which we'll consider as stuff.
+        num_templates_t = torch.tensor(
+            num_templates, dtype=torch.long, device=thing_mask.device
+        )  # (T',)
+        thing_mask = torch.repeat_interleave(thing_mask, num_templates_t, dim=-1).bool()
+        # Normalize masks to (B,T)
         if thing_mask.dim() == 1:
-            thing_mask = torch.cat([thing_mask, torch.tensor([0], dtype=thing_mask.dtype, device=thing_mask.device)], dim=0)  # (T)
+            tm = thing_mask.unsqueeze(0).expand(B, -1)  # (B,T)
         else:
-            thing_mask = torch.cat([thing_mask, torch.zeros((B,1), dtype=thing_mask.dtype, device=thing_mask.device)], dim=1)  # (B,T)
-        stuff_mask = ~thing_mask  # (T) or (B,T)
+            assert thing_mask.shape[0] == B, "Batch size of thing_mask and img must match"
+            tm = thing_mask.bool()
+        sm = ~tm
 
-        # Normalize text to (B,T,C) upfront to handle both Bias and RD logic uniformly
+        # Normalize text to (B,T,C)
         if text.dim() == 2:  # (T,C)
             text_b = text.unsqueeze(0).expand(B, -1, -1)  # (B,T,C)
         else:
-            B_t, T, C = text.shape
-            assert B_t == B, "Batch size of text and img must match"
+            assert text.shape[0] == B, "Batch size of text and img must match"
             text_b = text
 
-        # Add bias if needed
-        # Modified to handle all-thing or all-stuff cases (DDP fix)
-        if self.thing_stuff_adapter == "bias":
-            text_bias = text_b.clone()
-            
-            # Ensure masks are (B,T) for consistent indexing
-            if thing_mask.dim() == 1:
-                tm = thing_mask.unsqueeze(0).expand(B, -1)
-                sm = stuff_mask.unsqueeze(0).expand(B, -1)
-            else:
-                tm, sm = thing_mask, stuff_mask
+        _, T, C = text_b.shape
+        assert C == self.clip_embedding_dim, "Unexpected embedding dim"
 
-            if tm.any():
-                text_bias[tm] = text_b[tm] + self.thing_bias
-            else:
-                # Add 0 * param to graph if unused
-                text_bias = text_bias + 0.0 * self.thing_bias.sum()
-
-            if sm.any():
-                text_bias[sm] = text_b[sm] + self.stuff_bias
-            else:
-                # Add 0 * param to graph if unused
-                text_bias = text_bias + 0.0 * self.stuff_bias.sum()
-        else:
-            text_bias = text_b
-
-        # Build base descriptor rd
+        # Build base feature tensor BEFORE adapters:
+        #   - if use_rd: (B,T,2C) = [rd_img | text]
+        #   - else:      (B,T,C)  = text
         if self.use_rd:
-            if text.dim() == 2:
-                # (T,C) × (B,C) → (B,T,C)
-                rd = einsum(text, img, "t c, b c -> b t c")
-                rd = torch.cat((rd, text_bias), dim=-1)  # (B,T,2C)
-            else:
-                # (B,T,C) × (B,C) → (B,T,C)
-                rd = einsum(text, img, "b t c, b c -> b t c")
-                rd = torch.cat((rd, text_bias), dim=-1)  # (B,T,2C)
+            # (B,T,C) × (B,C) -> (B,T,C)
+            rd_img = einsum(text_b, img, "b t c, b c -> b t c")
+            feat = torch.cat((rd_img, text_b), dim=-1)  # (B,T,2C)
         else:
-            rd = text_bias  # (B,T,C)
+            feat = text_b  # (B,T,C)
 
-        # Apply linear adapters
-        # Modified to handle all-thing or all-stuff cases (DDP fix)
-        if self.thing_stuff_adapter == "linear":
-            T = rd.shape[1]
-            
-            # Normalize thing_mask to (B,T) bool
-            if thing_mask.dim() == 1:
-                tm = thing_mask.bool().unsqueeze(0).expand(B, -1)  # (B,T)
-                sm = stuff_mask.bool().unsqueeze(0).expand(B, -1)  # (B,T)
-            else:
-                tm = thing_mask.bool()
-                sm = stuff_mask.bool()
+        # Bias adapter
+        if self.thing_stuff_adapter == "bias":
+            # Ensure feat is (B,T,2C) so we can add 2C bias
+            if feat.shape[-1] == self.clip_embedding_dim:
+                feat = torch.cat((feat, feat), dim=-1)  # (B,T,2C)
 
-            # Per-type linear heads
-            rd_out = torch.empty(B, T, self.clip_embedding_dim, device=rd.device, dtype=rd.dtype)
-            
+            feat_bias = feat.clone()
+
+            # Modified to handle all-thing or all-stuff cases (DDP fix)
             if tm.any():
-                rd_out[tm] = self.thing_class_embed(rd[tm]).to(rd.dtype)
+                feat_bias[tm] = feat[tm] + self.thing_bias
             else:
-                # Fake computation for DDP
-                rd_out = rd_out + 0.0 * self.thing_class_embed.weight.sum()
-                if self.thing_class_embed.bias is not None:
-                    rd_out = rd_out + 0.0 * self.thing_class_embed.bias.sum()
+                feat_bias = feat_bias + 0.0 * self.thing_bias.sum()
 
             if sm.any():
-                rd_out[sm] = self.stuff_class_embed(rd[sm]).to(rd.dtype)
+                feat_bias[sm] = feat[sm] + self.stuff_bias
             else:
-                # Fake computation for DDP
-                rd_out = rd_out + 0.0 * self.stuff_class_embed.weight.sum()
+                feat_bias = feat_bias + 0.0 * self.stuff_bias.sum()
+
+            feat = feat_bias
+
+        # Linear adapters
+        if self.thing_stuff_adapter == "linear":
+            out_dim = self.clip_embedding_dim * 2  # heads output 2C
+            out = torch.empty(B, T, out_dim, device=feat.device, dtype=feat.dtype)
+
+            # Modified to handle all-thing or all-stuff cases (DDP fix)
+            if tm.any():
+                out[tm] = self.thing_class_embed(feat[tm]).to(feat.dtype)
+            else:
+                out = out + 0.0 * self.thing_class_embed.weight.sum()
+                if self.thing_class_embed.bias is not None:
+                    out = out + 0.0 * self.thing_class_embed.bias.sum()
+
+            if sm.any():
+                out[sm] = self.stuff_class_embed(feat[sm]).to(feat.dtype)
+            else:
+                out = out + 0.0 * self.stuff_class_embed.weight.sum()
                 if self.stuff_class_embed.bias is not None:
-                    rd_out = rd_out + 0.0 * self.stuff_class_embed.bias.sum()
+                    out = out + 0.0 * self.stuff_class_embed.bias.sum()
 
         elif self.use_rd:
-            # Shared linear head
-            rd_out = self.class_embed(rd)
+            # Shared linear head (expects/provides 2C in your modified setup)
+            out = self.class_embed(feat)  # (B,T,2C)
         else:
             # No linear adapters
-            rd_out = rd
+            out = feat  # (B,T,C) or (B,T,2C if bias duplicated)
 
-        return rd_out.float()  # (B,T,C)
+        if out.shape[-1] == self.clip_embedding_dim * 2:
+            out = out.reshape(B, T, 2, self.clip_embedding_dim)
+        else:
+            raise ValueError(f"Unexpected last dim {out.shape[-1]} (expected 2C).")
+
+        return out.float()  # (B,T,2,C)
 
     def forward(self, features, mask=None):
         return self.layers(features, mask)

@@ -142,7 +142,7 @@ class HungarianMatcher(nn.Module):
         # Iterate through batch size
         for b in range(bs):
 
-            out_prob = outputs["pred_logits"][b].softmax(-1)  # [num_queries, num_classes]
+            out_prob = outputs["pred_logits"][b,:,:,1].softmax(-1)  # [num_queries, num_classes]
             tgt_ids = targets[b]["labels"]
 
             if tgt_ids.numel() > 0:

@@ -36,9 +36,9 @@ def build_transformer_decoder(cfg, in_channels, mask_classification=True):
     return TRANSFORMER_DECODER_REGISTRY.get(name)(cfg, in_channels, mask_classification)
 
 
-def get_classification_logits(x, text_classifier, logit_scale, num_templates=None, text_attn_logits=None):
+def get_classification_logits(x, text_classifier, logit_scale, num_templates=None):
     # x in shape of [B, *, C]
-    # text_classifier: either [num_classes, C] or [B, num_classes, C]
+    # text_classifier: either [num_classes, 2, C] or [B, num_classes, 2, C]
     # text_attn_logits: optional [B, Q, num_classes]
     # logit_scale: scalar
     # num_templates: list of template counts per non-void class
@@ -49,21 +49,18 @@ def get_classification_logits(x, text_classifier, logit_scale, num_templates=Non
     logit_scale = torch.clamp(logit_scale.exp(), max=100)
     
     # Handle different text_classifier dimensions
-    if text_classifier.dim() == 2:
-        # Original case: [num_classes, C]
-        text_classifier = F.normalize(text_classifier, dim=-1)
-        if text_attn_logits is None:
-            pred_logits = logit_scale * (x @ text_classifier.T)
-        else:
-            pred_logits = logit_scale * ((x @ text_classifier.T) + text_attn_logits)
-    elif text_classifier.dim() == 3:
-        # New case: [B, num_classes, C]
-        text_classifier = F.normalize(text_classifier, dim=-1)
-        # Batched matrix multiplication: [B, *, C] @ [B, C, num_classes] -> [B, *, num_classes]
-        if text_attn_logits is None:
-            pred_logits = logit_scale * torch.matmul(x, text_classifier.transpose(-1, -2))
-        else:
-            pred_logits = logit_scale * (torch.matmul(x, text_classifier.transpose(-1, -2)) + text_attn_logits)
+    if text_classifier.dim() == 3:
+        # Original case: [num_classes, 2, C]
+        text_classifier = F.normalize(text_classifier, dim=-1).flatten(1,2) # [num_classes*2, C]
+        # Batched matrix multiplication: [B, *, C] @ [C, num_classes*2] -> [B, *, num_classes*2]
+        pred_logits = logit_scale * torch.matmul(x, text_classifier.transpose(-1, -2))
+        pred_logits = pred_logits.view(*x.shape[:-1], -1, 2)  # [B, *, num_classes, 2]
+    elif text_classifier.dim() == 4:
+        # New case: [B, num_classes, 2, C]
+        text_classifier = F.normalize(text_classifier, dim=-1).flatten(2,3) # [B, num_classes*2, C]
+        # Batched matrix multiplication: [B, *, C] @ [B, C, num_classes*2] -> [B, *, num_classes*2]
+        pred_logits = logit_scale * torch.matmul(x, text_classifier.transpose(-1, -2))
+        pred_logits = pred_logits.view(*x.shape[:-1], -1, 2)  # [B, *, num_classes, 2]
     else:
         raise ValueError(f"text_classifier must be 2D or 3D, got {text_classifier.dim()}D")
     
@@ -73,13 +70,11 @@ def get_classification_logits(x, text_classifier, logit_scale, num_templates=Non
     # Process each group of templates for non-void classes
     for num_t in num_templates:
         # Slice current template group and take max
-        group_logits = pred_logits[..., cur_idx:cur_idx + num_t]
-        final_pred_logits.append(group_logits.max(-1).values)
+        group_logits = pred_logits[:, :, cur_idx:cur_idx + num_t, :]  # [B, *, num_t, 2]
+        final_pred_logits.append(group_logits.max(-2).values)
         cur_idx += num_t
-    # Append void class (last element)
-    final_pred_logits.append(pred_logits[..., -1])
     # Stack along new class dimension
-    final_pred_logits = torch.stack(final_pred_logits, dim=-1)
+    final_pred_logits = torch.stack(final_pred_logits, dim=-2)  # [B, *, num_classes_final, 2]
     
     return final_pred_logits
 

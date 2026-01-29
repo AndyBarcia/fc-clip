@@ -563,7 +563,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                 thing_mask=thing_mask,
                 num_templates=num_templates,
             )
-            patch_scores = outputs_class[...,:-1].max(dim=-1).values
+            patch_scores = outputs_class[...,1].max(dim=-1).values
             topk_indices = patch_scores.topk(self.num_queries, dim=1).indices
             patch_output = patch_output.permute(1, 0, 2)
             topk_features = torch.gather(
@@ -590,12 +590,14 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         predictions_mask = []
         predictions_bbox = []
 
-        # Optional starting cross-attention for text. 
+        # Optional starting cross-attention for text.
+        # Pay attention only to the object text embeddings.
         if self.text_atnn_cls:
             output_flat = output.flatten(0, 1)
             query_embed_flat = query_embed.flatten(0, 1)
             output_flat, text_attn_logits = self.intermediate_text_cross_attention_layer(
-                output_flat, text_classifier,
+                output_flat, 
+                text_classifier[:,:,0], # (B,T,C)
                 query_pos=query_embed_flat,
                 return_attn_logits=self.text_atnn_cls
             )
@@ -647,9 +649,11 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             output_flat = output_flat.transpose(0,1) # (Q,B,C)
 
             # then, text cross-attention
+            # Pay attention only to the object text embeddings.
             if self.text_attn:
                 output_flat, text_attn_logits = self.transformer_text_cross_attention_layers[i](
-                    output_flat, text_classifier,
+                    output_flat, 
+                    text_classifier[:,:,0], # (B,T,C)
                     query_pos=query_embed_flat,
                     return_attn_logits=self.text_atnn_cls
                 )
@@ -717,9 +721,9 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             thing_mask_embed, stuff_mask_embed = mask_embed.chunk(2, dim=-1) # (B,Q,C), (B,Q,C)
 
             class_embed = self.class_embed(decoder_output) # (B,Q,C)
-            class_logits = get_classification_logits(class_embed, text_classifier, self.logit_scale, num_templates, text_attn_logits)[:,:,:-1].detach() # (B,Q,T)
+            class_logits = get_classification_logits(class_embed, text_classifier, self.logit_scale, num_templates).detach() # (B,Q,T,2)
             temp = self.thing_stuff_temperature.exp()
-            outputs_class = F.softmax(class_logits / temp, dim=-1) # (B,Q,T)
+            outputs_class = F.softmax(class_logits.mean(dim=-1) / temp, dim=-1) # (B,Q,T)
             output_thing_mask = torch.einsum("bqt,t->bq", outputs_class, thing_mask.to(outputs_class.dtype).to(outputs_class.device))  # (B,Q)
 
             thing_mask = torch.einsum("bqc,bchw->bqhw", thing_mask_embed, mask_features)
@@ -760,7 +764,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         maskpool_embeddings = self.mask_pooling(x=mask_features, mask=outputs_mask) # [B, Q, C]
         maskpool_embeddings = self._mask_pooling_proj(maskpool_embeddings)
         class_embed = self.class_embed(maskpool_embeddings + decoder_output)
-        outputs_class = get_classification_logits(class_embed, text_classifier, self.logit_scale, num_templates, text_attn_logits)
+        outputs_class = get_classification_logits(class_embed, text_classifier, self.logit_scale, num_templates) # (B,Q,T,2)
 
         attn_mask = build_attn_mask_maxpool(
             outputs_mask, 
