@@ -139,15 +139,20 @@ class HungarianMatcher(nn.Module):
 
         indices = []
 
+        obj_logits = outputs["pred_logits"].mean(dim=-2)  # (B,Q,2)
+        cls_logits = outputs["pred_logits"].mean(dim=-1)  # (B,Q,T)
+
         # Iterate through batch size
         for b in range(bs):
 
-            out_prob = outputs["pred_logits"][b,:,:,1].softmax(-1)  # [num_queries, num_classes]
+            out_prob = cls_logits[b].softmax(-1)  # [num_queries, num_classes]
+            out_obj_prob = obj_logits[b].softmax(-1)[..., 1]  # [num_queries]
             tgt_ids = targets[b]["labels"]
 
             if tgt_ids.numel() > 0:
                 # Compute the classification cost.
                 cost_class = -out_prob[:, tgt_ids]
+                cost_obj = -out_obj_prob[:, None].repeat(1,tgt_ids.shape[-1])  # [num_queries, num_target_boxes]
 
                 out_mask = outputs["pred_masks"][b]  # [num_queries, H_pred, W_pred]
                 tgt_mask = targets[b]["masks"].to(out_mask)
@@ -199,6 +204,7 @@ class HungarianMatcher(nn.Module):
                 C = (
                     self.cost_mask * cost_mask
                     + self.cost_class * cost_class
+                    + self.cost_class * cost_obj
                     + self.cost_dice * cost_dice
                 )
             else:
