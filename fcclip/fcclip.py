@@ -507,12 +507,27 @@ class FCCLIP(nn.Module):
         # Decide to randomly swap thing and stuff classes
         batch_size = len(targets)
         if self.probability_swap_thing != 0.0 and self.probability_swap_stuff != 0.0:
-            swap_probability = torch.where(
-                self.train_thing_mask,
-                torch.full_like(self.train_thing_mask, self.probability_swap_thing, dtype=torch.float),
-                torch.full_like(self.train_thing_mask, self.probability_swap_stuff, dtype=torch.float)
+            swap_probability_table = torch.tensor(
+                [
+                    [1.0, 0.0],  # all stuff
+                    [0.0, 1.0],  # all thing
+                    [0.0, 0.0],  # normal GT
+                    [0.1, 0.1],  # moderate fusion
+                ],
+                device=self.train_thing_mask.device,
+                dtype=torch.float,
             )
-            swap_probability = swap_probability.unsqueeze(0).expand(batch_size, -1)
+            repeats = (batch_size + swap_probability_table.shape[0] - 1) // swap_probability_table.shape[0]
+            swap_probability_table = swap_probability_table.repeat(repeats, 1)[:batch_size]
+            shuffle_indices = torch.randperm(batch_size, device=swap_probability_table.device)
+            swap_probability_table = swap_probability_table[shuffle_indices]
+            thing_prob = swap_probability_table[:, 0].unsqueeze(1)
+            stuff_prob = swap_probability_table[:, 1].unsqueeze(1)
+            swap_probability = torch.where(
+                self.train_thing_mask.unsqueeze(0),
+                thing_prob,
+                stuff_prob,
+            )
             flip_mask = torch.bernoulli(swap_probability).bool()
             new_thing_mask = torch.logical_xor(self.train_thing_mask.unsqueeze(0), flip_mask)
         else:
