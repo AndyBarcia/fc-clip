@@ -706,7 +706,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         attn_mask_size,
         attn_mask_target_size, 
         text_classifier, 
-        thing_mask, # (T,)
+        thing_mask, # (T,) or (B,T,)
         num_templates
     ):
         decoder_output = self.decoder_norm(output)
@@ -720,7 +720,9 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             class_logits = get_classification_logits(class_embed, text_classifier, self.logit_scale, num_templates, text_attn_logits)[:,:,:-1].detach() # (B,Q,T)
             temp = self.thing_stuff_temperature.exp()
             outputs_class = F.softmax(class_logits / temp, dim=-1) # (B,Q,T)
-            output_thing_mask = torch.einsum("bqt,t->bq", outputs_class, thing_mask.to(outputs_class.dtype).to(outputs_class.device))  # (B,Q)
+            if thing_mask.dim() == 1:
+                thing_mask = thing_mask[None, :].expand(outputs_class.shape[0], -1) # (B,T)
+            output_thing_mask = torch.einsum("bqt,bt->bq", outputs_class, thing_mask.to(outputs_class.dtype).to(outputs_class.device))  # (B,Q)
 
             thing_mask = torch.einsum("bqc,bchw->bqhw", thing_mask_embed, mask_features)
             stuff_mask = torch.einsum("bqc,bchw->bqhw", stuff_mask_embed, mask_features)
