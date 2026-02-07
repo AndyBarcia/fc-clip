@@ -505,25 +505,33 @@ class FCCLIP(nn.Module):
 
     def prepare_targets(self, targets, images):
         # Decide to randomly swap thing and stuff classes
+        batch_size = len(targets)
         if self.probability_swap_thing != 0.0 and self.probability_swap_stuff != 0.0:
             swap_probability = torch.where(
                 self.train_thing_mask,
                 torch.full_like(self.train_thing_mask, self.probability_swap_thing, dtype=torch.float),
                 torch.full_like(self.train_thing_mask, self.probability_swap_stuff, dtype=torch.float)
             )
+            swap_probability = swap_probability.unsqueeze(0).expand(batch_size, -1)
             flip_mask = torch.bernoulli(swap_probability).bool()
-            new_thing_mask = torch.logical_xor(self.train_thing_mask, flip_mask)
+            new_thing_mask = torch.logical_xor(self.train_thing_mask.unsqueeze(0), flip_mask)
         else:
-            flip_mask = torch.zeros_like(self.train_thing_mask).bool()
-            new_thing_mask = self.train_thing_mask
+            flip_mask = torch.zeros(
+                (batch_size, self.train_thing_mask.shape[0]),
+                device=self.train_thing_mask.device,
+                dtype=torch.bool,
+            )
+            new_thing_mask = self.train_thing_mask.unsqueeze(0).expand(batch_size, -1)
         
         h_pad, w_pad = images.tensor.shape[-2:]
         new_targets = []
 
-        for targets_per_image in targets:
+        for idx, targets_per_image in enumerate(targets):
             gt_masks = targets_per_image.gt_masks  # [N, H, W]
             gt_classes = targets_per_image.gt_classes  # [N]
             h, w = targets_per_image.image_size
+            per_image_flip_mask = flip_mask[idx]
+            per_image_thing_mask = new_thing_mask[idx]
 
             new_masks_list = []
             new_labels_list = []
@@ -535,8 +543,7 @@ class FCCLIP(nn.Module):
                     cls_inds = torch.nonzero(gt_classes == cls, as_tuple=True)[0]
                     cls_masks = gt_masks[cls_inds]  # [K, H, W]
 
-                    was_flipped = bool(flip_mask[cls].item())
-                    is_thing_now = bool(new_thing_mask[cls].item())
+                    is_thing_now = bool(per_image_thing_mask[cls].item())
 
                     # If class is stuff now, merge all disjoint masks into one
                     if not is_thing_now:
