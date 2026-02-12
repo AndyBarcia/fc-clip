@@ -402,9 +402,7 @@ class FCCLIP(nn.Module):
             out_vocab_cls_results = get_classification_logits(
                 pooled_clip_feature, 
                 text_classifier, 
-                self.backbone.clip_model.logit_scale, 
-                num_templates=num_templates,
-                append_void_class=False
+                self.backbone.clip_model.logit_scale
             )
             return out_vocab_cls_results
 

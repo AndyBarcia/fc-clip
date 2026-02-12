@@ -69,160 +69,186 @@ def build_attn_mask_maxpool(outputs_mask, attn_mask_target_size, num_heads, thre
     return attn_mask.detach()
 
 class TextCrossAttentionLayer(nn.Module):
-
+    """
+    Manual multi-head cross-attention:
+      - q: (Q, B, d_model)
+      - k/v: (T, B, d_clip)
+    Additionally:
+      - length-normalize q,k (per head) before dot-product
+      - optionally ensemble qk logits with out_of_vocab_logits (from mask->CLIP)
+        *inside this module* to produce the attention logits.
+    """
     def __init__(
-        self, 
-        d_model, 
+        self,
+        d_model: int,
         d_clip: int,
-        nhead, 
-        dropout=0.0,
-        activation="relu", 
-        normalize_before=False
+        nhead: int,
+        dropout: float = 0.0,
+        activation: str = "relu",
+        normalize_before: bool = False,
     ):
         super().__init__()
-        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, kdim=d_clip, vdim=d_clip, dropout=dropout)
+        assert d_model % nhead == 0, f"d_model={d_model} must be divisible by nhead={nhead}"
+        self.d_model = d_model
+        self.d_clip = d_clip
+        self.num_heads = nhead
+        self.head_dim = d_model // nhead
+
+        # Projections
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_clip, d_model)
+        self.v_proj = nn.Linear(d_clip, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
-        self.activation = _get_activation_fn(activation)
         self.normalize_before = normalize_before
+        self.activation = _get_activation_fn(activation)
+
+        self.in_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+
         self._reset_parameters()
 
-        # TODO update this.
-        # - Directly use CLIP out-of-vocab logits here to extract value embeddings from unseen classes.
-        # - Use query-key length normalization of the in-vocab logits.
-    
     def _reset_parameters(self):
-        for p in self.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
+        for m in [self.q_proj, self.k_proj, self.v_proj, self.out_proj]:
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
 
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
 
-    def _compute_attn_logits(self, q, k):
-        # Project queries and keys
-        if self.multihead_attn._qkv_same_embed_dim:
-            # Combined projection weights
-            w_q, w_k, _ = self.multihead_attn.in_proj_weight.chunk(3, dim=0)
-            b_q, b_k, _ = self.multihead_attn.in_proj_bias.chunk(3)
-        else:
-            # Separate projection weights
-            w_q = self.multihead_attn.q_proj_weight
-            w_k = self.multihead_attn.k_proj_weight
-            b_q = self.multihead_attn.in_proj_bias[:self.multihead_attn.embed_dim]
-            b_k = self.multihead_attn.in_proj_bias[self.multihead_attn.embed_dim:2*self.multihead_attn.embed_dim]
+    def _mha_forward(
+        self,
+        q: Tensor,  # (Q,B,d_model)
+        k: Tensor,  # (T,B,d_clip)
+        v: Tensor,  # (T,B,d_clip)
+        *,
+        out_of_vocab_logits: Optional[Tensor] = None,  # (B,Q,C) or (B,Q,T)
+        ensemble_alpha: Optional[Tensor] = None,        # scalar in [0,1]
+        return_attn_logits: bool = False,
+    ):
+        Q_len, B, _ = q.shape
+        T_len = k.shape[0]
 
-        q = F.linear(q, w_q, b_q)
-        k = F.linear(k, w_k, b_k)
-        
-        # Prepare dimensions
-        tgt_len, bsz, embed_dim = q.size()
-        src_len = k.size(0)
-        head_dim = embed_dim // self.multihead_attn.num_heads
-        
-        # Reshape queries and keys for efficient computation
-        q = q.contiguous().view(tgt_len, bsz, self.multihead_attn.num_heads, head_dim)
-        k = k.contiguous().view(src_len, bsz, self.multihead_attn.num_heads, head_dim)
-        
-        # Compute scaled dot-product attention logits
-        # Using einsum for efficient computation of averaged attention
-        attn_logits = torch.einsum('ibhd,jbhd->bij', q, k) / math.sqrt(head_dim)
-        
-        # Result is already averaged over heads due to einsum operation
-        return attn_logits  # Shape: [bsz, tgt_len, src_len]
+        # Project
+        q = self.q_proj(q)  # (Q,B,d_model)
+        k = self.k_proj(k)  # (T,B,d_model)
+        v = self.v_proj(v)  # (T,B,d_model)
+
+        # (B, heads, L, head_dim)
+        q = q.permute(1, 0, 2).reshape(B, Q_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = k.permute(1, 0, 2).reshape(B, T_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = v.permute(1, 0, 2).reshape(B, T_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        # Length-normalize queries and keys (per-head)
+        q = F.normalize(q, p=2, dim=-1, eps=1e-6)
+        k = F.normalize(k, p=2, dim=-1, eps=1e-6)
+
+        # Cosine attention logits: (B, heads, Q, T)
+        logit_scale = self.in_vocab_logit_scale.exp().clamp(max=100)
+        in_vocab_attn_logits = torch.einsum("bhqd,bhkd->bhqk", q, k) * logit_scale
+
+        # Ensemble inside attention logits (logit-space)
+        if out_of_vocab_logits is not None:
+            if ensemble_alpha is None:
+                raise ValueError("ensemble_alpha must be provided when out_of_vocab_logits is provided.")
+            out_of_vocab_logits = out_of_vocab_logits.unsqueeze(1)  # (B,1,Q,T) broadcast over heads
+            attn_logits = in_vocab_attn_logits * (1.0 - ensemble_alpha) + out_of_vocab_logits * ensemble_alpha
+        else:
+            attn_logits = in_vocab_attn_logits
+
+        # Attention weights and output
+        attn_weights = F.softmax(attn_logits, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        out = torch.einsum("bhqk,bhkd->bhqd", attn_weights, v)  # (B,heads,Q,head_dim)
+
+        # Merge heads: (Q,B,d_model)
+        out = out.permute(0, 2, 1, 3).reshape(B, Q_len, self.d_model).permute(1, 0, 2)
+        out = self.out_proj(out)
+
+        # Return logits averaged over heads
+        attn_logits_avg = attn_logits.mean(dim=1) if return_attn_logits else None  # (B,Q,T)
+
+        return out, attn_logits_avg
 
     def forward_post(
-        self, 
-        tgt, 
-        text_classification,
+        self,
+        tgt: Tensor,
+        text_classification: Tensor,
         query_pos: Optional[Tensor] = None,
+        *,
+        out_of_vocab_logits: Optional[Tensor] = None,
+        ensemble_alpha: Optional[Tensor] = None,
         return_attn_logits: bool = False,
     ):
         q = self.with_pos_embed(tgt, query_pos)
         k = v = text_classification
-        
-        if return_attn_logits:
-            # Compute attention logits (already averaged over heads)
-            attn_logits = self._compute_attn_logits(q, k)
-            
-            # Use multihead_attn for output computation
-            tgt2 = self.multihead_attn(
-                query=q,
-                key=k,
-                value=v,
-                attn_mask=None,
-                key_padding_mask=None
-            )[0]
-        else:
-            tgt2 = self.multihead_attn(
-                query=q,
-                key=k,
-                value=v,
-                attn_mask=None,
-                key_padding_mask=None
-            )[0]
-        
+
+        tgt2, attn_logits = self._mha_forward(
+            q, k, v,
+            out_of_vocab_logits=out_of_vocab_logits,
+            ensemble_alpha=ensemble_alpha,
+            return_attn_logits=return_attn_logits,
+        )
+
         tgt = tgt + self.dropout(tgt2)
         tgt = self.norm(tgt)
-        
         return (tgt, attn_logits) if return_attn_logits else (tgt, None)
 
     def forward_pre(
-        self, 
-        tgt, 
-        text_classification,
+        self,
+        tgt: Tensor,
+        text_classification: Tensor,
         query_pos: Optional[Tensor] = None,
-        return_attn_logits: bool = False
+        *,
+        out_of_vocab_logits: Optional[Tensor] = None,
+        ensemble_alpha: Optional[Tensor] = None,
+        return_attn_logits: bool = False,
     ):
         tgt2 = self.norm(tgt)
         q = self.with_pos_embed(tgt2, query_pos)
         k = v = text_classification
-        
-        if return_attn_logits:
-            # Compute attention logits (already averaged over heads)
-            attn_logits = self._compute_attn_logits(q, k)
-            
-            # Use multihead_attn for output computation
-            tgt2 = self.multihead_attn(
-                query=q,
-                key=k,
-                value=v,
-                attn_mask=None,
-                key_padding_mask=None
-            )[0]
-        else:
-            tgt2 = self.multihead_attn(
-                query=q,
-                key=k,
-                value=v,
-                attn_mask=None,
-                key_padding_mask=None
-            )[0]
-        
+
+        tgt2, attn_logits = self._mha_forward(
+            q, k, v,
+            out_of_vocab_logits=out_of_vocab_logits,
+            ensemble_alpha=ensemble_alpha,
+            return_attn_logits=return_attn_logits,
+        )
+
         tgt = tgt + self.dropout(tgt2)
         return (tgt, attn_logits) if return_attn_logits else (tgt, None)
 
     def forward(
-        self, 
-        tgt, 
-        text_classification, # (B,T,C) or (T,C)
+        self,
+        tgt: Tensor,
+        text_classification: Tensor,  # (B,T,C) or (T,C)
         query_pos: Optional[Tensor] = None,
-        return_attn_logits: bool = False
+        *,
+        out_of_vocab_logits: Optional[Tensor] = None,
+        ensemble_alpha: Optional[Tensor] = None,
+        return_attn_logits: bool = False,
     ):
+        # Make text_classification (T,B,C)
         if len(text_classification.shape) == 2:
-            text_classification = text_classification[:,None].expand(-1,tgt.shape[1],-1) # (T,B,C)
+            text_classification = text_classification[:, None].expand(-1, tgt.shape[1], -1)
         else:
-            text_classification = text_classification.transpose(0,1) # (T,B,C)
+            text_classification = text_classification.transpose(0, 1)
 
         if self.normalize_before:
             return self.forward_pre(
-                tgt, text_classification, query_pos, 
-                return_attn_logits=return_attn_logits
+                tgt, text_classification, query_pos,
+                out_of_vocab_logits=out_of_vocab_logits,
+                ensemble_alpha=ensemble_alpha,
+                return_attn_logits=return_attn_logits,
             )
         else:
             return self.forward_post(
                 tgt, text_classification, query_pos,
-                return_attn_logits=return_attn_logits
+                out_of_vocab_logits=out_of_vocab_logits,
+                ensemble_alpha=ensemble_alpha,
+                return_attn_logits=return_attn_logits,
             )
 
 
@@ -417,7 +443,6 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         # Classification ensemble in logit space. The out_of_vocab distribution is assumed
         # fixed and scaled by the frozen temperature given by clip. We only learn the 
         # temperature of the in_vocab distribution, and the ensembling weight alpha.
-        self.in_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         self.ensemble_alpha = torch.nn.Parameter(torch.tensor(0.0))
         self.obj_head = MLP(hidden_dim, hidden_dim, 1, 3)
 
@@ -526,7 +551,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         else:
             patch_output = torch.cat(src, dim=0)
             patch_pos = torch.cat(pos, dim=0)
-            outputs_class, _, _, _, _ = self.forward_prediction_heads(
+            outputs_class, _, _, _, _, _ = self.forward_prediction_heads(
                 patch_output,
                 mask_features,
                 None,
@@ -571,8 +596,11 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             output_flat = output.flatten(0, 1)
             query_embed_flat = query_embed.flatten(0, 1)
             output_flat, text_attn_logits = self.intermediate_text_cross_attention_layer(
-                output_flat, text_classifier,
+                output_flat, 
+                text_classifier,
                 query_pos=query_embed_flat,
+                out_of_vocab_logits=None,
+                ensemble_alpha=None,
                 return_attn_logits=self.text_atnn_cls
             )
             output = output_flat.view(self.query_h, self.query_w, bs, -1)
@@ -580,7 +608,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             text_attn_logits = None
 
         # prediction heads on learnable query features
-        outputs_class, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
+        outputs_class, out_of_vocab_logits, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
             output.flatten(0, 1), 
             mask_features,
             text_attn_logits,
@@ -627,8 +655,11 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             # then, text cross-attention
             if self.text_attn:
                 output_flat, text_attn_logits = self.transformer_text_cross_attention_layers[i](
-                    output_flat, text_classifier,
+                    output_flat, 
+                    text_classifier,
                     query_pos=query_embed_flat,
+                    out_of_vocab_logits=out_of_vocab_logits,
+                    ensemble_alpha=self.ensemble_alpha,
                     return_attn_logits=self.text_atnn_cls
                 )
             else:
@@ -646,7 +677,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                 output_flat
             )
 
-            outputs_class, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
+            outputs_class, out_of_vocab_logits, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
                 output_flat, 
                 mask_features, 
                 text_attn_logits,
@@ -696,8 +727,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         mask_embed = self.mask_embed(decoder_output) # (B,Q,2*C)
 
         # Get classification logits from attention patterns.
-        logit_scale = self.in_vocab_logit_scale.exp().clamp(max=100)
-        in_vocab_logits = logit_scale * get_untemplated_classification_logits(
+        vocab_logits = get_untemplated_classification_logits(
             text_attn_logits, 
             num_templates, 
             append_void_class=False
@@ -709,10 +739,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
 
             # Use the class predictions of the previous layer to predict thing vs. stuff.
             # For the very first layer, just use the in-vocab logits to predict thing vs. stuff
-            if prev_outputs_class is None:
-                top_class = in_vocab_logits.argmax(dim=-1)  # (B,Q)  long indices
-            else:
-                top_class = prev_outputs_class[...,:-1].argmax(dim=-1)  # (B,Q)  long indices
+            top_class = vocab_logits.argmax(dim=-1)  # (B,Q)  long indices
             if thing_mask.dim() == 1:
                 thing_mask = thing_mask[None, :].expand(top_class.shape[0], -1)  # (B,T)
             output_thing_mask = thing_mask.to(top_class.device).gather(1, top_class).to(mask_embed.dtype)  # (B,Q)
@@ -726,10 +753,6 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         # Get mask-to-clip logits from predicted masks.
         with torch.no_grad():
             out_of_vocab_logits = mask_to_clip_logits_fn(outputs_mask) # (B,Q,T)
-
-        # Ensemble the two logit distributions.
-        alpha = self.ensemble_alpha.sigmoid() # (1,)
-        vocab_logits = out_of_vocab_logits*alpha + in_vocab_logits*(1-alpha) # (B,Q,T)
 
         # Append objectness logit to learn to predict no-object.
         obj_logits = self.obj_head(decoder_output).squeeze(-1) # (B,Q)
@@ -746,7 +769,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         outputs_bbox = None
         query_bbox_unsigmoid_detached = None
 
-        return outputs_class, outputs_mask, outputs_bbox, query_bbox_unsigmoid_detached, attn_mask
+        return outputs_class, out_of_vocab_logits, outputs_mask, outputs_bbox, query_bbox_unsigmoid_detached, attn_mask
 
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_seg_masks, outputs_bboxes):

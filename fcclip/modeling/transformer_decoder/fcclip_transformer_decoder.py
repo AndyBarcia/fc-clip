@@ -53,11 +53,10 @@ def get_untemplated_classification_logits(pred_logits, num_templates=None, appen
     
     return final_pred_logits
 
-def get_classification_logits(x, text_classifier, logit_scale, num_templates=None, append_void_class=True):
+def get_classification_logits(x, text_classifier, logit_scale):
     # x in shape of [B, *, C]
     # text_classifier: either [num_classes, C] or [B, num_classes, C]
     # logit_scale: scalar
-    # num_templates: list of template counts per non-void class
     # Returns: [B, *, num_classes_final] where num_classes_final = len(num_templates) + 1
     
     # Normalize input features
@@ -77,11 +76,7 @@ def get_classification_logits(x, text_classifier, logit_scale, num_templates=Non
     else:
         raise ValueError(f"text_classifier must be 2D or 3D, got {text_classifier.dim()}D")
     
-    return get_untemplated_classification_logits(
-        pred_logits, 
-        num_templates=num_templates, 
-        append_void_class=append_void_class
-    )
+    return pred_logits
 
 
 # Ref: https://github.com/NVlabs/ODISE/blob/e97b06c424c575fec9fc5368dd4b3e050d91abc4/odise/modeling/meta_arch/odise.py#L923
@@ -754,9 +749,12 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         maskpool_embeddings = self._mask_pooling_proj(maskpool_embeddings)
         class_embed = self.class_embed(maskpool_embeddings + decoder_output)
 
-        # TODO here convert text_classifier to RD descriptors.
-
-        outputs_class = get_classification_logits(class_embed, text_classifier, self.logit_scale, num_templates)
+        outputs_class = get_classification_logits(class_embed, text_classifier, self.logit_scale)
+        outputs_class = get_untemplated_classification_logits(
+            outputs_class, 
+            num_templates=num_templates, 
+            append_void_class=True
+        )
 
         # NOTE: prediction is of higher-resolution
         # [B, Q, H, W] -> [B, Q, H*W] -> [B, h, Q, H*W] -> [B*h, Q, HW]
