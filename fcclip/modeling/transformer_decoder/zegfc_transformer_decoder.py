@@ -22,6 +22,7 @@ from .position_encoding import PositionEmbeddingSine
 from .fcclip_transformer_decoder import (
     TRANSFORMER_DECODER_REGISTRY,
     get_classification_logits,
+    get_untemplated_classification_logits,
     MaskPooling,
     SelfAttentionLayer,
     CrossAttentionLayer,
@@ -85,6 +86,10 @@ class TextCrossAttentionLayer(nn.Module):
         self.activation = _get_activation_fn(activation)
         self.normalize_before = normalize_before
         self._reset_parameters()
+
+        # TODO update this.
+        # - Directly use CLIP out-of-vocab logits here to extract value embeddings from unseen classes.
+        # - Use query-key length normalization of the in-vocab logits.
     
     def _reset_parameters(self):
         for p in self.parameters():
@@ -280,27 +285,12 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         self.pe_layer = PositionEmbeddingSine(N_steps, normalize=True)
         
         # Box regression module
-        self.box_reg_type = box_reg_type
         self.query_h = query_h
         self.query_w = query_w
         assert self.query_h > 0 and self.query_w > 0, "query_h and query_w must be positive"
         self.num_queries = self.query_h * self.query_w
-        if self.box_reg_type == "mlp":
-            self._bbox_embed = BBoxMLPRegression(hidden_dim)
-            self.query_bbox = nn.Embedding(self.num_queries, 4) if self._bbox_embed != None else None
-        elif self.box_reg_type in ['bitmask', 'mask2box']:
-            self.mask2box_threshold = 0.0
-            self._bbox_embed = BboxMaskInitialization(
-                fast_bbox = self.box_reg_type=="mask2box",
-                threshold=self.mask2box_threshold
-            )
-            self.query_bbox = None
-        elif self.box_reg_type == "stn":
-            self._bbox_embed = BboxMaskSTN(pooling="mean", learn_format="cxcywh")
-            self.query_bbox = None
-        else:
-            self._bbox_embed = None
-            self.query_bbox = None
+        self._bbox_embed = None
+        self.query_bbox = None
         
         # Attention type
         self.self_attn_type = self_attn_type
@@ -424,21 +414,12 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         if self.separate_thing_stuff_mask_embed:
             self.thing_stuff_temperature = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
-        # FC-CLIP
-        self.mask_pooling = MaskPooling()
-        self._mask_pooling_proj = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim))
-        
-        self.class_embed_type = class_embed_type
-        if self.class_embed_type == "mlp":
-            self.class_embed = MLP(hidden_dim, hidden_dim, clip_embedding_dim, 3)
-        elif self.class_embed_type == "linear":
-            self.class_embed = nn.Linear(hidden_dim, clip_embedding_dim)
-            weight_init.c2_xavier_fill(self.class_embed)
-        else:
-            raise ValueError(f"Unknown class_embed_type: {self.class_embed_type}")
-        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        # Classification ensemble in logit space. The out_of_vocab distribution is assumed
+        # fixed and scaled by the frozen temperature given by clip. We only learn the 
+        # temperature of the in_vocab distribution, and the ensembling weight alpha.
+        self.in_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        self.ensemble_alpha = torch.nn.Parameter(torch.tensor(0.0))
+        self.obj_head = MLP(hidden_dim, hidden_dim, 1, 3)
 
         # ZEG-FC
         self.text_attn = text_attn
@@ -452,22 +433,6 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                 dropout=0.0,
                 normalize_before=pre_norm,
             )
-        
-        self.attn_conv_kernel_size = attn_conv_kernel_size
-        if self.attn_conv_kernel_size:
-            self.attn_conv_layer = nn.Sequential(
-                nn.ReLU(),
-                nn.Conv2d(
-                    in_channels=1, out_channels=1,
-                    kernel_size=self.attn_conv_kernel_size, groups=1, padding="same", bias=False
-                )
-            )
-        
-        self.mask_pos_mlp_type = mask_pos_mlp_type
-        if self.mask_pos_mlp_type != "none":
-            self.mask_pos_mlp = PosMLP(hidden_dim, 16, batched=("brpb" in self.mask_pos_mlp_type))
-        else:
-            self.mask_pos_mlp = None
 
     @classmethod
     def from_config(cls, cfg, in_channels, mask_classification):
@@ -508,7 +473,16 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         ret["separate_thing_stuff_mask_embed"] = cfg.MODEL.ZEG_FC.SEPARATE_THING_STUFF_MASK_EMBED
         return ret
 
-    def forward(self, x, mask_features, mask = None, text_classifier=None, thing_mask=None, num_templates=None):
+    def forward(
+        self, 
+        x, 
+        mask_features, 
+        mask = None, 
+        text_classifier=None, 
+        thing_mask=None, 
+        num_templates=None,
+        mask_to_clip_logits_fn=None
+    ):
         # x is a list of multi-scale feature
         assert len(x) == self.num_feature_levels
         src = []
@@ -562,6 +536,8 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                 text_classifier=text_classifier,
                 thing_mask=thing_mask,
                 num_templates=num_templates,
+                mask_to_clip_logits_fn=mask_to_clip_logits_fn,
+                prev_outputs_class=None
             )
             patch_scores = outputs_class[...,:-1].max(dim=-1).values
             topk_indices = patch_scores.topk(self.num_queries, dim=1).indices
@@ -613,7 +589,9 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             attn_mask_target_size=size_list[0],
             text_classifier=text_classifier, 
             thing_mask=thing_mask,
-            num_templates=num_templates
+            num_templates=num_templates,
+            mask_to_clip_logits_fn=mask_to_clip_logits_fn,
+            prev_outputs_class=None
         )
         predictions_class.append(outputs_class)
         predictions_mask.append(outputs_mask)
@@ -677,7 +655,9 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                 attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels],
                 text_classifier=text_classifier, 
                 thing_mask=thing_mask,
-                num_templates=num_templates
+                num_templates=num_templates,
+                mask_to_clip_logits_fn=mask_to_clip_logits_fn,
+                prev_outputs_class=predictions_class[-1].detach()
             )
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
@@ -707,20 +687,35 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         attn_mask_target_size, 
         text_classifier, 
         thing_mask, # (T,)
-        num_templates
+        num_templates,
+        mask_to_clip_logits_fn,
+        prev_outputs_class=None
     ):
         decoder_output = self.decoder_norm(output)
         decoder_output = decoder_output.transpose(0, 1)
         mask_embed = self.mask_embed(decoder_output) # (B,Q,2*C)
 
+        # Get classification logits from attention patterns.
+        logit_scale = self.in_vocab_logit_scale.exp().clamp(max=100)
+        in_vocab_logits = logit_scale * get_untemplated_classification_logits(
+            text_attn_logits, 
+            num_templates, 
+            append_void_class=False
+        ) # (B,Q,T)
+
+        # Get mask predictions from mask embeddings.
         if self.separate_thing_stuff_mask_embed:
             thing_mask_embed, stuff_mask_embed = mask_embed.chunk(2, dim=-1) # (B,Q,C), (B,Q,C)
 
-            class_embed = self.class_embed(decoder_output) # (B,Q,C)
-            class_logits = get_classification_logits(class_embed, text_classifier, self.logit_scale, num_templates, text_attn_logits)[:,:,:-1].detach() # (B,Q,T)
-            temp = self.thing_stuff_temperature.exp()
-            outputs_class = F.softmax(class_logits / temp, dim=-1) # (B,Q,T)
-            output_thing_mask = torch.einsum("bqt,t->bq", outputs_class, thing_mask.to(outputs_class.dtype).to(outputs_class.device))  # (B,Q)
+            # Use the class predictions of the previous layer to predict thing vs. stuff.
+            # For the very first layer, just use the in-vocab logits to predict thing vs. stuff
+            if prev_outputs_class is None:
+                top_class = in_vocab_logits.argmax(dim=-1)  # (B,Q)  long indices
+            else:
+                top_class = prev_outputs_class[...,:-1].argmax(dim=-1)  # (B,Q)  long indices
+            if thing_mask.dim() == 1:
+                thing_mask = thing_mask[None, :].expand(top_class.shape[0], -1)  # (B,T)
+            output_thing_mask = thing_mask.to(top_class.device).gather(1, top_class).to(mask_embed.dtype)  # (B,Q)
 
             thing_mask = torch.einsum("bqc,bchw->bqhw", thing_mask_embed, mask_features)
             stuff_mask = torch.einsum("bqc,bchw->bqhw", stuff_mask_embed, mask_features)
@@ -728,46 +723,28 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         else:
             outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)  # (B,Q,H,W)
 
-        # Apply convolution MLP to the mask features.
-        if self.attn_conv_kernel_size:
-            outputs_mask = outputs_mask.flatten(0,1).unsqueeze(1)  # [B*Q, 1, H, W]
-            outputs_mask = outputs_mask + self.attn_conv_layer(outputs_mask)  # [B*Q, 1, H, W]
-            bs = decoder_output.shape[0]
-            outputs_mask = outputs_mask.squeeze(1).unflatten(0, (bs, -1))  # [B, Q, H, W]
+        # Get mask-to-clip logits from predicted masks.
+        with torch.no_grad():
+            out_of_vocab_logits = mask_to_clip_logits_fn(outputs_mask) # (B,Q,T)
 
-        # Do box regression if provided with look forward twice
-        if self._bbox_embed != None:
-            outputs_bbox, query_bbox_unsigmoid_detached = self._bbox_embed(
-                x=decoder_output, 
-                reference_points=query_bbox_unsigmoid.transpose(0,1) if query_bbox_unsigmoid is not None else None, 
-                masks=outputs_mask, 
-                normalized_space=False
-            )
-            outputs_bbox = outputs_bbox.sigmoid()
-            query_bbox_unsigmoid_detached = query_bbox_unsigmoid_detached.transpose(0,1)
-        else:
-            outputs_bbox, query_bbox_unsigmoid_detached = None, None
+        # Ensemble the two logit distributions.
+        alpha = self.ensemble_alpha.sigmoid() # (1,)
+        vocab_logits = out_of_vocab_logits*alpha + in_vocab_logits*(1-alpha) # (B,Q,T)
 
-        # Apply pos mlp bias
-        if self.mask_pos_mlp is not None:            
-            outputs_mask = outputs_mask + self.mask_pos_mlp(
-                outputs_bbox,
-                outputs_mask.shape[-2:],
-                decoder_output
-            )
+        # Append objectness logit to learn to predict no-object.
+        obj_logits = self.obj_head(decoder_output).squeeze(-1) # (B,Q)
+        outputs_class = torch.cat([vocab_logits, obj_logits.unsqueeze(-1)], dim=-1) # (B,Q,T+1)
 
-        # fcclip head
-        maskpool_embeddings = self.mask_pooling(x=mask_features, mask=outputs_mask) # [B, Q, C]
-        maskpool_embeddings = self._mask_pooling_proj(maskpool_embeddings)
-        class_embed = self.class_embed(maskpool_embeddings + decoder_output)
-        outputs_class = get_classification_logits(class_embed, text_classifier, self.logit_scale, num_templates, text_attn_logits)
-
+        # The final attention mask for the next layer is built from the predicted masks at the current layer
         attn_mask = build_attn_mask_maxpool(
             outputs_mask, 
             attn_mask_target_size, 
             self.num_heads,
             thresh=0.5
         )
+
+        outputs_bbox = None
+        query_bbox_unsigmoid_detached = None
 
         return outputs_class, outputs_mask, outputs_bbox, query_bbox_unsigmoid_detached, attn_mask
 

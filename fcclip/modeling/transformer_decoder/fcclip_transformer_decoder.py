@@ -35,11 +35,27 @@ def build_transformer_decoder(cfg, in_channels, mask_classification=True):
     name = cfg.MODEL.MASK_FORMER.TRANSFORMER_DECODER_NAME
     return TRANSFORMER_DECODER_REGISTRY.get(name)(cfg, in_channels, mask_classification)
 
+def get_untemplated_classification_logits(pred_logits, num_templates=None, append_void_class=True):
+    # Max ensembling over templates
+    final_pred_logits = []
+    cur_idx = 0
+    # Process each group of templates for non-void classes
+    for num_t in num_templates:
+        # Slice current template group and take max
+        group_logits = pred_logits[..., cur_idx:cur_idx + num_t]
+        final_pred_logits.append(group_logits.max(-1).values)
+        cur_idx += num_t
+    # Append void class (last element)
+    if append_void_class:
+        final_pred_logits.append(pred_logits[..., -1])
+    # Stack along new class dimension
+    final_pred_logits = torch.stack(final_pred_logits, dim=-1)
+    
+    return final_pred_logits
 
-def get_classification_logits(x, text_classifier, logit_scale, num_templates=None, text_attn_logits=None):
+def get_classification_logits(x, text_classifier, logit_scale, num_templates=None, append_void_class=True):
     # x in shape of [B, *, C]
     # text_classifier: either [num_classes, C] or [B, num_classes, C]
-    # text_attn_logits: optional [B, Q, num_classes]
     # logit_scale: scalar
     # num_templates: list of template counts per non-void class
     # Returns: [B, *, num_classes_final] where num_classes_final = len(num_templates) + 1
@@ -52,36 +68,20 @@ def get_classification_logits(x, text_classifier, logit_scale, num_templates=Non
     if text_classifier.dim() == 2:
         # Original case: [num_classes, C]
         text_classifier = F.normalize(text_classifier, dim=-1)
-        if text_attn_logits is None:
-            pred_logits = logit_scale * (x @ text_classifier.T)
-        else:
-            pred_logits = logit_scale * ((x @ text_classifier.T) + text_attn_logits)
+        pred_logits = logit_scale * (x @ text_classifier.T)
     elif text_classifier.dim() == 3:
         # New case: [B, num_classes, C]
         text_classifier = F.normalize(text_classifier, dim=-1)
         # Batched matrix multiplication: [B, *, C] @ [B, C, num_classes] -> [B, *, num_classes]
-        if text_attn_logits is None:
-            pred_logits = logit_scale * torch.matmul(x, text_classifier.transpose(-1, -2))
-        else:
-            pred_logits = logit_scale * (torch.matmul(x, text_classifier.transpose(-1, -2)) + text_attn_logits)
+        pred_logits = logit_scale * torch.matmul(x, text_classifier.transpose(-1, -2))
     else:
         raise ValueError(f"text_classifier must be 2D or 3D, got {text_classifier.dim()}D")
     
-    # Max ensembling over templates
-    final_pred_logits = []
-    cur_idx = 0
-    # Process each group of templates for non-void classes
-    for num_t in num_templates:
-        # Slice current template group and take max
-        group_logits = pred_logits[..., cur_idx:cur_idx + num_t]
-        final_pred_logits.append(group_logits.max(-1).values)
-        cur_idx += num_t
-    # Append void class (last element)
-    final_pred_logits.append(pred_logits[..., -1])
-    # Stack along new class dimension
-    final_pred_logits = torch.stack(final_pred_logits, dim=-1)
-    
-    return final_pred_logits
+    return get_untemplated_classification_logits(
+        pred_logits, 
+        num_templates=num_templates, 
+        append_void_class=append_void_class
+    )
 
 
 # Ref: https://github.com/NVlabs/ODISE/blob/e97b06c424c575fec9fc5368dd4b3e050d91abc4/odise/modeling/meta_arch/odise.py#L923

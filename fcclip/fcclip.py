@@ -138,7 +138,6 @@ class FCCLIP(nn.Module):
 
         self.train_text_classifier = None
         self.test_text_classifier = None
-        self.void_embedding = nn.Embedding(1, backbone.dim_latent) # use this for void
 
         (   _, 
             self.train_num_templates, 
@@ -368,8 +367,6 @@ class FCCLIP(nn.Module):
 
         features = self.backbone(images.tensor)
         text_classifier, num_templates = self.get_text_classifier()
-        # Append void class weight
-        text_classifier = torch.cat([text_classifier, F.normalize(self.void_embedding.weight, dim=-1)], dim=0)
         features['text_classifier'] = text_classifier
         features['num_templates'] = num_templates
 
@@ -383,7 +380,35 @@ class FCCLIP(nn.Module):
             features['thing_mask'] = self.test_thing_mask
             #features['thing_mask'] = torch.ones_like(self.test_thing_mask)
 
-        outputs = self.sem_seg_head(features)
+        # Function used to get clip logits from mask predictions, which will be used for both training and inference
+        def mask_to_clip_logits(mask_pred):
+            clip_feature = features["clip_vis_dense"]
+            mask_for_pooling = F.interpolate(
+                mask_pred, 
+                size=clip_feature.shape[-2:],
+                mode='bilinear', 
+                align_corners=False
+            )
+            if "convnext" in self.backbone.model_name.lower():
+                # TODO mask pooling uses here hard thresholding. Maybe use sigmoid and use
+                # smooth pooling instead?
+                pooled_clip_feature = self.mask_pooling(clip_feature, mask_for_pooling)
+                pooled_clip_feature = self.backbone.visual_prediction_forward(pooled_clip_feature)
+            elif "rn" in self.backbone.model_name.lower():
+                pooled_clip_feature = self.backbone.visual_prediction_forward(clip_feature, mask_for_pooling)
+            else:
+                raise NotImplementedError
+            
+            out_vocab_cls_results = get_classification_logits(
+                pooled_clip_feature, 
+                text_classifier, 
+                self.backbone.clip_model.logit_scale, 
+                num_templates=num_templates,
+                append_void_class=False
+            )
+            return out_vocab_cls_results
+
+        outputs = self.sem_seg_head(features, mask_to_clip_logits_fn=mask_to_clip_logits)
 
         if self.training:
             # bipartite matching-based loss
@@ -400,57 +425,6 @@ class FCCLIP(nn.Module):
             mask_cls_results = outputs["pred_logits"]
             mask_pred_results = outputs["pred_masks"]
             mask_box_results = outputs.get("pred_boxes")
-
-            # We ensemble the pred logits of in-vocab and out-vocab
-            clip_feature = features["clip_vis_dense"]
-            mask_for_pooling = F.interpolate(mask_pred_results, size=clip_feature.shape[-2:],
-                                                mode='bilinear', align_corners=False)
-            if "convnext" in self.backbone.model_name.lower():
-                pooled_clip_feature = self.mask_pooling(clip_feature, mask_for_pooling)
-                pooled_clip_feature = self.backbone.visual_prediction_forward(pooled_clip_feature)
-            elif "rn" in self.backbone.model_name.lower():
-                pooled_clip_feature = self.backbone.visual_prediction_forward(clip_feature, mask_for_pooling)
-            else:
-                raise NotImplementedError
-
-            out_vocab_cls_results = get_classification_logits(pooled_clip_feature, text_classifier, self.backbone.clip_model.logit_scale, num_templates)
-            in_vocab_cls_results = mask_cls_results[..., :-1] # remove void
-            out_vocab_cls_results = out_vocab_cls_results[..., :-1] # remove void
-
-            # Reference: https://github.com/NVlabs/ODISE/blob/main/odise/modeling/meta_arch/odise.py#L1506
-            out_vocab_cls_probs = out_vocab_cls_results.softmax(-1)
-            in_vocab_cls_results = in_vocab_cls_results.softmax(-1)
-            category_overlapping_mask = self.category_overlapping_mask.to(self.device)
-
-            if self.ensemble_on_valid_mask:
-                # Only include out_vocab cls results on masks with valid pixels
-                # We empirically find that this is important to obtain reasonable AP/mIOU score with ResNet CLIP models
-                valid_masking = (mask_for_pooling > 0).to(mask_for_pooling).sum(-1).sum(-1) > 0
-                valid_masking = valid_masking.to(in_vocab_cls_results.dtype).unsqueeze(-1)
-                alpha = torch.ones_like(in_vocab_cls_results) * self.geometric_ensemble_alpha
-                beta = torch.ones_like(in_vocab_cls_results) * self.geometric_ensemble_beta
-                alpha = alpha * valid_masking
-                beta = beta * valid_masking
-            else:
-                alpha = self.geometric_ensemble_alpha
-                beta = self.geometric_ensemble_beta
-
-            cls_logits_seen = (
-                (in_vocab_cls_results ** (1 - alpha) * out_vocab_cls_probs**alpha).log()
-                * category_overlapping_mask
-            )
-            cls_logits_unseen = (
-                (in_vocab_cls_results ** (1 - beta) * out_vocab_cls_probs**beta).log()
-                * (1 - category_overlapping_mask)
-            )
-            cls_results = cls_logits_seen + cls_logits_unseen
-
-            # This is used to filtering void predictions.
-            is_void_prob = F.softmax(mask_cls_results, dim=-1)[..., -1:]
-            mask_cls_probs = torch.cat([
-                cls_results.softmax(-1) * (1.0 - is_void_prob),
-                is_void_prob], dim=-1)
-            mask_cls_results = torch.log(mask_cls_probs + 1e-8)
 
             # upsample masks
             mask_up_pred_results = F.interpolate(
