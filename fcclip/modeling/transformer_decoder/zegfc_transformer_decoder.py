@@ -502,6 +502,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         self, 
         x, 
         mask_features, 
+        clip_vis_dense,
         mask = None, 
         text_classifier=None, 
         thing_mask=None, 
@@ -698,6 +699,8 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         assert len(predictions_class) == self.num_layers + 1
 
         out = {
+            'mask_features': mask_features,
+            'clip_vis_dense': clip_vis_dense,
             'pred_logits': predictions_class[-1],
             'pred_masks': predictions_mask[-1],
             'pred_boxes': predictions_bbox[-1],
@@ -750,9 +753,9 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         else:
             outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)  # (B,Q,H,W)
 
-        # Get mask-to-clip logits from predicted masks.
-        with torch.no_grad():
-            out_of_vocab_logits = mask_to_clip_logits_fn(outputs_mask) # (B,Q,T)
+        # Get mask-to-clip logits from predicted masks. We use the learned mask features
+        # that are adjusted with representation compensation.
+        out_of_vocab_logits = mask_to_clip_logits_fn(outputs_mask, mask_features) # (B,Q,T)
 
         # Append objectness logit to learn to predict no-object.
         obj_logits = self.obj_head(decoder_output).squeeze(-1) # (B,Q)

@@ -257,6 +257,7 @@ class FCCLIP(nn.Module):
         mask_weight = cfg.MODEL.MASK_FORMER.MASK_WEIGHT
         bbox_weight = cfg.MODEL.MASK_FORMER.BBOX_WEIGHT
         giou_weight = cfg.MODEL.MASK_FORMER.GIOU_WEIGHT
+        rc_weight = cfg.MODEL.MASK_FORMER.RC_WEIGHT
 
         # Use sampling for mask loss
         use_mask_sampling = cfg.MODEL.MASK_FORMER.USE_MASK_SAMPLING
@@ -278,7 +279,8 @@ class FCCLIP(nn.Module):
             "loss_mask": mask_weight,
             "loss_dice": dice_weight,
             "loss_bbox": bbox_weight,
-            "loss_giou": giou_weight
+            "loss_giou": giou_weight,
+            "loss_rc": rc_weight
         }
 
         if deep_supervision:
@@ -288,7 +290,7 @@ class FCCLIP(nn.Module):
                 aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
             weight_dict.update(aux_weight_dict)
 
-        losses = ["labels", "masks", "boxes"]
+        losses = ["labels", "masks", "boxes", "rc"]
 
         criterion = SetCriterion(
             sem_seg_head.num_classes,
@@ -381,26 +383,40 @@ class FCCLIP(nn.Module):
             #features['thing_mask'] = torch.ones_like(self.test_thing_mask)
 
         # Function used to get clip logits from mask predictions, which will be used for both training and inference
-        def mask_to_clip_logits(mask_pred):
-            clip_feature = features["clip_vis_dense"]
-            mask_for_pooling = F.interpolate(
-                mask_pred, 
-                size=clip_feature.shape[-2:],
-                mode='bilinear', 
-                align_corners=False
-            )
+        def mask_to_clip_logits(
+            mask_pred, # (B,Q,H,W)
+            clip_features # (B,C,h,w)
+        ):
+            clip_features = features["clip_vis_dense"] if clip_features is None else clip_features
+            
+            B,Q,H,W = mask_pred.shape[:4]
+            B,C,h,w = clip_features.shape
+
+            # Reduce predicted masks to CLIP feature map size using max-based pooling.
+            with torch.no_grad():
+                probs = mask_pred.sigmoid() # [B, Q, H, W]
+                x = probs.view(B * Q, 1, H, W) # [B*Q, 1, H, W]
+                pooled = F.adaptive_max_pool2d(x, output_size=(h, w)) # [B*Q, 1, h, w]
+                pooled = pooled.view(B, Q, h, w) # [B, Q, h, w]
+                mask = (pooled > 0).to(mask.dtype) # [B, Q, h, w]
+                denorm = mask.sum(dim=(-1, -2), keepdim=True) + 1e-8 # [B, Q]
+
+            # Get pooled CLIP features.
+            mask_pooled_clip_features = torch.einsum(
+                "bchw,bqhw->bqc",
+                clip_features,
+                mask / denorm,
+            ) # [B,Q,C]
+
+            # Apply frozen CLIP head to obtain CLIP classification features.
             if "convnext" in self.backbone.model_name.lower():
-                # TODO mask pooling uses here hard thresholding. Maybe use sigmoid and use
-                # smooth pooling instead?
-                pooled_clip_feature = self.mask_pooling(clip_feature, mask_for_pooling)
-                pooled_clip_feature = self.backbone.visual_prediction_forward(pooled_clip_feature)
-            elif "rn" in self.backbone.model_name.lower():
-                pooled_clip_feature = self.backbone.visual_prediction_forward(clip_feature, mask_for_pooling)
+                mask_pooled_clip_features = self.backbone.visual_prediction_forward(mask_pooled_clip_features)
             else:
                 raise NotImplementedError
             
+            # Get classification logits by comparing them to the original untuned text embeddings.
             out_vocab_cls_results = get_classification_logits(
-                pooled_clip_feature, 
+                mask_pooled_clip_features, 
                 text_classifier, 
                 self.backbone.clip_model.logit_scale
             )

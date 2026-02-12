@@ -94,6 +94,18 @@ def calculate_uncertainty(logits):
     return -(torch.abs(gt_class_logits))
 
 
+def multires_pool(x, sizes):
+    B = x.shape[0]
+    emb = []
+    for size in sizes:
+        tensor = F.avg_pool2d(x, kernel_size=size)
+        horizontal_pool = tensor.sum(dim=2).view(B, -1)
+        vertical_pool = tensor.sum(dim=3).view(B, -1)
+        emb.append(torch.cat([horizontal_pool, vertical_pool], dim=-1))
+
+    return torch.cat(emb, dim=1)
+
+
 class SetCriterion(nn.Module):
     """This class computes the loss for DETR.
     The process happens in two steps:
@@ -233,6 +245,32 @@ class SetCriterion(nn.Module):
         }
 
         return losses
+
+    def loss_rc(self, outputs, targets, indices, num_masks):
+        assert "clip_vis_dense" in outputs
+        assert "mask_features" in outputs
+
+        clip_vis_dense = outputs["clip_vis_dense"]
+        mask_features = outputs["mask_features"]
+
+        mask_features = mask_features.to(device=clip_vis_dense.device, dtype=clip_vis_dense.dtype)
+
+        B,H,W = clip_vis_dense.shape[:3]
+        spp_sizes = [ H//scale for scale in (1,2,4) ]
+
+        # ReLU preprocessing
+        clip_vis_dense = torch.clamp(clip_vis_dense, min=0.0)
+        mask_features = torch.clamp(mask_features, min=0.0)
+
+        # Pool to different resolutions.
+        clip_vis_dense = multires_pool(clip_vis_dense, spp_sizes)
+        mask_features = multires_pool(mask_features, spp_sizes)
+        
+        # Compute L1 smooth loss of both feature maps.
+        loss_rc = F.smooth_l1_loss(clip_vis_dense, mask_features)
+
+        return {"loss_rc": loss_rc}
+    
     
     def loss_boxes(self, outputs, targets, indices, num_boxes):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
@@ -274,6 +312,7 @@ class SetCriterion(nn.Module):
             'labels': self.loss_labels,
             'masks': self.loss_masks,
             'boxes': self.loss_boxes,
+            'rc': self.loss_rc
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_masks)

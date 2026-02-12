@@ -232,6 +232,7 @@ class FCCLIPHead(nn.Module):
             predictions = self.predictor(
                 multi_scale_features, 
                 mask_features, 
+                features["clip_vis_dense"],
                 mask,
                 text_classifier=text_classifier, 
                 thing_mask=features['thing_mask'],
