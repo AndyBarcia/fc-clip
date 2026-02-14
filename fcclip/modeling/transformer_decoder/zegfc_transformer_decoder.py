@@ -107,6 +107,12 @@ class TextCrossAttentionLayer(nn.Module):
 
         self.in_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
+        self.register_buffer(
+            "ensemble_alpha",
+            torch.linspace(0.0, 1.0, steps=nhead).view(1, nhead, 1, 1),
+            persistent=False,
+        )
+
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -125,7 +131,6 @@ class TextCrossAttentionLayer(nn.Module):
         v: Tensor,  # (T,B,d_clip)
         *,
         out_of_vocab_logits: Optional[Tensor] = None,  # (B,Q,C) or (B,Q,T)
-        ensemble_alpha: Optional[Tensor] = None,        # scalar in [0,1]
         return_attn_logits: bool = False,
     ):
         Q_len, B, _ = q.shape
@@ -151,10 +156,12 @@ class TextCrossAttentionLayer(nn.Module):
 
         # Ensemble inside attention logits (logit-space)
         if out_of_vocab_logits is not None:
-            if ensemble_alpha is None:
-                raise ValueError("ensemble_alpha must be provided when out_of_vocab_logits is provided.")
             out_of_vocab_logits = out_of_vocab_logits.unsqueeze(1)  # (B,1,Q,T) broadcast over heads
-            attn_logits = in_vocab_attn_logits * (1.0 - ensemble_alpha) + out_of_vocab_logits * ensemble_alpha
+            alpha = self.ensemble_alpha.to(
+                device=in_vocab_attn_logits.device, 
+                dtype=in_vocab_attn_logits.dtype
+            )  # (1,H,1,1)
+            attn_logits = in_vocab_attn_logits * (1.0 - alpha) + out_of_vocab_logits * alpha
         else:
             attn_logits = in_vocab_attn_logits
 
@@ -179,7 +186,6 @@ class TextCrossAttentionLayer(nn.Module):
         query_pos: Optional[Tensor] = None,
         *,
         out_of_vocab_logits: Optional[Tensor] = None,
-        ensemble_alpha: Optional[Tensor] = None,
         return_attn_logits: bool = False,
     ):
         q = self.with_pos_embed(tgt, query_pos)
@@ -188,7 +194,6 @@ class TextCrossAttentionLayer(nn.Module):
         tgt2, attn_logits = self._mha_forward(
             q, k, v,
             out_of_vocab_logits=out_of_vocab_logits,
-            ensemble_alpha=ensemble_alpha,
             return_attn_logits=return_attn_logits,
         )
 
@@ -203,7 +208,6 @@ class TextCrossAttentionLayer(nn.Module):
         query_pos: Optional[Tensor] = None,
         *,
         out_of_vocab_logits: Optional[Tensor] = None,
-        ensemble_alpha: Optional[Tensor] = None,
         return_attn_logits: bool = False,
     ):
         tgt2 = self.norm(tgt)
@@ -213,7 +217,6 @@ class TextCrossAttentionLayer(nn.Module):
         tgt2, attn_logits = self._mha_forward(
             q, k, v,
             out_of_vocab_logits=out_of_vocab_logits,
-            ensemble_alpha=ensemble_alpha,
             return_attn_logits=return_attn_logits,
         )
 
@@ -227,7 +230,6 @@ class TextCrossAttentionLayer(nn.Module):
         query_pos: Optional[Tensor] = None,
         *,
         out_of_vocab_logits: Optional[Tensor] = None,
-        ensemble_alpha: Optional[Tensor] = None,
         return_attn_logits: bool = False,
     ):
         # Make text_classification (T,B,C)
@@ -240,14 +242,12 @@ class TextCrossAttentionLayer(nn.Module):
             return self.forward_pre(
                 tgt, text_classification, query_pos,
                 out_of_vocab_logits=out_of_vocab_logits,
-                ensemble_alpha=ensemble_alpha,
                 return_attn_logits=return_attn_logits,
             )
         else:
             return self.forward_post(
                 tgt, text_classification, query_pos,
                 out_of_vocab_logits=out_of_vocab_logits,
-                ensemble_alpha=ensemble_alpha,
                 return_attn_logits=return_attn_logits,
             )
 
@@ -440,10 +440,6 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         if self.separate_thing_stuff_mask_embed:
             self.thing_stuff_temperature = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
-        # Classification ensemble in logit space. The out_of_vocab distribution is assumed
-        # fixed and scaled by the frozen temperature given by clip. We only learn the 
-        # temperature of the in_vocab distribution, and the ensembling weight alpha.
-        self.ensemble_alpha = torch.nn.Parameter(torch.tensor(0.0))
         self.obj_head = MLP(hidden_dim, hidden_dim, 1, 3)
 
         # ZEG-FC
@@ -600,7 +596,6 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                 text_classifier,
                 query_pos=query_embed_flat,
                 out_of_vocab_logits=None,
-                ensemble_alpha=None,
                 return_attn_logits=self.text_atnn_cls
             )
             output = output_flat.view(self.query_h, self.query_w, bs, -1)
@@ -659,7 +654,6 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                     text_classifier,
                     query_pos=query_embed_flat,
                     out_of_vocab_logits=out_of_vocab_logits,
-                    ensemble_alpha=self.ensemble_alpha,
                     return_attn_logits=self.text_atnn_cls
                 )
             else:
@@ -679,7 +673,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
 
             outputs_class, out_of_vocab_logits, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
                 output_flat, 
-                mask_features, 
+                mask_features,
                 text_attn_logits,
                 query_bbox_unsigmoid=query_bbox_unsigmoid,
                 attn_mask_size=size_list[i % self.num_feature_levels],
