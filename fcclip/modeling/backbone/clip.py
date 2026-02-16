@@ -68,6 +68,7 @@ class CLIP(Backbone):
             "res4": 16,
             "res5": 32,
             "clip_vis_dense": 32,
+            "clip_dense_embedding": 32,
             "clip_embedding": -1
         }
         self._out_feature_channels = {
@@ -77,6 +78,7 @@ class CLIP(Backbone):
             "res4": self.output_channels[3],
             "res5": self.output_channels[4],
             "clip_vis_dense": self.output_channels[4],
+            "clip_dense_embedding": self.dim_latent,
             "clip_embedding": self.dim_latent
         }
 
@@ -127,6 +129,12 @@ class CLIP(Backbone):
         x = self.clip_model.visual.trunk.norm_pre(x)
         out['clip_vis_dense'] = x.contiguous()
 
+        # Dense CLIP embeddings: apply CLIP visual head to each spatial token.
+        b, c, h, w = x.shape
+        dense_tokens = x.permute(0, 2, 3, 1).reshape(b, h * w, c)
+        dense_embeddings = self.visual_prediction_forward(dense_tokens)
+        out['clip_dense_embedding'] = dense_embeddings.view(b, h, w, -1).permute(0, 3, 1, 2).contiguous()
+
         x = self.clip_model.visual.trunk.head.global_pool(x)
         x = self.clip_model.visual.trunk.head.norm(x)
         x = self.clip_model.visual.trunk.head.flatten(x)
@@ -152,6 +160,10 @@ class CLIP(Backbone):
         x = self.clip_model.visual.layer4(x)
         out['res5'] = x.contiguous() # os32
         out['clip_vis_dense'] = x
+        # Dense CLIP embeddings: project each patch feature with CLIP c_proj.
+        dense_tokens = x.permute(0, 2, 3, 1)  # B,H,W,C
+        dense_embeddings = self.clip_model.visual.attnpool.c_proj(dense_tokens)
+        out['clip_dense_embedding'] = dense_embeddings.permute(0, 3, 1, 2).contiguous()
         out['clip_embedding'] = self.clip_model.visual.global_pool(x)
         return out
 
@@ -236,7 +248,7 @@ class CLIP(Backbone):
             name: ShapeSpec(
                 channels=self._out_feature_channels[name], stride=self._out_feature_strides[name]
             )
-            for name in ["stem", "res2", "res3", "res4", "res5", "clip_vis_dense", "clip_embedding"]
+            for name in ["stem", "res2", "res3", "res4", "res5", "clip_vis_dense", "clip_dense_embedding", "clip_embedding"]
         }
 
     @property

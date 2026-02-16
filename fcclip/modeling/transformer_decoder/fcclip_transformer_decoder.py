@@ -179,11 +179,27 @@ class CrossAttentionLayer(nn.Module):
     def __init__(self, d_model, nhead, dropout=0.0,
                  activation="relu", normalize_before=False):
         super().__init__()
-        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        if d_model % nhead != 0:
+            raise ValueError(f"d_model ({d_model}) must be divisible by nhead ({nhead})")
+        self.d_model = d_model
+        self.num_heads = nhead
+        self.head_dim = d_model // nhead
+        self.scale = self.head_dim ** -0.5
+
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
         self.activation = _get_activation_fn(activation)
         self.normalize_before = normalize_before
+        self.register_buffer(
+            "ensemble_alpha",
+            torch.linspace(0.0, 1.0, steps=nhead).view(1, nhead, 1, 1),
+            persistent=False,
+        )
         self._reset_parameters()
     
     def _reset_parameters(self):
@@ -194,64 +210,78 @@ class CrossAttentionLayer(nn.Module):
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
     
-    def _compute_attn_logits(self, q, k):
-        # Project queries and keys
-        if self.multihead_attn._qkv_same_embed_dim:
-            # Combined projection weights
-            w_q, w_k, _ = self.multihead_attn.in_proj_weight.chunk(3, dim=0)
-            b_q, b_k, _ = self.multihead_attn.in_proj_bias.chunk(3)
-        else:
-            # Separate projection weights
-            w_q = self.multihead_attn.q_proj_weight
-            w_k = self.multihead_attn.k_proj_weight
-            b_q = self.multihead_attn.in_proj_bias[:self.multihead_attn.embed_dim]
-            b_k = self.multihead_attn.in_proj_bias[self.multihead_attn.embed_dim:2*self.multihead_attn.embed_dim]
+    def _mha_forward(
+        self,
+        q,
+        k,
+        v,
+        *,
+        attn_mask: Optional[Tensor] = None,
+        memory_key_padding_mask: Optional[Tensor] = None,
+        out_of_vocab_attn_logits: Optional[Tensor] = None,
+        return_attn_logits: bool = False,
+    ):
+        q_proj = self.q_proj(q)
+        k_proj = self.k_proj(k)
+        v_proj = self.v_proj(v)
 
-        q = F.linear(q, w_q, b_q)
-        k = F.linear(k, w_k, b_k)
-        
-        # Prepare dimensions
-        tgt_len, bsz, embed_dim = q.size()
-        src_len = k.size(0)
-        head_dim = embed_dim // self.multihead_attn.num_heads
-        
-        # Reshape queries and keys for efficient computation
-        q = q.contiguous().view(tgt_len, bsz, self.multihead_attn.num_heads, head_dim)
-        k = k.contiguous().view(src_len, bsz, self.multihead_attn.num_heads, head_dim)
-        
-        # Compute scaled dot-product attention logits
-        # Using einsum for efficient computation of averaged attention
-        attn_logits = torch.einsum('ibhd,jbhd->bij', q, k) / math.sqrt(head_dim)
-        
-        # Result is already averaged over heads due to einsum operation
-        return attn_logits  # Shape: [bsz, tgt_len, src_len]
+        tgt_len, bsz, embed_dim = q_proj.size()
+        src_len = k_proj.size(0)
+        num_heads = self.num_heads
+        head_dim = self.head_dim
+
+        q_proj = q_proj.contiguous().view(tgt_len, bsz, num_heads, head_dim).permute(1, 2, 0, 3)
+        k_proj = k_proj.contiguous().view(src_len, bsz, num_heads, head_dim).permute(1, 2, 0, 3)
+        v_proj = v_proj.contiguous().view(src_len, bsz, num_heads, head_dim).permute(1, 2, 0, 3)
+
+        in_vocab_attn_logits = torch.einsum("bhqd,bhkd->bhqk", q_proj, k_proj) * self.scale
+
+        if out_of_vocab_attn_logits is not None:
+            if out_of_vocab_attn_logits.dim() == 4:
+                out_of_vocab_attn_logits = out_of_vocab_attn_logits.flatten(2)
+            out_of_vocab_attn_logits = out_of_vocab_attn_logits.unsqueeze(1).to(in_vocab_attn_logits.dtype)
+            alpha = self.ensemble_alpha.to(device=in_vocab_attn_logits.device, dtype=in_vocab_attn_logits.dtype)
+            attn_logits = in_vocab_attn_logits * (1.0 - alpha) + out_of_vocab_attn_logits * alpha
+        else:
+            attn_logits = in_vocab_attn_logits
+
+        if attn_mask is not None:
+            attn_mask = attn_mask.view(bsz, num_heads, tgt_len, src_len)
+            attn_logits = attn_logits.masked_fill(attn_mask, float("-inf"))
+
+        if memory_key_padding_mask is not None:
+            key_mask = memory_key_padding_mask[:, None, None, :]
+            attn_logits = attn_logits.masked_fill(key_mask, float("-inf"))
+
+        attn_weights = F.softmax(attn_logits, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        out = torch.einsum("bhqk,bhkd->bhqd", attn_weights, v_proj)
+        out = out.permute(2, 0, 1, 3).contiguous().view(tgt_len, bsz, embed_dim)
+        out = self.out_proj(out)
+
+        attn_logits_avg = attn_logits.mean(dim=1) if return_attn_logits else None
+        return out, attn_logits_avg
     
     def forward_post(self, tgt, memory,
                      attn_mask: Optional[Tensor] = None,
                      memory_key_padding_mask: Optional[Tensor] = None,
                      pos: Optional[Tensor] = None,
                      query_pos: Optional[Tensor] = None,
+                     out_of_vocab_attn_logits: Optional[Tensor] = None,
                      return_attn_logits: bool = False):
         q = self.with_pos_embed(tgt, query_pos)
         k = self.with_pos_embed(memory, pos)
         v = memory
         
-        if return_attn_logits:
-            # Compute attention logits (already averaged over heads)
-            attn_logits = self._compute_attn_logits(q, k)
-            
-            # Use multihead_attn for output computation
-            tgt2 = self.multihead_attn(query=q,
-                                       key=k,
-                                       value=v, 
-                                       attn_mask=attn_mask,
-                                       key_padding_mask=memory_key_padding_mask)[0]
-        else:
-            tgt2 = self.multihead_attn(query=q,
-                                       key=k,
-                                       value=v, 
-                                       attn_mask=attn_mask,
-                                       key_padding_mask=memory_key_padding_mask)[0]
+        tgt2, attn_logits = self._mha_forward(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            memory_key_padding_mask=memory_key_padding_mask,
+            out_of_vocab_attn_logits=out_of_vocab_attn_logits,
+            return_attn_logits=return_attn_logits,
+        )
         
         tgt = tgt + self.dropout(tgt2)
         tgt = self.norm(tgt)
@@ -263,28 +293,22 @@ class CrossAttentionLayer(nn.Module):
                     memory_key_padding_mask: Optional[Tensor] = None,
                     pos: Optional[Tensor] = None,
                     query_pos: Optional[Tensor] = None,
+                    out_of_vocab_attn_logits: Optional[Tensor] = None,
                     return_attn_logits: bool = False):
         tgt2 = self.norm(tgt)
         q = self.with_pos_embed(tgt2, query_pos)
         k = self.with_pos_embed(memory, pos)
         v = memory
         
-        if return_attn_logits:
-            # Compute attention logits (already averaged over heads)
-            attn_logits = self._compute_attn_logits(q, k)
-            
-            # Use multihead_attn for output computation
-            tgt2 = self.multihead_attn(query=q,
-                                       key=k,
-                                       value=v, 
-                                       attn_mask=attn_mask,
-                                       key_padding_mask=memory_key_padding_mask)[0]
-        else:
-            tgt2 = self.multihead_attn(query=q,
-                                       key=k,
-                                       value=v, 
-                                       attn_mask=attn_mask,
-                                       key_padding_mask=memory_key_padding_mask)[0]
+        tgt2, attn_logits = self._mha_forward(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            memory_key_padding_mask=memory_key_padding_mask,
+            out_of_vocab_attn_logits=out_of_vocab_attn_logits,
+            return_attn_logits=return_attn_logits,
+        )
         
         tgt = tgt + self.dropout(tgt2)
         return (tgt, attn_logits) if return_attn_logits else (tgt, None)
@@ -297,9 +321,20 @@ class CrossAttentionLayer(nn.Module):
         memory_key_padding_mask: Optional[Tensor] = None,
         memory_pos_emb: Optional[Tensor] = None, # (B,H,W,C), 
         query_pos_emb: Optional[Tensor] = None, # (B,Q,C)
+        out_of_vocab_attn_logits: Optional[Tensor] = None, # (B,Q,H,W) or (B,Q,HW)
         return_attn_logits: bool = False,
         pos: Optional[Tensor] = None, # (B,Q,[x,y,w,j])
     ):
+        target_h, target_w = memory.shape[1], memory.shape[2]
+        if out_of_vocab_attn_logits is not None and out_of_vocab_attn_logits.dim() == 4:
+            if out_of_vocab_attn_logits.shape[-2:] != (target_h, target_w):
+                out_of_vocab_attn_logits = F.interpolate(
+                    out_of_vocab_attn_logits,
+                    size=(target_h, target_w),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
         tgt = tgt.transpose(0,1) # (Q,B,C)
         memory = memory.flatten(1,2).transpose(0,1) # (H*W,B,C)
         attn_mask = attn_mask.flatten(0,1).flatten(2,3) # (B*num_heads, Q, H*W)
@@ -309,10 +344,12 @@ class CrossAttentionLayer(nn.Module):
         if self.normalize_before:
             output, logits = self.forward_pre(tgt, memory, attn_mask,
                                     memory_key_padding_mask, memory_pos_emb, query_pos_emb,
+                                    out_of_vocab_attn_logits=out_of_vocab_attn_logits,
                                     return_attn_logits=return_attn_logits)
         else:
             output, logits = self.forward_post(tgt, memory, attn_mask,
                                  memory_key_padding_mask, memory_pos_emb, query_pos_emb,
+                                 out_of_vocab_attn_logits=out_of_vocab_attn_logits,
                                  return_attn_logits=return_attn_logits)
     
         return output.transpose(0,1), logits # (Q,B,C)
