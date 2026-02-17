@@ -166,7 +166,11 @@ class FCCLIP(nn.Module):
         # get text classifier
         try:
             class_names = split_labels(metadata.stuff_classes) # it includes both thing and stuff
-            thing_mask = torch.tensor(metadata.thing_mask) # (C,) 1 if thing else 0 
+            # If thing_mask is not present, assume all classes are stuff
+            try:
+                thing_mask = torch.tensor(metadata.thing_mask) # (C,) 1 if thing else 0 
+            except:
+                thing_mask = torch.tensor([False] * len(metadata.stuff_classes)) # (C,) 1 if thing else 0
             train_class_names = split_labels(train_metadata.stuff_classes)
         except:
             # this could be for insseg, where only thing_classes are available
@@ -406,7 +410,29 @@ class FCCLIP(nn.Module):
             )
             return out_vocab_cls_results
 
-        outputs = self.sem_seg_head(features, mask_to_clip_logits_fn=mask_to_clip_logits)
+        def logits_to_clip_mask(mask_logits, target_size):
+            clip_dense_features = features["clip_dense_embedding"]
+            if clip_dense_features.shape[-2:] != target_size:
+                clip_dense_features = F.interpolate(
+                    clip_dense_features,
+                    size=target_size,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            class_weights = F.softmax(mask_logits, dim=-1)
+            text_prototypes = text_classifier.unsqueeze(0).expand(class_weights.shape[0], -1, -1)
+            clip_query_proto = torch.matmul(class_weights, text_prototypes)
+            clip_query_proto = F.normalize(clip_query_proto, dim=-1)
+            clip_dense_features = F.normalize(clip_dense_features, dim=1)
+            out_of_vocab_mask_logits = torch.einsum("bqc,bchw->bqhw", clip_query_proto, clip_dense_features) * self.backbone.clip_model.logit_scale
+            
+            return out_of_vocab_mask_logits
+
+        outputs = self.sem_seg_head(
+            features, 
+            mask_to_clip_logits_fn=mask_to_clip_logits,
+            logits_to_clip_mask_fn=logits_to_clip_mask
+        )
 
         if self.training:
             # bipartite matching-based loss

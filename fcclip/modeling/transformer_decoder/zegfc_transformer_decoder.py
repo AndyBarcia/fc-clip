@@ -503,6 +503,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         thing_mask=None, 
         num_templates=None,
         mask_to_clip_logits_fn=None,
+        logits_to_clip_mask_fn=None,
         clip_dense_features=None,
     ):
         # x is a list of multi-scale feature
@@ -559,6 +560,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                 thing_mask=thing_mask,
                 num_templates=num_templates,
                 mask_to_clip_logits_fn=mask_to_clip_logits_fn,
+                logits_to_clip_mask_fn=logits_to_clip_mask_fn,
                 clip_dense_features=clip_dense_features,
                 prev_outputs_class=None
             )
@@ -616,6 +618,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             thing_mask=thing_mask,
             num_templates=num_templates,
             mask_to_clip_logits_fn=mask_to_clip_logits_fn,
+            logits_to_clip_mask_fn=logits_to_clip_mask_fn,
             clip_dense_features=clip_dense_features,
             prev_outputs_class=None
         )
@@ -686,6 +689,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                 thing_mask=thing_mask,
                 num_templates=num_templates,
                 mask_to_clip_logits_fn=mask_to_clip_logits_fn,
+                logits_to_clip_mask_fn=logits_to_clip_mask_fn,
                 clip_dense_features=clip_dense_features,
                 prev_outputs_class=predictions_class[-1].detach()
             )
@@ -719,12 +723,17 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         thing_mask, # (T,)
         num_templates,
         mask_to_clip_logits_fn,
+        logits_to_clip_mask_fn,
         clip_dense_features,
         prev_outputs_class=None
     ):
         decoder_output = self.decoder_norm(output)
         decoder_output = decoder_output.transpose(0, 1)
         mask_embed = self.mask_embed(decoder_output) # (B,Q,2*C)
+
+        # Obtain out-of-vocab mask logits from dense CLIP features.
+        with torch.no_grad():
+            out_of_vocab_mask_logits = logits_to_clip_mask_fn(text_attn_logits, attn_mask_target_size) # (B,Q,H,W)
 
         # Get classification logits from attention patterns.
         vocab_logits = get_untemplated_classification_logits(
@@ -757,26 +766,6 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         # Append objectness logit to learn to predict no-object.
         obj_logits = self.obj_head(decoder_output).squeeze(-1) # (B,Q)
         outputs_class = torch.cat([vocab_logits, obj_logits.unsqueeze(-1)], dim=-1) # (B,Q,T+1)
-
-        out_of_vocab_mask_logits = None
-        if clip_dense_features is not None:
-            if clip_dense_features.shape[-2:] != attn_mask_target_size:
-                clip_dense_features = F.interpolate(
-                    clip_dense_features,
-                    size=attn_mask_target_size,
-                    mode="bilinear",
-                    align_corners=False,
-                )
-            # Build a query-specific CLIP prototype from class logits and text embeddings.
-            class_weights = F.softmax(vocab_logits, dim=-1)
-            text_prototypes = text_classifier
-            if text_prototypes.dim() == 2:
-                text_prototypes = text_prototypes.unsqueeze(0).expand(class_weights.shape[0], -1, -1)
-            text_prototypes = F.normalize(text_prototypes, dim=-1)
-            clip_query_proto = torch.matmul(class_weights, text_prototypes)
-            clip_query_proto = F.normalize(clip_query_proto, dim=-1)
-            clip_dense_features = F.normalize(clip_dense_features, dim=1)
-            out_of_vocab_mask_logits = torch.einsum("bqc,bchw->bqhw", clip_query_proto, clip_dense_features)
 
         # The final attention mask for the next layer is built from the predicted masks at the current layer
         attn_mask = build_attn_mask_maxpool(
