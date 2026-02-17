@@ -549,7 +549,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         else:
             patch_output = torch.cat(src, dim=0)
             patch_pos = torch.cat(pos, dim=0)
-            outputs_class, _, _, _, _, _, _ = self.forward_prediction_heads(
+            outputs_class, _, _, _, _, _, _, _ = self.forward_prediction_heads(
                 patch_output,
                 mask_features,
                 None,
@@ -587,6 +587,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             query_embed = self.query_embed.weight.view(self.query_h, self.query_w, 1, -1).repeat(1, 1, bs, 1)
         query_bbox_unsigmoid = self.query_bbox.weight.unsqueeze(1).repeat(1, bs, 1) if self.query_bbox else None
 
+        predictions_obj = []
         predictions_class = []
         predictions_mask = []
         predictions_bbox = []
@@ -607,7 +608,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             text_attn_logits = None
 
         # prediction heads on learnable query features
-        outputs_class, out_of_vocab_logits, out_of_vocab_mask_logits, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
+        outputs_class, outputs_obj, out_of_vocab_logits, out_of_vocab_mask_logits, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
             output.flatten(0, 1), 
             mask_features,
             text_attn_logits,
@@ -622,6 +623,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             clip_dense_features=clip_dense_features,
             prev_outputs_class=None
         )
+        predictions_obj.append(outputs_obj)
         predictions_class.append(outputs_class)
         predictions_mask.append(outputs_mask)
         predictions_bbox.append(output_box)
@@ -678,7 +680,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                 output_flat
             )
 
-            outputs_class, out_of_vocab_logits, out_of_vocab_mask_logits, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
+            outputs_class, outputs_obj, out_of_vocab_logits, out_of_vocab_mask_logits, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
                 output_flat, 
                 mask_features,
                 text_attn_logits,
@@ -693,6 +695,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                 clip_dense_features=clip_dense_features,
                 prev_outputs_class=predictions_class[-1].detach()
             )
+            predictions_obj.append(outputs_obj)
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
             predictions_bbox.append(output_box)
@@ -701,11 +704,12 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         assert len(predictions_class) == self.num_layers + 1
 
         out = {
+            'pred_obj': predictions_obj[-1],
             'pred_logits': predictions_class[-1],
             'pred_masks': predictions_mask[-1],
             'pred_boxes': predictions_bbox[-1],
             'aux_outputs': self._set_aux_loss(
-                predictions_class if self.mask_classification else None, predictions_mask, predictions_bbox
+                predictions_class, predictions_obj, predictions_mask, predictions_bbox
             )
         }
         return out
@@ -763,9 +767,8 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         with torch.no_grad():
             out_of_vocab_logits = mask_to_clip_logits_fn(outputs_mask) # (B,Q,T)
 
-        # Append objectness logit to learn to predict no-object.
+        # Get objectness logit to learn to predict no-object.
         obj_logits = self.obj_head(decoder_output).squeeze(-1) # (B,Q)
-        outputs_class = torch.cat([vocab_logits, obj_logits.unsqueeze(-1)], dim=-1) # (B,Q,T+1)
 
         # The final attention mask for the next layer is built from the predicted masks at the current layer
         attn_mask = build_attn_mask_maxpool(
@@ -778,20 +781,15 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         outputs_bbox = None
         query_bbox_unsigmoid_detached = None
 
-        return outputs_class, out_of_vocab_logits, out_of_vocab_mask_logits, outputs_mask, outputs_bbox, query_bbox_unsigmoid_detached, attn_mask
+        return vocab_logits, obj_logits, out_of_vocab_logits, out_of_vocab_mask_logits, outputs_mask, outputs_bbox, query_bbox_unsigmoid_detached, attn_mask
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_seg_masks, outputs_bboxes):
+    def _set_aux_loss(self, outputs_class, outputs_obj, outputs_seg_masks, outputs_bboxes):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
-        if self.mask_classification:
-            return [
-                {"pred_logits": a, "pred_masks": b, "pred_boxes": c}
-                for a, b, c in zip(outputs_class[:-1], outputs_seg_masks[:-1], outputs_bboxes[:-1])
-            ]
-        else:
-            return [
-                {"pred_masks": b, "pred_boxes": c}
-                for b, c in zip(outputs_seg_masks[:-1], outputs_bboxes[:-1])
-            ]
+        return [
+            {"pred_logits": a, "pred_obj": b, "pred_masks": c, "pred_boxes": d}
+            for a, b, c, d in zip(outputs_class[:-1], outputs_obj[:-1], outputs_seg_masks[:-1], outputs_bboxes[:-1])
+        ]
+
