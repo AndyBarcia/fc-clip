@@ -557,7 +557,20 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             if self.query_pos_init_type == "sine":
                 query_pos_map = self.query_pos_embed(query_feat.unsqueeze(2), None)
                 query_embed = query_pos_map.permute(0, 1, 2).unsqueeze(2).repeat(1, 1, bs, 1)
-        elif self.query_init_type in {"avg_pool", "score_max_pool"}:
+        elif self.query_init_type == "avg_pool":
+            # choose the feature level with the smallest spatial size
+            areas = [h * w for h, w in size_list]
+            low_res_level = areas.index(min(areas))
+            low_res_feat = self.input_proj[low_res_level](x[low_res_level])
+            query_feat = F.adaptive_avg_pool2d(
+                self.query_feat_proj(low_res_feat),
+                output_size=(self.query_h, self.query_w),
+            )
+            output = query_feat.permute(2, 3, 0, 1)
+            if self.query_pos_init_type == "sine":
+                query_pos_map = self.query_pos_embed(query_feat, None)
+                query_embed = query_pos_map.permute(2, 3, 0, 1)
+        elif self.query_init_type == "score_max_pool":
             # choose the feature level with the smallest spatial size
             areas = [h * w for h, w in size_list]
             low_res_level = areas.index(min(areas))
