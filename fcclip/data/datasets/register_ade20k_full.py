@@ -775,6 +775,235 @@ UNSEEN_ADE20K_847_CATEGORY_IDS = [
     846, # adding machine,totalizer,totaliser
 ]
 
+
+SUPERCLASSES_ADE20K_847_CATEGORY_IDS = {
+    1: { # Building, buildings, edifice. Superclass of:
+        26,  # house exterior
+        59,  # skyscraper, skyscrapers
+        418, # temple
+        101, # hovel, hut, shack, shanty
+        317, # shanty
+        256, # shanties
+        262, # cabin
+        139, # tent, collapsible shelter
+        339, # shop, store
+        399, # shops
+        106, # booth, cubicle, stall, kiosk
+        205, # telephone booth
+        361, # greenhouse
+        266, # henhouse
+        522, # pergola
+        116, # gazebo
+        269, # windmill
+    },
+    2: { # Sky, clouds. Contains/Superclass of:
+        720, # sun
+        738, # star
+        395, # smoke
+    },
+    9: { # Earth, ground. Superclass of:
+        54,  # sand
+        213, # sand dune
+        142, # dirt track
+        338, # sand trap
+    },
+    16: { # Plant, flora, plant life, bushes. Superclass of:
+        3,   # tree, trees
+        63,  # palm tree, palm trees
+        12,  # grass, grass field
+        417, # weeds
+        73,  # flower, flowers
+        358, # alga, algae
+        496, # leaf, leafage, foliage
+        387, # leaves
+        651, # root
+        568, # branch
+    },
+    24: { # Water. Superclass of:
+        22,  # sea, ocean
+        35,  # river
+        546, # stream
+        134, # lake
+        111, # pond
+        473, # puddle
+        136, # ice, water ice
+        536, # ice floe, floe
+        304, # iceberg
+        218, # swimming pool, swimming bath
+        86,  # fountain
+        71,  # waterfall, falls
+    },
+    33: { # Rock, stone, rocks, stones. Superclass of:
+        445, # rocky formation
+        53,  # cliff, drop, drop-off
+        383, # rubble
+    },
+    34: { # Seat, seats. Superclass of:
+        18,  # chair, chairs
+        29,  # armchair, armchairs
+        21,  # sofa, couch, sofas, couches
+        404, # sofa bed
+        83,  # bench, benches
+        133, # stool, stools
+        126, # ottoman, pouf, hassock
+        81,  # swivel chair
+        319, # rocking chair, rocker
+        719, # chaise lounge
+        297, # deck chair, beach chair
+        330, # hairdresser chair
+        616, # dental chair
+        551, # chair desk
+    },
+    82: { # Light, light source. Superclass of:
+        32,  # lamp, lamps
+        105, # chandelier, pendant
+        110, # sconce, sconce lamp
+        206, # spotlight, spot
+        686, # spotlights
+        756, # floor spotlight
+        78,  # streetlight, street lamp
+        478, # light bulb, bulb, bulbs
+        763, # bulbs
+        219, # fluorescent, fluorescent fixture
+        469, # candle, taper
+        824, # night light
+    },
+    102: { # Apparel, wearing apparel, dress, clothes. Superclass of:
+        202, # jacket
+        484, # coat
+        350, # shirt
+        314, # jersey, t-shirt
+        517, # sweater, jumper
+        656, # sweatshirt
+        728, # sweatshirts
+        283, # trouser, pant
+        481, # skirt
+        315, # shoe
+        442, # gym shoe, sneaker
+        516, # boot
+        750, # flip flop
+        249, # hat, chapeau
+        386, # cap
+        590, # helmet
+        384, # scarf
+        748, # scarfs
+        801, # belt
+        834, # tie
+        684, # shawl
+        658, # mitten
+    },
+    104: { # Animal, animate being. Superclass of:
+        500, # cat
+        259, # dog, domestic dog
+        165, # horse
+        320, # bird
+        569, # duck
+        508, # hen, biddy
+        301, # fish
+        838, # sea star
+    },
+    118: { # Land, soil. Superclass of:
+        31,  # field
+        90,  # hill
+        15,  # mountain, mount
+        435, # valley, vale
+        494, # canyon
+        368, # island
+        624, # shore
+    },
+    152: { # Food, solid food. Superclass of:
+        234, # fruit
+        375, # bread
+        705, # breads
+        683, # bread rolls
+        419, # patty, cake
+        311, # candy, confect
+        609, # chips
+        787, # potatoes
+        781, # onions
+        533, # pumpkin
+    },
+    160: { # Container. Superclass of:
+        61,  # box, boxes
+        127, # ashcan, trash can, garbage can, wastebin
+        294, # recycling bin
+        199, # bucket, pail
+        682, # buckets
+        137, # basket, handbasket
+        678, # baskets
+        142, # barrel, cask, barrels
+        385, # barrels
+        135, # tank, storage tank
+        356, # tanks
+        114, # bag, bags, gift bag, paper bag
+        252, # bag, handbag, pocketbook, purse
+        191, # traveling bag, suitcase
+        239, # backpack, knapsack
+        128, # bottle, bottles
+        240, # jar
+        823, # spice jar
+        355, # can, tin, tin can
+        745, # tins
+        426, # canister
+    },
+    173: { # Machine. Superclass of:
+        464, # tractor
+        493, # forklift
+        397, # bulldozer
+        456, # excavator
+        290, # steam shovel
+        560, # mechanical shovel
+        145, # dishwasher
+        149, # washer, automatic washer, washing machine
+        510, # washing machines
+        440, # tumble dryer
+        652, # sewing machine
+        236, # vending machine
+        345, # slot machine, coin machine
+        120, # arcade machine, arcade machines
+        460, # scale, weighing machine
+        846, # adding machine
+    },
+    232: { # Rubbish, trash, scrap. Superclass of:
+        544, # junk
+        246, # landfill
+        657, # recycling materials
+    },
+    357: { # Fabric, cloth, material, textile. Superclass of (or material of):
+        430, # canvas
+        446, # plastic
+        377, # wood
+        178, # paper
+        471, # cardboard
+    },
+    696: { # Cutlery (Also semantically linked to Utensils). Superclass of:
+        437, # knife
+        625, # fork
+        638, # spoon
+        815, # ladle
+        798, # tongs
+        827, # slotted spoon
+        708, # skimmer
+    },
+    736: { # Tools. Superclass of:
+        833, # hammer
+        810, # spanners
+        504, # shovel
+        722, # rake
+        775, # scissors
+    },
+    773: { # Utensils. Superclass of:
+        696, # cutlery
+        437, # knife
+        625, # fork
+        638, # spoon
+        815, # ladle
+        798, # tongs
+        827, # slotted spoon
+        708, # skimmer
+    }
+}
+
 def get_metadata():
     meta = {}
 
@@ -787,10 +1016,17 @@ def get_metadata():
     seen_dataset_id_to_seen_contiguous_id = {}
     unseen_dataset_id_to_contiguous_id = {}
     contiguous_id_to_seen_contiguous_id = []
+    superclass_dataset_id_to_contiguous_id = {}
+    subclass_dataset_id_to_contiguous_id = {}
     last_seen_id = 0
 
     max_dataset_id = max([ cat["id"] for cat in ADE20K_847_CATEGORIES ])
     dataset_id_to_seen_contigous_id = [ -1 for _ in range(max_dataset_id+1) ]
+
+    superclass_ids = set(SUPERCLASSES_ADE20K_847_CATEGORY_IDS.keys())
+    subclass_ids = set()
+    for children in SUPERCLASSES_ADE20K_847_CATEGORY_IDS.values():
+        subclass_ids.update(children)
 
     for i, cat in enumerate(ADE20K_847_CATEGORIES):
         stuff_dataset_id_to_contiguous_id[cat["trainId"]] = i
@@ -805,7 +1041,13 @@ def get_metadata():
             seen_dataset_id_to_seen_contiguous_id[cat["trainId"]] = last_seen_id
             dataset_id_to_seen_contigous_id[cat["trainId"]] = last_seen_id
             last_seen_id += 1
-            seen_dataset_id_to_contiguous_id[cat["trainId"]] = i
+            seen_dataset_id_to_contiguous_id[cat["trainId"]] = i====
+        
+        if cat["id"] in superclass_ids:
+            superclass_dataset_id_to_contiguous_id[cat["trainId"]] = i
+
+        if cat["id"] in subclass_ids:
+            subclass_dataset_id_to_contiguous_id[cat["trainId"]] = i
 
     meta["stuff_classes"] = stuff_classes
     meta["stuff_dataset_id_to_contiguous_id"] = stuff_dataset_id_to_contiguous_id
@@ -814,6 +1056,8 @@ def get_metadata():
     meta["seen_dataset_id_to_seen_contiguous_id"] = seen_dataset_id_to_seen_contiguous_id
     meta["unseen_dataset_id_to_contiguous_id"] = unseen_dataset_id_to_contiguous_id
     meta["contiguous_id_to_seen_contiguous_id"] = contiguous_id_to_seen_contiguous_id
+    meta["superclass_dataset_id_to_contiguous_id"] = superclass_dataset_id_to_contiguous_id
+    meta["subclass_dataset_id_to_contiguous_id"] = subclass_dataset_id_to_contiguous_id
 
     return meta
 

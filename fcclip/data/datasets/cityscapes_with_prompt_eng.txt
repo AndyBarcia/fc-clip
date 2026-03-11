@@ -9,11 +9,11 @@
 8:vegetation,tree,trees,palm tree,bushes
 9:terrain,river,sand,sea,snow,water,mountain,grass,dirt,rock
 10:sky,clouds
-11:person
-12:rider
+11:person,child,girl,boy,woman,man,people,children,girls,boys,women,men,lady,guy,ladies,guys,clothes
+12:rider,person riding a bike
 13:car,cars
 14:truck,trucks
 15:bus,buses
-16:train,trains,locomotive,locomotives,freight train
+16:train,trains,locomotive,locomotives,freight train,tram,streetcar
 17:motorcycle,motorcycles
 18:bicycle,bicycles,bike,bikes

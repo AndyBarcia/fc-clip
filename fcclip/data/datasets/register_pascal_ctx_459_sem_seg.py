@@ -412,6 +412,138 @@ UNSEEN_PASCAL_CTX_459_CLASSES = [
     458, # wool
 ]
 
+
+SUPERCLASSES_CTX_459_CATEGORY_IDS = {
+    261: { # musical instrument
+        0,   # accordion
+        69,  # cello
+        121, # drum
+        122, # drum kit
+        132, # electronic keyboard
+        190, # guitar
+        285, # piano
+        437, # violin
+    },
+    409: { # tool
+        76,  # clippers
+        131, # electric saw
+        163, # forceps
+        192, # hammer
+        298, # pliers
+        316, # rake
+        334, # saw
+        337, # scissors
+        340, # screwdriver
+        342, # scythe
+        351, # shovel
+        368, # spanner
+        427, # tweezers
+    },
+    238: { # machine
+        62,  # casette recorder
+        66,  # cd player
+        82,  # coffee machine
+        91,  # copying machine
+        110, # dishwasher
+        118, # drinking machine
+        142, # fax machine
+        169, # fridge
+        175, # game machine
+        250, # microwave
+        268, # oven
+        308, # printer
+        321, # recreational machines
+        336, # scanner
+        344, # sewing machine
+        406, # toaster
+        428, # typewriter
+        431, # vacuum cleaner
+        432, # vending machine
+        442, # washing machine
+    },
+    397: { # tableware
+        35,  # bowl
+        103, # cup, cups
+        180, # glass
+        215, # jar
+        291, # pitcher
+        294, # plate, plates
+        455, # wineglass
+    },
+    87: { # container
+        8,   # bag, bags
+        12,  # barrel
+        14,  # basket
+        33,  # bottle, bottles
+        36,  # box
+        42,  # bucket
+        54,  # can
+        100, # crate
+        150, # fishbowl
+        179, # gift box
+        215, # jar
+        270, # pack
+        273, # paper box
+        281, # pen container
+        306, # pot
+        372, # spice container
+        398, # tank
+        417, # trash bin
+        424, # tube
+    },
+    412: { # toy
+        10,  # balloon
+        181, # glass marble
+        221, # kite
+        327, # rocking horse
+        413, # toy car
+    },
+    79: { # cloth, clothes
+        18,  # bedclothes
+        57,  # cap
+        183, # glove
+        198, # hat
+        349, # shoe
+        361, # slippers
+        411, # towel
+    },
+    444: { # water
+        119, # drop
+        166, # fountain
+        210, # ice
+        365, # snow
+        393, # swimming pool
+    },
+    292: { # plant
+        158, # flower, flowers
+        186, # grass, grasses, lawn, turf
+        228, # leaves
+        307, # pottedplant, plant pots, planter
+        419, # tree, trees
+    },
+    161: { # food
+        19,  # beer
+        48,  # cake
+        81,  # coffee
+        98,  # crabstick
+        127, # egg
+        171, # fruit
+        310, # pumpkin
+        448, # watermelon
+    },
+    171: { # fruit
+        310, # pumpkin
+        448, # watermelon
+    },
+    188: { # ground, soil, soil ground, dirt ground
+        333, # sand
+    },
+    359: { # sky, clouds
+        386, # sun
+    }
+}
+
+
 def _get_ctx459_meta():
     meta = {}
     # Id 0 is reserved for ignore_label, we change ignore_label for 0
@@ -426,6 +558,8 @@ def _get_ctx459_meta():
     seen_dataset_id_to_contiguous_id = {}
     seen_dataset_id_to_seen_contiguous_id = {}
     unseen_dataset_id_to_contiguous_id = {}
+    superclass_dataset_id_to_contiguous_id = {}
+    subclass_dataset_id_to_contiguous_id = {}
 
     seen_dataset_id_to_thing_contigous_id = {}
     unseen_dataset_id_to_thing_contigous_id = {}
@@ -436,6 +570,11 @@ def _get_ctx459_meta():
 
     max_dataset_id = max([ cat["id"] for cat in PASCAL_CTX_459_CATEGORIES ])
     dataset_id_to_seen_contigous_id = [ -1 for _ in range(max_dataset_id+1) ]
+
+    superclass_ids = set(SUPERCLASSES_CTX_459_CATEGORY_IDS.keys())
+    subclass_ids = set()
+    for children in SUPERCLASSES_CTX_459_CATEGORY_IDS.values():
+        subclass_ids.update(children)
 
     for i, cat in enumerate(PASCAL_CTX_459_CATEGORIES):
         if cat["isthing"]:
@@ -462,7 +601,12 @@ def _get_ctx459_meta():
             dataset_id_to_seen_contigous_id[cat["id"]] = last_seen_id
             last_seen_id += 1
             seen_dataset_id_to_contiguous_id[cat["id"]] = i
+        
+        if cat["id"] in superclass_ids:
+            superclass_dataset_id_to_contiguous_id[cat["id"]] = i
 
+        if cat["id"] in subclass_ids:
+            subclass_dataset_id_to_contiguous_id[cat["id"]] = i
 
     meta["stuff_dataset_id_to_contiguous_id"] = stuff_dataset_id_to_contiguous_id
     meta["thing_dataset_id_to_contiguous_id"] = thing_dataset_id_to_contiguous_id
@@ -473,6 +617,8 @@ def _get_ctx459_meta():
     meta["seen_dataset_id_to_thing_contigous_id"] = seen_dataset_id_to_thing_contigous_id
     meta["unseen_dataset_id_to_thing_contigous_id"] = unseen_dataset_id_to_thing_contigous_id
     meta["contiguous_id_to_seen_contiguous_id"] = contiguous_id_to_seen_contiguous_id
+    meta["superclass_dataset_id_to_contiguous_id"] = superclass_dataset_id_to_contiguous_id
+    meta["subclass_dataset_id_to_contiguous_id"] = subclass_dataset_id_to_contiguous_id
 
     meta["stuff_classes"] = stuff_classes
     return meta

@@ -164,9 +164,16 @@ class FCCLIP(nn.Module):
                 x_ = x_.split(',') # there can be multiple synonyms for single class
                 res.append(x_)
             return res
+        # try to get prompts
+        try:
+            class_names = split_labels(metadata.stuff_prompts) # it includes both thing and stuff
+            class_names = split_labels(metadata.thing_prompts) # it includes both thing and stuff
+        except:
+            class_names = None
+
         # get text classifier
         try:
-            class_names = split_labels(metadata.stuff_classes) # it includes both thing and stuff
+            class_names = split_labels(metadata.stuff_classes) if class_names is None else class_names # it includes both thing and stuff
             # If thing_mask is not present, assume all classes are stuff
             try:
                 thing_mask = torch.tensor(metadata.thing_mask) # (C,) 1 if thing else 0 
@@ -175,7 +182,7 @@ class FCCLIP(nn.Module):
             train_class_names = split_labels(train_metadata.stuff_classes)
         except:
             # this could be for insseg, where only thing_classes are available
-            class_names = split_labels(metadata.thing_classes)
+            class_names = split_labels(metadata.thing_classes) if class_names is None else class_names
             thing_mask = torch.tensor([True] * len(metadata.thing_classes)) # (C,) 1 if thing else 0
             train_class_names = split_labels(train_metadata.thing_classes)
         train_class_names = {l for label in train_class_names for l in label}
