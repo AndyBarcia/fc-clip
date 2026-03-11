@@ -93,6 +93,54 @@ def calculate_uncertainty(logits):
     gt_class_logits = logits.clone()
     return -(torch.abs(gt_class_logits))
 
+def _stat(name: str, t: torch.Tensor, extra: str = ""):
+    """Print nan/inf flags + min/max for a tensor (robust to empty tensors)."""
+    if t is None:
+        print(f"[{name}] None {extra}")
+        return
+    if not torch.is_tensor(t):
+        print(f"[{name}] not a tensor: {type(t)} {extra}")
+        return
+
+    with torch.no_grad():
+        dev = str(t.device)
+        dt = str(t.dtype)
+        shp = tuple(t.shape)
+        n = t.numel()
+
+        if n == 0:
+            print(f"[{name}] empty | shape={shp} dtype={dt} device={dev} {extra}")
+            return
+
+        # Use float32 for stats to avoid fp16 overflow in reductions
+        tf = t.detach()
+        if tf.is_floating_point():
+            tf_stats = tf.float()
+        else:
+            tf_stats = tf
+
+        has_nan = torch.isnan(tf_stats).any().item() if tf_stats.is_floating_point() else False
+        has_inf = torch.isinf(tf_stats).any().item() if tf_stats.is_floating_point() else False
+
+        # min/max (handle all-nan case)
+        finite_mask = torch.isfinite(tf_stats) if tf_stats.is_floating_point() else None
+        if tf_stats.is_floating_point():
+            finite_any = finite_mask.any().item()
+            if finite_any:
+                tmin = tf_stats[finite_mask].min().item()
+                tmax = tf_stats[finite_mask].max().item()
+            else:
+                tmin = float("nan")
+                tmax = float("nan")
+        else:
+            tmin = tf_stats.min().item()
+            tmax = tf_stats.max().item()
+
+        print(
+            f"[{name}] nan={has_nan} inf={has_inf} "
+            f"| min={tmin:.6g} max={tmax:.6g} "
+            f"| shape={shp} dtype={dt} device={dev} {extra}"
+        )
 
 class SetCriterion(nn.Module):
     """This class computes the loss for DETR.
@@ -208,6 +256,10 @@ class SetCriterion(nn.Module):
             loss_dice = sampling_dice_loss_jit(point_logits, point_labels, num_masks)
         else:
             logits = src_masks.reshape(src_masks.shape[0], -1)
+
+            # Replace -inf logits with a large negative value to avoid NaNs in the loss.
+            logits = torch.nan_to_num(logits, nan=0.0, neginf=-1e3, posinf=1e3)
+
             pos_counts, block_area, H_t, W_t = compute_mask_block_counts(
                 target_masks, src_masks.shape[-2:]
             )
@@ -217,6 +269,7 @@ class SetCriterion(nn.Module):
             max_logits = torch.clamp(logits, min=0)
             logexp = torch.log1p(torch.exp(-abs_logits))
             loss_block = block_area * max_logits - logits * pos_counts + block_area * logexp
+            loss_block = torch.nan_to_num(loss_block, nan=0.0, neginf=0.0, posinf=0.0)
             loss_mask = loss_block.sum(dim=1) / (H_t * W_t)
             loss_mask = loss_mask.sum() / num_masks
 
