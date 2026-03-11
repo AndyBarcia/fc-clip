@@ -35,7 +35,7 @@ def build_transformer_decoder(cfg, in_channels, mask_classification=True):
     name = cfg.MODEL.MASK_FORMER.TRANSFORMER_DECODER_NAME
     return TRANSFORMER_DECODER_REGISTRY.get(name)(cfg, in_channels, mask_classification)
 
-def get_untemplated_classification_logits(pred_logits, num_templates=None, append_void_class=True):
+def get_untemplated_classification_logits(pred_logits, num_templates, append_void_class=True):
     # Max ensembling over templates
     final_pred_logits = []
     cur_idx = 0
@@ -653,7 +653,7 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         ret["clip_embedding_dim"] = cfg.MODEL.FC_CLIP.EMBED_DIM
         return ret
 
-    def forward(self, x, mask_features, mask = None, text_classifier=None, num_templates=None):
+    def forward(self, x, mask_features, mask = None, text_classifier=None, thing_mask=None, num_templates=None):
         # x is a list of multi-scale feature
         assert len(x) == self.num_feature_levels
         src = []
