@@ -142,13 +142,17 @@ def register_all_cityscapes_panoptic(root):
     # visualization function in D2 handles thing and class classes differently
     # due to some heuristic used in Panoptic FPN. We keep the same naming to
     # enable reusing existing visualization functions.
+    thing_prompts = [k["prompt"] for k in CITYSCAPES_CATEGORIES ]
     thing_classes = [k["name"] for k in CITYSCAPES_CATEGORIES]
     thing_colors = [k["color"] for k in CITYSCAPES_CATEGORIES]
+    stuff_prompts = [k["prompt"] for k in CITYSCAPES_CATEGORIES]
     stuff_classes = [k["name"] for k in CITYSCAPES_CATEGORIES]
     stuff_colors = [k["color"] for k in CITYSCAPES_CATEGORIES]
 
+    meta["thing_prompts"] = thing_prompts
     meta["thing_classes"] = thing_classes
     meta["thing_colors"] = thing_colors
+    meta["stuff_prompts"] = stuff_prompts
     meta["stuff_classes"] = stuff_classes
     meta["stuff_colors"] = stuff_colors
 

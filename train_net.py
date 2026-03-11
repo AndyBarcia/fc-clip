@@ -83,6 +83,12 @@ from fcclip import (
 )
 
 
+import numpy as np
+# Compatibility shim for older LVIS API versions used by detectron2 evaluator.
+if not hasattr(np, "float"):
+    np.float = float
+
+
 def build_limited_detection_test_loader(cfg, dataset_name, mapper, max_eval_images):
     """Create an evaluation data loader that only iterates over a subset."""
 
@@ -271,7 +277,7 @@ class Trainer(DefaultTrainer):
         optimizer = self.build_optimizer(cfg, model)
         data_loader = self.build_train_loader(cfg)
 
-        compiled_model = create_ddp_model(compiled_model, broadcast_buffers=False)
+        compiled_model = create_ddp_model(compiled_model, broadcast_buffers=False, find_unused_parameters=True)
 
         if cfg.SOLVER.AMP.ENABLED:
             # Convert precision string to torch dtype
@@ -391,7 +397,7 @@ class Trainer(DefaultTrainer):
         evaluator_list = []
         evaluator_type = MetadataCatalog.get(dataset_name).evaluator_type
         # semantic segmentation
-        if evaluator_type in ["sem_seg", "ade20k_panoptic_seg"]:
+        if evaluator_type in ["sem_seg", "ade20k_panoptic_seg"] and cfg.MODEL.MASK_FORMER.TEST.SEMANTIC_ON:
             evaluator_list.append(
                 SemSegEvaluator(
                     dataset_name,
@@ -399,7 +405,7 @@ class Trainer(DefaultTrainer):
                     output_dir=output_folder,
                 )
             )
-        elif evaluator_type in ["zs_sem_seg", "zs_ade20k_panoptic_seg"]:
+        elif evaluator_type in ["zs_sem_seg", "zs_ade20k_panoptic_seg"] and cfg.MODEL.MASK_FORMER.TEST.SEMANTIC_ON:
             evaluator_list.append(
                 ZSSemSegEvaluator(
                     dataset_name,
@@ -466,7 +472,7 @@ class Trainer(DefaultTrainer):
                 torch.cuda.device_count() > comm.get_rank()
             ), "CityscapesEvaluator currently do not work with multiple machines."
             return CityscapesSemSegEvaluator(dataset_name)
-        if evaluator_type == "cityscapes_panoptic_seg":
+        if evaluator_type in ["cityscapes_panoptic_seg", "zs_cityscapes_panoptic_seg"]:
             if cfg.MODEL.MASK_FORMER.TEST.SEMANTIC_ON:
                 assert (
                     torch.cuda.device_count() > comm.get_rank()

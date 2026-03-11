@@ -2399,7 +2399,9 @@ def get_cityscapes_categories_with_prompt_eng():
             continue
         #print(CITYSCAPES_CATEGORIES_[cityscapes_idx]["name"], '->', name)
         assert CITYSCAPES_CATEGORIES_[cityscapes_idx]["trainId"] == idx
-        CITYSCAPES_CATEGORIES_[cityscapes_idx]["name"] = name
+        # We can't update name because the evaluation script is stupidly designed and uses
+        # the actual class name to identify classes. So we put the prompt in a new field "prompt".
+        CITYSCAPES_CATEGORIES_[cityscapes_idx]["prompt"] = name
         cityscapes_idx += 1
     return CITYSCAPES_CATEGORIES_
 
@@ -2468,6 +2470,17 @@ def get_mapillary_vistas_categories_with_prompt_eng():
         mapillary_idx += 1
     return MAPILLARY_VISTAS_SEM_SEG_CATEGORIES_
 
+def get_lvis_1203_categories_with_prompt_eng():
+    lvis_1203_id_names = open('./fcclip/data/datasets/lvis_1203_with_prompt_eng.txt').read().splitlines()
+    lvis_categories = []
+    for line in lvis_1203_id_names:
+        idx, name = line.split(':', 1)
+        idx = int(idx)
+        if idx == 0 or name == "invalid_class_id":
+            continue
+        lvis_categories.append(name)
+    return lvis_categories
+
 if __name__ == "__main__":
     get_coco_categories_with_prompt_eng()
     get_ade20k_categories_with_prompt_eng()
@@ -2478,3 +2491,4 @@ if __name__ == "__main__":
     get_pascal_ctx_59_categories_with_prompt_eng()
     get_mapillary_vistas_categories_with_prompt_eng()
     get_coco_stuff_categories_with_prompt_eng()
+    get_lvis_1203_categories_with_prompt_eng()

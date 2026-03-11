@@ -35,7 +35,7 @@ _PREDEFINED_SPLITS = {
 
 def _get_ade_instances_meta():
     thing_ids = [k["id"] for k in ADE_CATEGORIES]
-    assert len(thing_ids) == 100, len(thing_ids)
+    #assert len(thing_ids) == 100, len(thing_ids)
     # Mapping from the incontiguous ADE category id to an id in [0, 99]
     thing_dataset_id_to_contiguous_id = {k: i for i, k in enumerate(thing_ids)}
     thing_classes = [k["name"] for k in ADE_CATEGORIES]

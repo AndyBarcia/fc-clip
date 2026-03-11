@@ -236,6 +236,77 @@ UNSEEN_ADE20K_CATEGORY_IDS =  [
 ]
 
 
+TYPE_SHIFT_ADE20K_CATEGORY_IDS = [
+    45,   # counter (COCO: counter)
+    18,   # curtain (COCO: curtain)
+    66,   # flower (COCO: flower)
+    82,   # light (COCO: light)
+    57,   # pillow (COCO: pillow)
+    24,   # shelf (COCO: shelf)
+    53,   # stairs (COCO: stairs)
+    81,   # towel (COCO: towel)
+    14,   # door (COCO: door-stuff)
+    27,   # mirror (COCO: mirror-stuff)
+    8,    # window (COCO: window-blind, window-other)
+    32,   # fence (COCO: fence-merged)
+    10,   # cabinet (COCO: cabinet-merged)
+    15,   # table (COCO: table-merged)
+    33,   # desk (COCO: table-merged)
+    64,   # coffee table (COCO: table-merged)
+    120,  # food, solid food (COCO: fruit, food-other-merged)
+    43,   # signboard, sign (COCO: banner)
+]
+
+
+SUPERCLASSES_ADE20K_CATEGORY_IDS = {
+    1: { # Building, edifice. Superclass of:
+        25, # house exterior
+        48, # skyscraper, skyscrapers
+        79, # hovel, hut, hutch, shack, shanty
+        88, # booth, cubicle, stall, kiosk
+        51, # grandstand, covered stand
+        84, # tower, towers
+    },
+    21: { # Water. Superclass of:
+        26, # sea, ocean
+        60, # river
+        128, # lake
+        109, # swimming pool, swimming bath
+        104, # fountain
+        113, # waterfall, falls
+    },
+    17: { # Plant, flora, plant life, bushes. Superclass of:
+        4,  # tree, trees
+        72, # palm tree, palm trees
+        9,  # grass, grass field
+        66, # flower, flowers
+    },
+    13: { # Earth, ground. Superclass of:
+        94, # land, soil (can be considered a direct synonym/subclass)
+        16, # mountain, mount, mountains
+        68, # hill
+        46, # sand
+        29, # field
+        91, # dirt track
+    },
+    31: { # Seat, seats. Superclass of:
+        19, # chair, chairs
+        30, # armchair, armchairs
+        23, # sofa, couch, sofas, couches
+        69, # bench, benches
+        110, # stool, stools
+        75, # swivel chair
+        97, # ottoman, pouf, pouffe, puff, hassock
+    },
+    15: { # Table, tables. Superclass of:
+        33, # desk, desks
+        64, # coffee table, cocktail table
+        56, # pool table, billiard table, snooker table
+        73, # kitchen island
+    },
+}
+
+
 def get_metadata():
     meta = {}
     # The following metadata maps contiguous id from [0, #thing categories +
@@ -282,6 +353,10 @@ def get_metadata():
     seen_dataset_id_to_seen_contiguous_id = {}
     unseen_dataset_id_to_contiguous_id = {}
 
+    typeshift_dataset_id_to_contiguous_id = {}
+    superclass_dataset_id_to_contiguous_id = {}
+    subclass_dataset_id_to_contiguous_id = {}
+
     seen_dataset_id_to_thing_contigous_id = {}
     unseen_dataset_id_to_thing_contigous_id = {}
     last_thing_id = 0
@@ -291,6 +366,11 @@ def get_metadata():
 
     max_dataset_id = max([ cat["id"] for cat in ADE20K_150_CATEGORIES ])
     dataset_id_to_seen_contigous_id = [ -1 for _ in range(max_dataset_id+1) ]
+
+    superclass_ids = set(SUPERCLASSES_ADE20K_CATEGORY_IDS.keys())
+    subclass_ids = set()
+    for children in SUPERCLASSES_ADE20K_CATEGORY_IDS.values():
+        subclass_ids.update(children)
 
     for i, cat in enumerate(ADE20K_150_CATEGORIES):
         if cat["isthing"]:
@@ -317,7 +397,17 @@ def get_metadata():
             dataset_id_to_seen_contigous_id[cat["id"]] = last_seen_id
             last_seen_id += 1
             seen_dataset_id_to_contiguous_id[cat["id"]] = i
+        
+        if cat["id"] in TYPE_SHIFT_ADE20K_CATEGORY_IDS:
+            typeshift_dataset_id_to_contiguous_id[cat["id"]] = i
+        
+        if cat["id"] in superclass_ids:
+            superclass_dataset_id_to_contiguous_id[cat["id"]] = i
 
+        if cat["id"] in subclass_ids:
+            subclass_dataset_id_to_contiguous_id[cat["id"]] = i
+
+    meta["typeshift_dataset_id_to_contiguous_id"] = typeshift_dataset_id_to_contiguous_id
     meta["thing_dataset_id_to_contiguous_id"] = thing_dataset_id_to_contiguous_id
     meta["stuff_dataset_id_to_contiguous_id"] = stuff_dataset_id_to_contiguous_id
     meta["seen_dataset_id_to_contiguous_id"] = seen_dataset_id_to_contiguous_id
@@ -327,6 +417,8 @@ def get_metadata():
     meta["seen_dataset_id_to_thing_contigous_id"] = seen_dataset_id_to_thing_contigous_id
     meta["unseen_dataset_id_to_thing_contigous_id"] = unseen_dataset_id_to_thing_contigous_id
     meta["contiguous_id_to_seen_contiguous_id"] = contiguous_id_to_seen_contiguous_id
+    meta["superclass_dataset_id_to_contiguous_id"] = superclass_dataset_id_to_contiguous_id
+    meta["subclass_dataset_id_to_contiguous_id"] = subclass_dataset_id_to_contiguous_id
 
     return meta
 

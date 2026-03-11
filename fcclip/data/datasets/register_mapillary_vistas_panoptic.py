@@ -99,7 +99,7 @@ def register_mapillary_vistas_panoptic(
         image_root=image_root,
         panoptic_json=panoptic_json,
         json_file=instances_json,
-        evaluator_type="mapillary_vistas_panoptic_seg",
+        evaluator_type="zs_mapillary_vistas_panoptic_seg",
         ignore_label=65,  # different from other datasets, Mapillary Vistas sets ignore_label to 65
         label_divisor=1000,
         **metadata,
@@ -122,6 +122,53 @@ _PREDEFINED_SPLITS_ADE20K_PANOPTIC = {
 }
 
 
+UNSEEN_MAPILLARY_VISTAS_CATEGORY_IDS = [
+    2,  # Ground Animal
+    3,  # Curb
+    5,  # Guard Rail
+    6,  # Barrier
+    8,  # Bike Lane
+    9,  # Crosswalk - Plain
+    10, # Curb Cut
+    11, # Parking
+    12, # Pedestrian Area
+    15, # Service Lane
+    16, # Sidewalk
+    19, # Tunnel
+    21, # Bicyclist
+    22, # Motorcyclist
+    23, # Other Rider
+    24, # Lane Marking - Crosswalk
+    25, # Lane Marking - General
+    30, # Terrain
+    35, # Bike Rack
+    36, # Billboard
+    37, # Catch Basin
+    38, # CCTV Camera
+    40, # Junction Box
+    41, # Mailbox
+    42, # Manhole
+    43, # Phone Booth
+    44, # Pothole
+    45, # Street Light
+    46, # Pole
+    47, # Traffic Sign Frame
+    48, # Utility Pole
+    50, # Traffic Sign (Back)
+    51, # Traffic Sign (Front)
+    52, # Trash Can
+    57, # Caravan
+    60, # Other Vehicle
+    61, # Trailer
+    63, # Wheeled Slow
+    64, # Car Mount
+    65, # Ego Vehicle
+]
+
+TYPE_SHIFT_MAPILLARY_VISTAS_CATEGORY_IDS = [
+    33,  # Banner (COCO: banner)
+]
+
 def get_metadata():
     meta = {}
     # The following metadata maps contiguous id from [0, #thing categories +
@@ -135,10 +182,24 @@ def get_metadata():
     stuff_classes = [k["name"] for k in MAPILLARY_VISTAS_SEM_SEG_CATEGORIES]
     stuff_colors = [k["color"] for k in MAPILLARY_VISTAS_SEM_SEG_CATEGORIES]
 
+    seen_classes = [k["name"] for k in MAPILLARY_VISTAS_SEM_SEG_CATEGORIES if k["id"] not in MAPILLARY_VISTAS_SEM_SEG_CATEGORIES]
+    seen_colors = [k["color"] for k in MAPILLARY_VISTAS_SEM_SEG_CATEGORIES if k["id"] not in MAPILLARY_VISTAS_SEM_SEG_CATEGORIES]
+    unseen_classes = [k["name"] for k in MAPILLARY_VISTAS_SEM_SEG_CATEGORIES if k["id"] in MAPILLARY_VISTAS_SEM_SEG_CATEGORIES]
+    unseen_colors = [k["color"] for k in MAPILLARY_VISTAS_SEM_SEG_CATEGORIES if k["id"] in MAPILLARY_VISTAS_SEM_SEG_CATEGORIES]
+
+    thing_mask = [k["isthing"] == 1 for k in MAPILLARY_VISTAS_SEM_SEG_CATEGORIES]
+
     meta["thing_classes"] = thing_classes
     meta["thing_colors"] = thing_colors
     meta["stuff_classes"] = stuff_classes
     meta["stuff_colors"] = stuff_colors
+
+    meta["seen_classes"] = seen_classes
+    meta["seen_colors"] = seen_colors
+    meta["unseen_classes"] = unseen_classes
+    meta["unseen_colors"] = unseen_colors
+
+    meta["thing_mask"] = thing_mask
 
     # Convert category id for training:
     #   category id: like semantic segmentation, it is the class id for each
@@ -150,18 +211,61 @@ def get_metadata():
     #           softmax classifier.
     thing_dataset_id_to_contiguous_id = {}
     stuff_dataset_id_to_contiguous_id = {}
+    seen_dataset_id_to_contiguous_id = {}
+    seen_dataset_id_to_seen_contiguous_id = {}
+    unseen_dataset_id_to_contiguous_id = {}
+
+    typeshift_dataset_id_to_contiguous_id = {}
+
+    seen_dataset_id_to_thing_contigous_id = {}
+    unseen_dataset_id_to_thing_contigous_id = {}
+    last_thing_id = 0
+
+    contiguous_id_to_seen_contiguous_id = []
+    last_seen_id = 0
+
+    max_dataset_id = max([ cat["id"] for cat in MAPILLARY_VISTAS_SEM_SEG_CATEGORIES ])
+    dataset_id_to_seen_contigous_id = [ -1 for _ in range(max_dataset_id+1) ]
 
     for i, cat in enumerate(MAPILLARY_VISTAS_SEM_SEG_CATEGORIES):
         if cat["isthing"]:
             thing_dataset_id_to_contiguous_id[cat["id"]] = i
+            if cat["id"] in UNSEEN_MAPILLARY_VISTAS_CATEGORY_IDS:
+                unseen_dataset_id_to_thing_contigous_id[cat["id"]] = last_thing_id
+            else:
+                seen_dataset_id_to_thing_contigous_id[cat["id"]] = last_thing_id
+            last_thing_id += 1
         # else:
         #     stuff_dataset_id_to_contiguous_id[cat["id"]] = i
 
         # in order to use sem_seg evaluator
         stuff_dataset_id_to_contiguous_id[cat["id"]] = i
 
+        if cat["id"] in UNSEEN_MAPILLARY_VISTAS_CATEGORY_IDS:
+            # If this category is unseen, map it to -1 category.
+            # This allows then easy filtering on unseen categories.
+            contiguous_id_to_seen_contiguous_id.append(-1)
+            unseen_dataset_id_to_contiguous_id[cat["id"]] = i
+        else:
+            contiguous_id_to_seen_contiguous_id.append(last_seen_id)
+            seen_dataset_id_to_seen_contiguous_id[cat["id"]] = last_seen_id
+            dataset_id_to_seen_contigous_id[cat["id"]] = last_seen_id
+            last_seen_id += 1
+            seen_dataset_id_to_contiguous_id[cat["id"]] = i
+        
+        if cat["id"] in TYPE_SHIFT_MAPILLARY_VISTAS_CATEGORY_IDS:
+            typeshift_dataset_id_to_contiguous_id[cat["id"]] = i
+
+    meta["typeshift_dataset_id_to_contiguous_id"] = typeshift_dataset_id_to_contiguous_id
     meta["thing_dataset_id_to_contiguous_id"] = thing_dataset_id_to_contiguous_id
     meta["stuff_dataset_id_to_contiguous_id"] = stuff_dataset_id_to_contiguous_id
+    meta["seen_dataset_id_to_contiguous_id"] = seen_dataset_id_to_contiguous_id
+    meta["dataset_id_to_seen_contigous_id"] = dataset_id_to_seen_contigous_id
+    meta["seen_dataset_id_to_seen_contiguous_id"] = seen_dataset_id_to_seen_contiguous_id
+    meta["unseen_dataset_id_to_contiguous_id"] = unseen_dataset_id_to_contiguous_id
+    meta["seen_dataset_id_to_thing_contigous_id"] = seen_dataset_id_to_thing_contigous_id
+    meta["unseen_dataset_id_to_thing_contigous_id"] = unseen_dataset_id_to_thing_contigous_id
+    meta["contiguous_id_to_seen_contiguous_id"] = contiguous_id_to_seen_contiguous_id
 
     return meta
 

@@ -369,9 +369,11 @@ class ExportEvaluator(DatasetEvaluator):
             panoptic_img = panoptic_img.cpu().numpy()
 
             # 1) Raw detection matching: pairwise costs + Hungarian
+            """
             detection_matching = self._compute_detection_matching(
                 input, cls_logits, mask_logits
             )
+            """
 
             # 2) Panoptic IoU + Hungarian + ID remap
             (
