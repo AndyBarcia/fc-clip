@@ -439,8 +439,9 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
 
         if self.separate_thing_stuff_mask_embed:
             self.thing_stuff_temperature = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
-
-        self.obj_head = MLP(hidden_dim, hidden_dim, 1, 3)
+    
+        #self.obj_head = MLP(hidden_dim, hidden_dim, 1, 3)
+        self.obj_head = nn.Linear(hidden_dim, 1)
 
         # ZEG-FC
         self.text_attn = text_attn
