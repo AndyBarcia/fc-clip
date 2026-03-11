@@ -36,6 +36,25 @@ def build_transformer_decoder(cfg, in_channels, mask_classification=True):
     return TRANSFORMER_DECODER_REGISTRY.get(name)(cfg, in_channels, mask_classification)
 
 
+def get_untemplated_classification_logits(pred_logits, num_templates, append_void_class=True):
+    # Max ensembling over templates
+    final_pred_logits = []
+    cur_idx = 0
+    # Process each group of templates for non-void classes
+    for num_t in num_templates:
+        # Slice current template group and take max
+        group_logits = pred_logits[..., cur_idx:cur_idx + num_t]
+        final_pred_logits.append(group_logits.max(-1).values)
+        cur_idx += num_t
+    # Append void class (last element)
+    if append_void_class:
+        final_pred_logits.append(pred_logits[..., -1])
+    # Stack along new class dimension
+    final_pred_logits = torch.stack(final_pred_logits, dim=-1)
+    
+    return final_pred_logits
+
+
 def get_classification_logits(x, text_classifier, logit_scale, num_templates=None, text_attn_logits=None):
     # x in shape of [B, *, C]
     # text_classifier: either [num_classes, C] or [B, num_classes, C]
@@ -658,7 +677,7 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         ret["clip_embedding_dim"] = cfg.MODEL.FC_CLIP.EMBED_DIM
         return ret
 
-    def forward(self, x, mask_features, mask = None, text_classifier=None, num_templates=None):
+    def forward(self, x, mask_features, mask = None, text_classifier=None, thing_mask=None, num_templates=None):
         # x is a list of multi-scale feature
         assert len(x) == self.num_feature_levels
         src = []

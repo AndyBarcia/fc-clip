@@ -1041,7 +1041,7 @@ def get_metadata():
             seen_dataset_id_to_seen_contiguous_id[cat["trainId"]] = last_seen_id
             dataset_id_to_seen_contigous_id[cat["trainId"]] = last_seen_id
             last_seen_id += 1
-            seen_dataset_id_to_contiguous_id[cat["trainId"]] = i====
+            seen_dataset_id_to_contiguous_id[cat["trainId"]] = i
         
         if cat["id"] in superclass_ids:
             superclass_dataset_id_to_contiguous_id[cat["trainId"]] = i
