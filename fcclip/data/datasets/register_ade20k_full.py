@@ -795,6 +795,7 @@ SUPERCLASSES_ADE20K_847_CATEGORY_IDS = {
         522, # pergola
         116, # gazebo
         269, # windmill
+        417, # shelter
     },
     2: { # Sky, clouds. Contains/Superclass of:
         720, # sun
@@ -1001,6 +1002,23 @@ SUPERCLASSES_ADE20K_847_CATEGORY_IDS = {
         798, # tongs
         827, # slotted spoon
         708, # skimmer
+    },
+    97: { # Court. Superclass of:
+        348, # volleyball court
+    },
+    190: { # Shower. Superclass of:
+        395, # shower room
+    },
+    233: { # Ice rink. Superclass of:
+        416, # ice hockey rink
+    },
+    241: { # Track. Superclass of:
+        353, # railway
+        480, # tracks
+    },
+    271: { # Elevator, lift. Superclass of:
+        197, # elevator door
+        576, # service elevator
     }
 }
 
