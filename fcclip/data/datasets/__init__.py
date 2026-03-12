@@ -21,6 +21,7 @@ from . import (
     register_cityscapes_panoptic,
     register_mapillary_vistas_panoptic,
     register_ade20k_full,
+    register_ade20k_full_superclass_merged_equiv_623,
     register_pascal_voc_20_semantic,
     register_pascal_voc_21_semantic,
     register_pascal_ctx_59_sem_seg,
