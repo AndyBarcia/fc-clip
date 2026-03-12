@@ -1,0 +1,610 @@
+1:wall,walls,interior wall,brick wall,stone wall
+2:building,buildings,edifice,edifices,tower,towers,shelter
+3:sky,clouds
+4:road,route,street,roads,streets,routes
+5:floor,flooring
+6:ceiling
+7:bed,beds
+8:sidewalk,pavement
+9:earth,ground
+10:cabinet,cabinets,wall mounted cabine
+11:person,child,girl,boy,woman,man,people,children,girls,boys,women,men
+12:windowpane,window,windows
+13:car,automobile,cars
+14:plant,flora,plant life,plants,bushes
+15:table,tables,tablecloth
+16:curtain,drape,drapery,pall
+17:door,double door,doors
+18:painting,picture,paintings,pictures,wallart,framed canvas
+19:water
+20:mirror,mirrors
+21:rug,carpet,carpeting
+22:shelf,shelves
+23:fence,fencing
+24:rock,stone,rocks,stones
+25:seat,seats
+26:desk,desks
+27:bathtub,bathing tub,bath,tub
+28:railing
+29:signboard,sign,signboards,signs,billboard
+30:cushion,cushions
+31:path
+32:work surface
+33:stairs,steps
+34:column,pillar
+35:sink
+36:wardrobe,closet,press,wardrobes,closets
+37:snow
+38:refrigerator,icebox
+39:pedestal
+40:bridge,span
+41:blind
+42:runway
+43:fireplace,hearth,open fireplace
+44:pillow,pillows
+45:screen door,shower door
+46:toilet,commode,crapper,potty
+47:grandstand,covered stand
+48:pool table,billiard table,snooker table
+49:coffee table,cocktail table
+50:counter
+51:countertop,counter top,worktop
+52:chest of drawers,chest,bureau,dresser
+53:kitchen island
+54:boat
+55:stove,kitchen stove,kitchen range,kitchen range,cooking stove
+56:bookcase
+57:controls
+58:book,books
+59:computer,computing machine,computing device,data processor,electronic computer,information processing system
+60:bus,autobus,double-decker,jitney,motorbus,motorcoach,omnibus,passenger vehicle
+61:light,light source
+62:case,display case,showcase,vitrine
+63:towel
+64:embankment
+65:television receiver,television,television set,tv,tv set
+66:van
+67:awning,sunshade,sunblind
+68:poster,posting,placard,notice,bill,card
+69:truck,motortruck
+70:airplane,aeroplane,airplanes,aeroplanes
+71:pole
+72:court,volleybal court
+73:ball,balls
+74:aircraft carrier,carrier,flattop,attack aircraft carrier
+75:buffet,sideboard
+76:apparel,wearing apparel,dress,clothes
+77:minibike,motorbike
+78:animal,animate being,dog,cat,horse,cow,sheep,zebra,giraffe,bird
+79:booth,cubicle,stall,kiosk
+80:bicycle,bike
+81:doorframe,doorcase
+82:trade name,brand name
+83:bannister,banister,balustrade,balusters,handrail
+84:traffic light,traffic signal,traffic lights
+85:escalator,moving staircase,moving stairway
+86:land,soil
+87:board,plank
+88:eiderdown,duvet,continental quilt
+89:bar
+90:stall,stand,sales booth
+91:playground
+92:ship
+93:cradle
+94:pot,flowerpot
+95:conveyer belt,conveyor belt,conveyer,conveyor,transporter
+96:train,railroad train
+97:manhole
+98:canopy
+99:microwave,microwave oven
+100:dirt track
+101:beam
+102:plate,plates
+103:crt screen
+104:ruins
+105:blanket,cover
+106:plaything,toy,toys
+107:food,solid food
+108:projection screen
+109:oven
+110:stage
+111:beacon,lighthouse,beacon light,pharos
+112:umbrella
+113:sculpture,sculptures
+114:aqueduct
+115:container
+116:scaffolding,staging
+117:exhaust hood
+118:curb,curbing,kerb
+119:roller coaster
+120:catwalk
+121:glass,drinking glass
+122:vase,vases
+123:central reservation
+124:carousel
+125:radiator,heater
+126:machine
+127:pier,wharf,wharfage,dock
+128:ceiling fan,floor fan
+129:inflatable bounce game
+130:pitch
+131:arcade,colonnade
+132:hot tub
+133:helicopter
+134:tray,trays
+135:partition,divider
+136:vineyard
+137:bowl
+138:bullring
+139:flag,flags
+140:footbridge,overcrossing,pedestrian bridge
+141:shower,shower room
+142:bulletin board,notice board
+143:confessional booth
+144:trunk,tree trunk,bole
+145:forest
+146:elevator door,elevator,lift,service elevator
+147:laptop,laptop computer
+148:instrument panel,control panel,control board,board,panel,controls,cockpit
+149:tapestry,tapis
+150:platform
+151:gate
+152:monitor,monitoring device,monitors
+153:ring
+154:blackboard,chalkboard
+155:air conditioner,air conditioning
+156:chest
+157:clock
+158:pipe,pipage,piping
+159:vault
+160:table football
+161:cannon
+162:statue
+163:loudspeaker,speaker,speaker unit,loudspeaker system,speaker system
+164:exhibitor
+165:ladder
+166:carport
+167:dam
+168:pulpit
+169:skylight,fanlight
+170:water tower
+171:grill,grille,grillwork
+172:display board
+173:pane,pane of glass,window glass
+174:rubbish,trash,scrap
+175:ice rink,ice hockey rink
+176:patio
+177:telephone,phone,telephone set
+178:net
+179:magazine
+180:shutter
+181:roof
+182:banner,streamer
+183:post
+184:altarpiece,reredos
+185:arch,archway
+186:table game
+187:document,written document,papers
+188:dome
+189:forecourt
+190:crane
+191:piano,pianoforte,forte-piano
+192:drawing
+193:ad,advertisement,advertizement,advertising,advertizing,advert
+194:amphitheater,amphitheatre,coliseum
+195:monument
+196:pool
+197:decoration,ornament,ornamentation
+198:labyrinth
+199:text,textual matter
+200:printer
+201:mezzanine,first balcony
+202:mattress
+203:straw,hay
+204:bus stop
+205:console table,console
+206:rack
+207:notebook
+208:shrine
+209:pantry
+210:cart
+211:porch
+212:postbox,mailbox,letter box
+213:figurine,statuette
+214:folding screen
+215:telescope
+216:kennel
+217:coffee maker
+218:altar,communion table,lord's table
+219:easel
+220:artificial golf green
+221:candlestick,candle holder
+222:television stand
+223:wall socket,wall plug,electric outlet,electrical outlet,outlet,electric receptacle
+224:skeleton
+225:grand piano,grand
+226:grille door
+227:gravestone,headstone,tombstone
+228:structure
+229:place mat
+230:tomb
+231:big top
+232:gas pump,gasoline pump,petrol pump,island dispenser
+233:lockers
+234:cage
+235:finger
+236:bleachers
+237:ferris wheel
+238:mat
+239:stands
+240:aquarium,fish tank,marine museum
+241:streetcar,tram,tramcar,trolley,trolley car
+242:napkin,table napkin,serviette
+243:dummy
+244:booklet,brochure,folder,leaflet,pamphlet
+245:service station
+246:coffin
+247:drawer
+248:balcony
+249:table tennis
+250:control table
+251:merchandise,ware,product
+252:railway,track
+253:parterre
+254:chimney
+255:fabric,cloth,material,textile
+256:system
+257:map
+258:mug
+259:barbecue
+260:trailer
+261:toilet tissue,toilet paper,bathroom tissue
+262:organ
+263:dishrag,dishcloth
+264:keyboard
+265:trench
+266:basket,basketball hoop,hoop
+267:steering wheel,wheel
+268:pitcher,ewer
+269:goal
+270:file cabinet
+271:newspaper,paper
+272:motorboat
+273:rope
+274:guitar
+275:control tower
+276:dashboard
+277:bandstand
+278:lectern
+279:switch,electric switch,electrical switch
+280:baseboard,mopboard,skirting board
+281:faucet,spigot
+282:saucepan
+283:meter
+284:crevasse
+285:gear
+286:candelabrum,candelabra
+287:tunnel
+288:pallet
+289:wire,conducting wire
+290:kettle,boiler
+291:bidet
+292:baby buggy,baby carriage,carriage,perambulator,pram,stroller,go-cart,pushchair,pusher
+293:music stand
+294:cup,cups,drinking glass,drinking glasses
+295:parking meter
+296:ski slope
+297:panel
+298:wallet
+299:wheel
+300:towel rack,towel horse
+301:roundabout
+302:rod
+303:soap dispenser
+304:bell
+305:box office,ticket office,ticket booth
+306:teacup
+307:trellis
+308:workbench
+309:toaster
+310:podium
+311:ramp
+312:fireplug,fire hydrant,plug
+313:lab bench
+314:equipment
+315:calendar
+316:caravan
+317:check-in-desk
+318:ticket counter
+319:brush
+320:mill
+321:covered bridge
+322:bowling alley
+323:hanger
+324:trestle
+325:revolving door
+326:blast furnace
+327:projector
+328:soap
+329:locker
+330:stretcher
+331:frame
+332:grating
+333:alembic
+334:barrier
+335:cave
+336:tarp
+337:price tag
+338:watchtower
+339:hair dryer
+340:viaduct
+341:paper towel
+342:sheet
+343:fire extinguisher,extinguisher,asphyxiator
+344:water wheel
+345:pottery,clayware
+346:magazine rack
+347:teapot
+348:microphone,mike
+349:support
+350:cash register,register
+351:remote control,remote
+352:soap dish
+353:windshield,windscreen
+354:cue,cue stick,pool cue,pool stick
+355:vent,venthole,vent-hole,blowhole
+356:videos
+357:eaves
+358:antenna,aerial,transmitting aerial
+359:shipyard
+360:traffic cone
+361:truck crane
+362:cds
+363:niche
+364:scoreboard
+365:briefcase
+366:pack
+367:bottle rack
+368:glacier
+369:building materials
+370:television camera
+371:first floor
+372:rifle
+373:stadium
+374:safety belt
+375:cover
+376:dish rack
+377:synthesizer
+378:gutter
+379:fruit stand
+380:handle,grip,handgrip,hold
+381:wheelchair
+382:mousepad,mouse mat
+383:diploma
+384:fairground ride
+385:radio
+386:hotplate
+387:wheelbarrow
+388:toll plaza
+389:punching bag
+390:trough
+391:throne
+392:weighbridge
+393:extractor fan
+394:hanging clothes
+395:dish,dish aerial,dish antenna,saucer
+396:alarm clock,alarm
+397:ski lift
+398:chain
+399:garage
+400:wine rack
+401:tramway
+402:treadmill
+403:menu
+404:block
+405:well
+406:witness stand
+407:casserole
+408:frying pan
+409:desk organizer
+410:mast
+411:spectacles,specs,eyeglasses,glasses
+412:dollhouse
+413:hammock
+414:clothes hanging
+415:photocopier
+416:notepad
+417:golf cart
+418:footpath
+419:cross
+420:baptismal font
+421:boiler
+422:skip
+423:rotisserie
+424:water mill
+425:cover curtain
+426:brick
+427:table runner
+428:ashtray
+429:street box
+430:stick
+431:cells
+432:urinal
+433:centerpiece
+434:portable fridge
+435:dvds
+436:golf club
+437:water cooler
+438:clipboard
+439:camera,photographic camera
+440:pigeonhole
+441:food processor
+442:lid
+443:drum
+444:blender
+445:cave entrance
+446:obelisk
+447:canoe
+448:mobile
+449:pool ball
+450:cue rack
+451:baggage carts
+452:paper filer
+453:bicycle rack
+454:coat rack
+455:garland
+456:sports bag
+457:fish tank
+458:towel dispenser
+459:carriage
+460:plaque
+461:stringer
+462:iron
+463:flag pole
+464:toilet brush
+465:book stand
+466:broom
+467:ice bucket
+468:carapace,shell,cuticle,shield
+469:tureen
+470:chess
+471:model
+472:pen
+473:violin
+474:chopping board,cutting board
+475:mask
+476:log
+477:mouse,computer mouse
+478:hole
+479:target
+480:trash bag
+481:chalk
+482:balloon
+483:score
+484:hair spray
+485:roll
+486:runner
+487:engine
+488:inflatable glove
+489:games
+490:coop
+491:dvd player
+492:rocking horse
+493:watering can
+494:post-it
+495:security camera
+496:runner cloth
+497:lock
+498:alarm,warning device,alarm system
+499:side
+500:roulette
+501:bone
+502:cutlery
+503:spice rack
+504:towel ring
+505:bread box
+506:funfair
+507:tripod
+508:ironing board
+509:hollow
+510:scratching post
+511:tricycle
+512:file box
+513:mountain pass
+514:cooker
+515:card game,cards
+516:golf bag
+517:toilet paper holder
+518:key
+519:umbrella stand
+520:dartboard
+521:transformer
+522:fireplace utensils
+523:cellular telephone,cellular phone,cellphone,cell,mobile phone
+524:tallboy
+525:stapler
+526:sauna
+527:test tube
+528:palette
+529:shopping carts
+530:tools
+531:push button,push,button
+532:roof rack
+533:barbed wire
+534:spray
+535:ear
+536:sponge
+537:racket
+538:file
+539:sugar bowl
+540:laptop bag
+541:leash
+542:climbing frame
+543:suit hanger
+544:plate rack
+545:sewer
+546:hard drive
+547:sprinkler
+548:tools box
+549:necklace
+550:steel industry
+551:club
+552:jack
+553:door bars
+554:hairbrush
+555:napkin holder
+556:office
+557:smoke detector
+558:utensils
+559:apron
+560:terminal
+561:grinder
+562:entry phone
+563:newspaper stand
+564:pepper shaker
+565:central processing unit,cpu,central processor,processor,mainframe
+566:tape
+567:bat
+568:coaster
+569:calculator
+570:luggage rack
+571:salt
+572:street number
+573:viewpoint
+574:sword
+575:rowing machine
+576:plug
+577:andiron,firedog,dog,dog-iron
+578:pepper
+579:bonfire
+580:dog dish
+581:dumbbells
+582:videocassette recorder,vcr
+583:hook
+584:envelopes
+585:shower faucet
+586:watch
+587:padlock
+588:swimming pool ladder
+589:gravy boat
+590:fire alarm
+591:stethoscope
+592:rocket
+593:funnel
+594:bowling pins
+595:valve
+596:thermometer
+597:games table
+598:reel
+599:scourer
+600:sleeping robe
+601:desk mat
+602:typewriter
+603:shaker
+604:cheese dish
+605:butane gas cylinder
+606:paper weight
+607:shaving brush
+608:sunglasses
+609:gear shift
+610:towel rail
