@@ -34,6 +34,7 @@ SUPERCLASSES_ADE20K_847_CATEGORY_IDS = {
         522, # pergola
         116, # gazebo
         269, # windmill
+        417, # shelter
     },
     2: { # Sky, clouds. Contains/Superclass of:
         720, # sun
@@ -208,6 +209,10 @@ SUPERCLASSES_ADE20K_847_CATEGORY_IDS = {
         246, # landfill
         657, # recycling materials
     },
+    352: { # Railway. Superclass of:
+        241, # track
+        479, # tracks
+    },
     357: { # Fabric, cloth, material, textile. Superclass of (or material of):
         430, # canvas
         446, # plastic
@@ -246,6 +251,7 @@ SUPERCLASSES_ADE20K_847_CATEGORY_IDS = {
 
 
 EQUIVALENT_ADE20K_847_CLASS_GROUPS = [
+    (40, 282),
     (8, 377),
     (18, 341, 589),
     (44, 78, 107),
@@ -258,18 +264,25 @@ EQUIVALENT_ADE20K_847_CLASS_GROUPS = [
     (138, 679),
     (143, 386),
     (150, 511),
+    (172, 269),
     (175, 256),
     (186, 689),
+    (191, 395),
     (191, 307),
+    (197, 272, 576),
     (193, 813),
     (199, 209, 769),
     (200, 683),
     (205, 621),
     (215, 413),
     (230, 664),
+    (234, 416),
     (236, 281),
     (242, 480),
+    (268, 769),
+    (279, 519),
     (293, 612),
+    (98, 348),
     (317, 715, 752),
     (327, 345),
     (338, 635, 650),
@@ -364,7 +377,7 @@ if __name__ == "__main__":
 
     for split in ["training", "validation"]:
         src_dir = ade_root / "annotations_detectron2" / split
-        dst_dir = ade_root / "annotations_detectron2_superclass_merged_equiv_623" / split
+        dst_dir = ade_root / "annotations_detectron2_superclass_merged_equiv_613" / split
         dst_dir.mkdir(parents=True, exist_ok=True)
 
         for src_path in tqdm.tqdm(sorted(src_dir.glob("*.tif")), desc=f"Processing {split}"):
