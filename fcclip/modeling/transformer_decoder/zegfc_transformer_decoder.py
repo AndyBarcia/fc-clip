@@ -397,7 +397,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         self.decoder_norm = nn.LayerNorm(hidden_dim)
 
         self.query_init_type = query_init_type
-        if self.query_init_type not in {"avg_pool", "feature", "learned"}:
+        if self.query_init_type not in {"avg_pool", "score_max_pool", "feature", "learned"}:
             raise ValueError(f"Unknown query_init_type: {self.query_init_type}")
         self.query_pos_init_type = query_pos_init_type
         if self.query_pos_init_type not in {"learned", "sine"}:
@@ -495,6 +495,32 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         ret["separate_thing_stuff_mask_embed"] = cfg.MODEL.ZEG_FC.SEPARATE_THING_STUFF_MASK_EMBED
         return ret
 
+    def _compute_patch_scores(self, patch_output, patch_pos, text_classifier, num_templates):
+        """Compute per-patch classification confidence without mask prediction."""
+        text_layer = None
+        if self.text_atnn_cls:
+            text_layer = self.intermediate_text_cross_attention_layer
+        elif len(self.transformer_text_cross_attention_layers) > 0:
+            text_layer = self.transformer_text_cross_attention_layers[0]
+
+        if text_layer is None or text_classifier is None:
+            # Fallback when text attention is disabled.
+            return patch_output.permute(1, 0, 2).norm(dim=-1)
+
+        _, text_attn_logits = text_layer(
+            patch_output,
+            text_classifier,
+            query_pos=patch_pos,
+            out_of_vocab_logits=None,
+            return_attn_logits=True,
+        )
+        vocab_logits = get_untemplated_classification_logits(
+            text_attn_logits,
+            num_templates,
+            append_void_class=False,
+        )
+        return vocab_logits.max(dim=-1).values
+
     def forward(
         self, 
         x, 
@@ -545,6 +571,46 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             if self.query_pos_init_type == "sine":
                 query_pos_map = self.query_pos_embed(query_feat, None)
                 query_embed = query_pos_map.permute(2, 3, 0, 1)
+        elif self.query_init_type == "score_max_pool":
+            # choose the feature level with the smallest spatial size
+            areas = [h * w for h, w in size_list]
+            low_res_level = areas.index(min(areas))
+            low_res_feat = self.input_proj[low_res_level](x[low_res_level])
+
+            # Build a per-patch confidence map from classification scores
+            # without mask prediction, then select one best patch per query block.
+            low_res_patch_output = low_res_feat.flatten(2).permute(2, 0, 1)
+            low_res_patch_pos = self.pe_layer(low_res_feat, None).flatten(2).permute(2, 0, 1)
+            patch_scores = self._compute_patch_scores(
+                low_res_patch_output,
+                low_res_patch_pos,
+                text_classifier,
+                num_templates,
+            )
+            score_map = patch_scores.view(bs, *size_list[low_res_level])
+            _, block_indices = F.adaptive_max_pool2d(
+                score_map.unsqueeze(1),
+                output_size=(self.query_h, self.query_w),
+                return_indices=True,
+            )
+
+            query_candidates = self.query_feat_proj(low_res_feat).flatten(2).permute(0, 2, 1)
+            query_indices = block_indices.flatten(2).squeeze(1)
+            gathered_queries = torch.gather(
+                query_candidates,
+                1,
+                query_indices.unsqueeze(-1).expand(-1, -1, query_candidates.shape[-1]),
+            )
+            output = gathered_queries.transpose(0, 1).view(self.query_h, self.query_w, bs, -1)
+
+            if self.query_pos_init_type == "sine":
+                query_pos_map = self.query_pos_embed(low_res_feat, None).flatten(2).permute(0, 2, 1)
+                gathered_query_pos = torch.gather(
+                    query_pos_map,
+                    1,
+                    query_indices.unsqueeze(-1).expand(-1, -1, query_pos_map.shape[-1]),
+                )
+                query_embed = gathered_query_pos.transpose(0, 1).view(self.query_h, self.query_w, bs, -1)
         else:
             patch_output = torch.cat(src, dim=0)
             patch_pos = torch.cat(pos, dim=0)
