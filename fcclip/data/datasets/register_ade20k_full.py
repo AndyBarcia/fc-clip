@@ -795,6 +795,7 @@ SUPERCLASSES_ADE20K_847_CATEGORY_IDS = {
         522, # pergola
         116, # gazebo
         269, # windmill
+        417, # shelter
     },
     2: { # Sky, clouds. Contains/Superclass of:
         720, # sun
@@ -968,6 +969,10 @@ SUPERCLASSES_ADE20K_847_CATEGORY_IDS = {
         544, # junk
         246, # landfill
         657, # recycling materials
+    },
+    352: { # Railway. Superclass of:
+        241, # track
+        479, # tracks
     },
     357: { # Fabric, cloth, material, textile. Superclass of (or material of):
         430, # canvas
