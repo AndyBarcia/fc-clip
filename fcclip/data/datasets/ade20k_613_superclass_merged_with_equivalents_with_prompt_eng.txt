@@ -13,7 +13,7 @@
 13:car,automobile,cars
 14:plant,flora,plant life,plants,bushes
 15:table,tables,tablecloth
-16:curtain,drape,drapery,mantle,pall
+16:curtain,drape,drapery,pall
 17:door,double door,doors
 18:painting,picture,paintings,pictures,wallart,framed canvas
 19:water
@@ -25,8 +25,8 @@
 25:seat,seats
 26:desk,desks
 27:bathtub,bathing tub,bath,tub
-28:railing,rail
-29:signboard,sign,signboards,signs
+28:railing
+29:signboard,sign,signboards,signs,billboard
 30:cushion,cushions
 31:path
 32:work surface
@@ -71,7 +71,7 @@
 71:airplane,aeroplane,airplanes,aeroplanes
 72:pole
 73:tower,towers
-74:court
+74:court,volleybal court
 75:ball,balls
 76:aircraft carrier,carrier,flattop,attack aircraft carrier
 77:buffet,sideboard
@@ -124,7 +124,7 @@
 124:vase,vases
 125:central reservation
 126:carousel
-127:radiator
+127:radiator,heater
 128:machine
 129:pier,wharf,wharfage,dock
 130:ceiling fan,floor fan
@@ -140,14 +140,14 @@
 140:bullring
 141:flag,flags
 142:footbridge,overcrossing,pedestrian bridge
-143:shower
+143:shower,shower room
 144:bulletin board,notice board
 145:confessional booth
 146:trunk,tree trunk,bole
 147:forest
-148:elevator door
+148:elevator door,elevator,lift,service elevator
 149:laptop,laptop computer
-150:instrument panel
+150:instrument panel,control panel,control board,board,panel,controls,cockpit
 151:tapestry,tapis
 152:platform
 153:gate
@@ -174,7 +174,7 @@
 174:display board
 175:pane,pane of glass,window glass
 176:rubbish,trash,scrap
-177:ice rink
+177:ice rink,ice hockey rink
 178:patio
 179:telephone,phone,telephone set
 180:net
@@ -202,7 +202,7 @@
 202:printer
 203:mezzanine,first balcony
 204:mattress
-205:straw
+205:straw,hay
 206:bus stop
 207:console table,console
 208:rack
@@ -251,7 +251,7 @@
 251:table tennis
 252:control table
 253:merchandise,ware,product
-254:railway
+254:railway,track
 255:parterre
 256:chimney
 257:fabric,cloth,material,textile
