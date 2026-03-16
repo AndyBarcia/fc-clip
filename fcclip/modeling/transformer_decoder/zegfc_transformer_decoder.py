@@ -29,7 +29,8 @@ from .fcclip_transformer_decoder import (
     SlotCrossAttention,
     FFNLayer,
     MLP,
-    _get_activation_fn
+    _get_activation_fn,
+    BlockAttentionResidual,
 )
 from .box_regression import (
     BboxMaskInitialization, 
@@ -41,6 +42,7 @@ from .pos_mlp_bias.functions import (
     PosMLPSelfAttention,
     PosMLP
 )
+
 
 def build_attn_mask_maxpool(outputs_mask, attn_mask_target_size, num_heads, thresh=0.5):
     """
@@ -86,6 +88,7 @@ class TextCrossAttentionLayer(nn.Module):
         dropout: float = 0.0,
         activation: str = "relu",
         normalize_before: bool = False,
+        use_block_residual: bool = False,
     ):
         super().__init__()
         assert d_model % nhead == 0, f"d_model={d_model} must be divisible by nhead={nhead}"
@@ -106,6 +109,7 @@ class TextCrossAttentionLayer(nn.Module):
         self.activation = _get_activation_fn(activation)
 
         self.in_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        self.block_residual = BlockAttentionResidual(d_model) if use_block_residual else None
 
         self.register_buffer(
             "ensemble_alpha",
@@ -231,7 +235,11 @@ class TextCrossAttentionLayer(nn.Module):
         *,
         out_of_vocab_logits: Optional[Tensor] = None,
         return_attn_logits: bool = False,
+        blocks: Optional[list[Tensor]] = None,
     ):
+        if self.block_residual is not None and blocks:
+            tgt = self.block_residual(blocks, tgt)
+
         # Make text_classification (T,B,C)
         if len(text_classification.shape) == 2:
             text_classification = text_classification[:, None].expand(-1, tgt.shape[1], -1)
@@ -283,6 +291,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         separate_thing_stuff_mask_embed: bool = False,
         query_init_type: str = "avg_pool",
         query_pos_init_type: str = "learned",
+        block_residual_mode: str = "attn",
     ):
         """
         NOTE: this interface is experimental.
@@ -322,6 +331,10 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         self.self_attn_type = self_attn_type
         self.cross_attn_type = cross_attn_type
 
+        if block_residual_mode not in {"attn", "none"}:
+            raise ValueError(f"Unknown block_residual_mode: {block_residual_mode}")
+        self.block_residual_mode = block_residual_mode
+
         # define Transformer decoder here
         self.num_heads = nheads
         self.num_layers = dec_layers
@@ -330,6 +343,8 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         self.transformer_text_cross_attention_layers = nn.ModuleList()
         self.transformer_ffn_layers = nn.ModuleList()
 
+        use_block_residual = self.block_residual_mode == "attn"
+
         for _ in range(self.num_layers):
             self.transformer_self_attention_layers.append(
                 SelfAttentionLayer(
@@ -337,6 +352,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                     nhead=nheads,
                     dropout=0.0,
                     normalize_before=pre_norm,
+                    use_block_residual=use_block_residual,
                 ) if self.self_attn_type == "standard" else
                 PosMLPSelfAttention(
                     dim=hidden_dim,
@@ -354,6 +370,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                     nhead=nheads,
                     dropout=0.0,
                     normalize_before=pre_norm,
+                    use_block_residual=use_block_residual,
                 )
                 if self.cross_attn_type == "standard" else
                 PosMLPAttention(
@@ -370,6 +387,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                     n_heads=nheads,
                     dropout=0.0,
                     normalize_before=pre_norm,
+                    use_block_residual=use_block_residual,
                 )
                 if "slot"in self.cross_attn_type else None
             )
@@ -382,6 +400,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                         nhead=nheads,
                         dropout=0.0,
                         normalize_before=pre_norm,
+                        use_block_residual=use_block_residual,
                     )
                 )
 
@@ -391,6 +410,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                     dim_feedforward=dim_feedforward,
                     dropout=0.0,
                     normalize_before=pre_norm,
+                    use_block_residual=use_block_residual,
                 )
             )
 
@@ -454,6 +474,7 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
                 nhead=nheads,
                 dropout=0.0,
                 normalize_before=pre_norm,
+                use_block_residual=use_block_residual,
             )
 
     @classmethod
@@ -493,7 +514,32 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         ret["self_attn_type"] = cfg.MODEL.ZEG_FC.SELF_ATTN_TYPE
         ret["mask_pos_mlp_type"] = cfg.MODEL.ZEG_FC.MASK_POS_MLP_TYPE
         ret["separate_thing_stuff_mask_embed"] = cfg.MODEL.ZEG_FC.SEPARATE_THING_STUFF_MASK_EMBED
+        ret["block_residual_mode"] = "attn"
         return ret
+
+    def _apply_attention_stage(
+        self,
+        layer: nn.Module,
+        stage_input: Tensor,
+        *,
+        transpose_io: bool = False,
+        **kwargs,
+    ) -> tuple[Tensor, Optional[Tensor]]:
+        layer_in = stage_input.transpose(0, 1) if transpose_io else stage_input
+        stage_out, aux = layer(layer_in, **kwargs)
+        if transpose_io:
+            stage_out = stage_out.transpose(0, 1)
+        return stage_input + (stage_out - stage_input), aux
+
+    def _apply_ffn_stage(
+        self,
+        layer: FFNLayer,
+        stage_input: Tensor,
+        *,
+        blocks: Optional[list[Tensor]] = None,
+    ) -> Tensor:
+        stage_out = layer(stage_input, blocks=blocks)
+        return stage_input + (stage_out - stage_input)
 
     def forward(
         self, 
@@ -622,9 +668,11 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
         predictions_bbox.append(output_box)
         output = output.flatten(0, 1).view(self.query_h, self.query_w, bs, -1)
 
+        blocks = [output.flatten(0, 1).transpose(0, 1)]
+
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
-            
+
             # Un-mask queries that are not paying attention to any pixels (Row check)
             query_sees_nothing = attn_mask.all(dim=2) # Shape: [B*Heads, Q]
             attn_mask[query_sees_nothing.unsqueeze(2).expand_as(attn_mask)] = False
@@ -632,54 +680,70 @@ class MultiScaleExtendedMaskedTransformerDecoder(nn.Module):
             # When using SlotAttention, Un-mask pixels that are not being attended to 
             # by any query (Column check)
             if "slot" in self.cross_attn_type:
-                pixel_seen_by_no_one = attn_mask.all(dim=1) # Shape: [B*Heads, HW]            
+                pixel_seen_by_no_one = attn_mask.all(dim=1) # Shape: [B*Heads, HW]
                 attn_mask[pixel_seen_by_no_one.unsqueeze(1).expand_as(attn_mask)] = False
 
-            # attention: cross-attention first
             output_flat = output.flatten(0, 1)
             query_embed_flat = query_embed.flatten(0, 1)
-            output_flat, _ = self.transformer_cross_attention_layers[i](
-                output_flat.transpose(0,1), # (B,Q,C)
-                src[level_index].transpose(0,1).view(bs, size_list[level_index][0], size_list[level_index][1], -1), # (B,H,W,C)
+            partial_block = output_flat
+
+            # cross-attention
+            partial_block, _ = self._apply_attention_stage(
+                self.transformer_cross_attention_layers[i],
+                partial_block,
+                transpose_io=True,
+                memory=src[level_index].transpose(0,1).view(bs, size_list[level_index][0], size_list[level_index][1], -1), # (B,H,W,C)
                 attn_mask=attn_mask.view(bs, self.num_heads, self.num_queries, size_list[level_index][0], size_list[level_index][1]), # (B, num_heads, Q, H,W)
-                memory_pos_emb=pos[level_index].transpose(0,1).view(bs, size_list[level_index][0], size_list[level_index][1], -1), # (B,H,W,C), 
+                memory_pos_emb=pos[level_index].transpose(0,1).view(bs, size_list[level_index][0], size_list[level_index][1], -1), # (B,H,W,C),
                 query_pos_emb=query_embed_flat.transpose(0,1), # (B,Q,C)
                 pos=query_bbox_unsigmoid.sigmoid().transpose(0,1) if query_bbox_unsigmoid is not None else None, # (B,Q,[x,y,w,j])
+                blocks=blocks,
             )
-            output_flat = output_flat.transpose(0,1) # (Q,B,C)
 
-            # then, text cross-attention
+            # text cross-attention
             if self.text_attn:
-                output_flat, text_attn_logits = self.transformer_text_cross_attention_layers[i](
-                    output_flat, 
-                    text_classifier,
+                text_blocks = [b.transpose(0, 1) for b in blocks]
+                partial_block, text_attn_logits = self._apply_attention_stage(
+                    self.transformer_text_cross_attention_layers[i],
+                    partial_block,
+                    text_classification=text_classifier,
                     query_pos=query_embed_flat,
                     out_of_vocab_logits=out_of_vocab_logits,
-                    return_attn_logits=self.text_atnn_cls
+                    return_attn_logits=self.text_atnn_cls,
+                    blocks=text_blocks,
                 )
             else:
                 text_attn_logits = None
-            # then, self-attention
-            output_flat, _ = self.transformer_self_attention_layers[i](
-                output_flat.transpose(0,1), # (B,Q,C) 
-                pos_emb=query_embed_flat.transpose(0,1), # # (B,Q,C) 
+
+            # self-attention
+            partial_block, _ = self._apply_attention_stage(
+                self.transformer_self_attention_layers[i],
+                partial_block,
+                transpose_io=True,
+                pos_emb=query_embed_flat.transpose(0,1), # (B,Q,C)
                 pos=query_bbox_unsigmoid.sigmoid().transpose(0,1) if query_bbox_unsigmoid is not None else None, # (B,Q,[x,y,w,j])
-            )
-            output_flat = output_flat.transpose(0,1) # (Q,B,C)
-            
-            # FFN
-            output_flat = self.transformer_ffn_layers[i](
-                output_flat
+                blocks=blocks,
             )
 
+            # FFN
+            mlp_blocks = [b.transpose(0, 1) for b in blocks]
+            partial_block = self._apply_ffn_stage(
+                self.transformer_ffn_layers[i],
+                partial_block,
+                blocks=mlp_blocks,
+            )
+
+            output_flat = partial_block
+            blocks.append(output_flat.transpose(0, 1))
+
             outputs_class, out_of_vocab_logits, outputs_mask, output_box, query_bbox_unsigmoid, attn_mask = self.forward_prediction_heads(
-                output_flat, 
+                output_flat,
                 mask_features,
                 text_attn_logits,
                 query_bbox_unsigmoid=query_bbox_unsigmoid,
                 attn_mask_size=size_list[i % self.num_feature_levels],
                 attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels],
-                text_classifier=text_classifier, 
+                text_classifier=text_classifier,
                 thing_mask=thing_mask,
                 num_templates=num_templates,
                 mask_to_clip_logits_fn=mask_to_clip_logits_fn,
