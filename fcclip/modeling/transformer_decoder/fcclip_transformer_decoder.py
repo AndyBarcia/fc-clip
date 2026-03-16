@@ -28,6 +28,30 @@ Registry for transformer module in MaskFormer.
 """
 
 
+class SimpleRMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return x * self.weight
+
+
+class BlockAttentionResidual(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.proj = nn.Linear(dim, 1, bias=False)
+        self.norm = SimpleRMSNorm(dim)
+
+    def forward(self, blocks: list[Tensor], partial_block: Tensor) -> Tensor:
+        values = torch.stack(blocks + [partial_block], dim=0)
+        keys = self.norm(values)
+        logits = torch.einsum("d,n...d->n...", self.proj.weight.squeeze(0), keys)
+        weights = F.softmax(logits, dim=0)
+        return torch.einsum("n...,n...d->...d", weights, values)
+
 def build_transformer_decoder(cfg, in_channels, mask_classification=True):
     """
     Build a instance embedding branch from `cfg.MODEL.INS_EMBED_HEAD.NAME`.
@@ -110,7 +134,7 @@ class MaskPooling(nn.Module):
 class SelfAttentionLayer(nn.Module):
 
     def __init__(self, d_model, nhead, dropout=0.0,
-                 activation="relu", normalize_before=False):
+                 activation="relu", normalize_before=False, use_block_residual: bool = False):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
 
@@ -119,6 +143,7 @@ class SelfAttentionLayer(nn.Module):
 
         self.activation = _get_activation_fn(activation)
         self.normalize_before = normalize_before
+        self.block_residual = BlockAttentionResidual(d_model) if use_block_residual else None
 
         self._reset_parameters()
     
@@ -155,13 +180,16 @@ class SelfAttentionLayer(nn.Module):
         return tgt
 
     def forward(
-        self, 
-        tgt, # (B,Q,C) 
+        self,
+        tgt, # (B,Q,C)
         tgt_mask: Optional[Tensor] = None,
         tgt_key_padding_mask: Optional[Tensor] = None,
-        pos_emb: Optional[Tensor] = None, # (B,Q,C) 
-        pos: Optional[Tensor] = None
+        pos_emb: Optional[Tensor] = None, # (B,Q,C)
+        pos: Optional[Tensor] = None,
+        blocks: Optional[list[Tensor]] = None,
     ):
+        if self.block_residual is not None and blocks:
+            tgt = self.block_residual(blocks, tgt)
         tgt = tgt.transpose(0,1) # (Q,B,C) 
         pos_emb = pos_emb.transpose(0,1) # (Q,B,C) 
 
@@ -172,18 +200,20 @@ class SelfAttentionLayer(nn.Module):
             output = self.forward_post(tgt, tgt_mask,
                                  tgt_key_padding_mask, pos_emb)
 
-        return output.transpose(0,1), None # (B,Q,C) 
+        output = output.transpose(0,1)
+        return output, None # (B,Q,C)
 
 
 class CrossAttentionLayer(nn.Module):
     def __init__(self, d_model, nhead, dropout=0.0,
-                 activation="relu", normalize_before=False):
+                 activation="relu", normalize_before=False, use_block_residual: bool = False):
         super().__init__()
         self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
         self.activation = _get_activation_fn(activation)
         self.normalize_before = normalize_before
+        self.block_residual = BlockAttentionResidual(d_model) if use_block_residual else None
         self._reset_parameters()
     
     def _reset_parameters(self):
@@ -290,16 +320,19 @@ class CrossAttentionLayer(nn.Module):
         return (tgt, attn_logits) if return_attn_logits else (tgt, None)
     
     def forward(
-        self, 
-        tgt, # (B,Q,C) 
+        self,
+        tgt, # (B,Q,C)
         memory,  # (B,H,W,C)
         attn_mask: Optional[Tensor] = None, # (B, num_heads, Q, H, W)
         memory_key_padding_mask: Optional[Tensor] = None,
-        memory_pos_emb: Optional[Tensor] = None, # (B,H,W,C), 
+        memory_pos_emb: Optional[Tensor] = None, # (B,H,W,C),
         query_pos_emb: Optional[Tensor] = None, # (B,Q,C)
         return_attn_logits: bool = False,
         pos: Optional[Tensor] = None, # (B,Q,[x,y,w,j])
+        blocks: Optional[list[Tensor]] = None,
     ):
+        if self.block_residual is not None and blocks:
+            tgt = self.block_residual(blocks, tgt)
         tgt = tgt.transpose(0,1) # (Q,B,C)
         memory = memory.flatten(1,2).transpose(0,1) # (H*W,B,C)
         attn_mask = attn_mask.flatten(0,1).flatten(2,3) # (B*num_heads, Q, H*W)
@@ -314,8 +347,9 @@ class CrossAttentionLayer(nn.Module):
             output, logits = self.forward_post(tgt, memory, attn_mask,
                                  memory_key_padding_mask, memory_pos_emb, query_pos_emb,
                                  return_attn_logits=return_attn_logits)
-    
-        return output.transpose(0,1), logits # (Q,B,C)
+
+        output = output.transpose(0,1)
+        return output, logits # (Q,B,C)
 
 
 class SlotCrossAttention(nn.Module):
@@ -324,7 +358,8 @@ class SlotCrossAttention(nn.Module):
         dim: int, 
         n_heads: int, 
         dropout: float = 0.1, 
-        normalize_before: bool = False
+        normalize_before: bool = False,
+        use_block_residual: bool = False,
     ):
         super().__init__()
         if dim % n_heads != 0:
@@ -335,6 +370,7 @@ class SlotCrossAttention(nn.Module):
         self.head_dim = dim // n_heads
         self.scale = self.head_dim ** -0.5
         self.normalize_before = normalize_before
+        self.block_residual = BlockAttentionResidual(dim) if use_block_residual else None
 
         # Capas de proyección lineal para Q, K, V
         self.to_q = nn.Linear(dim, dim, bias=False)
@@ -415,16 +451,19 @@ class SlotCrossAttention(nn.Module):
         return (tgt, attn) if return_attn_logits else (tgt, None)
 
     def forward(
-        self, 
-        tgt: Tensor, # (B, Q, C) 
+        self,
+        tgt: Tensor, # (B, Q, C)
         memory: Tensor,  # (B, H, W, C)
         attn_mask: Optional[Tensor] = None, # (B, num_heads, Q, H, W)
         memory_key_padding_mask: Optional[Tensor] = None, # (B, H*W)
-        memory_pos_emb: Optional[Tensor] = None, # (B, H, W, C), 
+        memory_pos_emb: Optional[Tensor] = None, # (B, H, W, C),
         query_pos_emb: Optional[Tensor] = None, # (B, Q, C)
         return_attn_logits: bool = False,
         pos: Optional[Tensor] = None,
+        blocks: Optional[list[Tensor]] = None,
     ):
+        if self.block_residual is not None and blocks:
+            tgt = self.block_residual(blocks, tgt)
         memory = memory.flatten(1, 2)
         if memory_pos_emb is not None:
             memory_pos_emb = memory_pos_emb.flatten(1, 2)
@@ -440,14 +479,14 @@ class SlotCrossAttention(nn.Module):
             output, logits = self.forward_post(
                 tgt, memory, attn_mask, memory_key_padding_mask, memory_pos_emb, query_pos_emb, return_attn_logits
             )
-    
+
         return output, logits
 
 
 class FFNLayer(nn.Module):
 
     def __init__(self, d_model, dim_feedforward=2048, dropout=0.0,
-                 activation="relu", normalize_before=False):
+                 activation="relu", normalize_before=False, use_block_residual: bool = False):
         super().__init__()
         # Implementation of Feedforward model
         self.linear1 = nn.Linear(d_model, dim_feedforward)
@@ -458,6 +497,7 @@ class FFNLayer(nn.Module):
 
         self.activation = _get_activation_fn(activation)
         self.normalize_before = normalize_before
+        self.block_residual = BlockAttentionResidual(d_model) if use_block_residual else None
 
         self._reset_parameters()
     
@@ -481,10 +521,11 @@ class FFNLayer(nn.Module):
         tgt = tgt + self.dropout(tgt2)
         return tgt
 
-    def forward(self, tgt):
-        if self.normalize_before:
-            return self.forward_pre(tgt)
-        return self.forward_post(tgt)
+    def forward(self, tgt, blocks: Optional[list[Tensor]] = None):
+        if self.block_residual is not None and blocks:
+            tgt = self.block_residual(blocks, tgt)
+        out = self.forward_pre(tgt) if self.normalize_before else self.forward_post(tgt)
+        return out
 
 
 def _get_activation_fn(activation):
