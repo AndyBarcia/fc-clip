@@ -237,6 +237,7 @@ class FCCLIPHead(nn.Module):
                 thing_mask=features['thing_mask'],
                 num_templates=features["num_templates"],
                 mask_to_clip_logits_fn=mask_to_clip_logits_fn,
+                clip_dense_features=features.get("clip_dense_embedding"),
             )
         else:
             raise NotImplementedError
