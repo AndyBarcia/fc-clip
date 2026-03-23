@@ -64,7 +64,7 @@ from detectron2.data.samplers import InferenceSampler
 from detectron2.data.build import build_batch_data_loader, trivial_batch_collator
 import weakref
 
-from fcclip import (
+from tsclip import (
     COCOInstanceNewBaselineDatasetMapper,
     COCOPanopticNewBaselineDatasetMapper,
     InstanceSegEvaluator,
@@ -77,8 +77,7 @@ from fcclip import (
     SemanticSegmentorWithTTA,
     ZSSemSegEvaluator,
     add_maskformer2_config,
-    add_fcclip_config,
-    add_zegfc_config,
+    add_tsclip_config,
     build_compiled_model
 )
 
@@ -328,10 +327,10 @@ class Trainer(DefaultTrainer):
                 self.base_model,
                 self._trainer.model,
                 self.max_iter,
-                cfg.MODEL.ZEG_FC.PROBABILITY_SWAP_THING,
-                cfg.MODEL.ZEG_FC.PROBABILITY_SWAP_THING_END,
-                cfg.MODEL.ZEG_FC.PROBABILITY_SWAP_STUFF,
-                cfg.MODEL.ZEG_FC.PROBABILITY_SWAP_STUFF_END,
+                cfg.MODEL.TSCLIP.PROBABILITY_SWAP_THING,
+                cfg.MODEL.TSCLIP.PROBABILITY_SWAP_THING_END,
+                cfg.MODEL.TSCLIP.PROBABILITY_SWAP_STUFF,
+                cfg.MODEL.TSCLIP.PROBABILITY_SWAP_STUFF_END,
             ),
             hooks.LRScheduler(),
             hooks.PreciseBN(
@@ -658,14 +657,12 @@ def setup(args):
     # for poly lr schedule
     add_deeplab_config(cfg)
     add_maskformer2_config(cfg)
-    add_fcclip_config(cfg)
-    add_zegfc_config(cfg)
+    add_tsclip_config(cfg)
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
     cfg.freeze()
     default_setup(cfg, args)
-    # Setup logger for "fcclip" module
-    setup_logger(output=cfg.OUTPUT_DIR, distributed_rank=comm.get_rank(), name="fcclip")
+    setup_logger(output=cfg.OUTPUT_DIR, distributed_rank=comm.get_rank(), name="tsclip")
     return cfg
 
 
