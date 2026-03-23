@@ -1,0 +1,25 @@
+_BASE_: ./tsclip_convnext_large_eval_ade20k.yaml
+
+SOLVER:
+  IMS_PER_BATCH: 8
+  STEPS: (140000, 145000)
+  MAX_ITER: 150000
+
+MODEL:
+  TSCLIP:
+    TEXT_ATTN: True
+    MEM_ATTN_MASK: False
+    TEXT_ATTN_CLS: True
+    SEPARATE_THING_STUFF_MASK_EMBED: True
+    PROBABILITY_SWAP_THING: 0.1
+    PROBABILITY_SWAP_STUFF: 0.1
+    PROBABILITY_SWAP_THING_END: 0.1
+    PROBABILITY_SWAP_STUFF_END: 0.5
+    THING_STUFF_ADAPTER_TYPE: "linear"
+    QUERY_INIT_TYPE: "avg_pool"
+    QUERY_POS_INIT_TYPE: "sine"
+  MASK_FORMER:
+    USE_MASK_SAMPLING: False
+
+DATASETS:
+  TRAIN: ("openvocab_coco_2017_train_stuff_disjoint_panoptic",)

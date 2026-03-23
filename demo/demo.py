@@ -28,12 +28,12 @@ from detectron2.data.detection_utils import read_image
 from detectron2.projects.deeplab import add_deeplab_config
 from detectron2.utils.logger import setup_logger
 
-from fcclip import add_maskformer2_config, add_fcclip_config, add_zegfc_config
+from tsclip import add_maskformer2_config, add_tsclip_config, add_tsclip_model_config
 from predictor import VisualizationDemo
 
 
 # constants
-WINDOW_NAME = "fc-clip demo"
+WINDOW_NAME = "ts-clip demo"
 
 
 def setup_cfg(args):
@@ -41,8 +41,8 @@ def setup_cfg(args):
     cfg = get_cfg()
     add_deeplab_config(cfg)
     add_maskformer2_config(cfg)
-    add_fcclip_config(cfg)
-    add_zegfc_config(cfg)
+    add_tsclip_config(cfg)
+    add_tsclip_model_config(cfg)
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
     cfg.freeze()
@@ -50,10 +50,10 @@ def setup_cfg(args):
 
 
 def get_parser():
-    parser = argparse.ArgumentParser(description="fcclip demo for builtin configs")
+    parser = argparse.ArgumentParser(description="tsclip demo for builtin configs")
     parser.add_argument(
         "--config-file",
-        default="configs/coco/panoptic-segmentation/fcclip/fcclip_convnext_large_eval_ade20k.yaml",
+        default="configs/coco/panoptic-segmentation/tsclip/tsclip_convnext_large_eval_ade20k.yaml",
         metavar="FILE",
         help="path to config file",
     )
