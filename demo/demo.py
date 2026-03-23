@@ -28,7 +28,7 @@ from detectron2.data.detection_utils import read_image
 from detectron2.projects.deeplab import add_deeplab_config
 from detectron2.utils.logger import setup_logger
 
-from tsclip import add_maskformer2_config, add_tsclip_config, add_tsclip_model_config
+from tsclip import add_maskformer2_config, add_tsclip_config
 from predictor import VisualizationDemo
 
 
@@ -42,7 +42,6 @@ def setup_cfg(args):
     add_deeplab_config(cfg)
     add_maskformer2_config(cfg)
     add_tsclip_config(cfg)
-    add_tsclip_model_config(cfg)
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
     cfg.freeze()

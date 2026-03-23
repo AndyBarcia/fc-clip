@@ -78,7 +78,6 @@ from tsclip import (
     ZSSemSegEvaluator,
     add_maskformer2_config,
     add_tsclip_config,
-    add_tsclip_model_config,
     build_compiled_model
 )
 
@@ -659,7 +658,6 @@ def setup(args):
     add_deeplab_config(cfg)
     add_maskformer2_config(cfg)
     add_tsclip_config(cfg)
-    add_tsclip_model_config(cfg)
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
     cfg.freeze()

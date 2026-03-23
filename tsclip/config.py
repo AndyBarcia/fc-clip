@@ -137,6 +137,7 @@ def add_maskformer2_config(cfg):
     cfg.SOLVER.AMP.PRECISION = "float16"
 
 def add_tsclip_config(cfg):
+    # TSCLIP model config.
     cfg.MODEL.FC_CLIP = CN()
     cfg.MODEL.FC_CLIP.CLIP_MODEL_NAME = "convnext_large_d_320"
     cfg.MODEL.FC_CLIP.CLIP_PRETRAINED_WEIGHTS = "laion2b_s29b_b131k_ft_soup"
@@ -145,13 +146,6 @@ def add_tsclip_config(cfg):
     cfg.MODEL.FC_CLIP.GEOMETRIC_ENSEMBLE_BETA = 0.8
     cfg.MODEL.FC_CLIP.ENSEMBLE_ON_VALID_MASK = False
 
-
-def add_fcclip_config(cfg):
-    add_tsclip_config(cfg)
-
-
-def add_tsclip_model_config(cfg):
-    # TSCLIP model config.
     cfg.MODEL.TSCLIP = CN()
     cfg.MODEL.TSCLIP.USE_RELATIONSHIP_DESCRIPTOR = False
     cfg.MODEL.TSCLIP.TEXT_ATTN = False
